@@ -70,13 +70,13 @@ protocol RouterMappingServicing {
     func ensureMapping(config: AppConfig, localAddress: String, gatewayAddress: String) throws -> PortMappingResult
     func ensureIPv6Pinhole(config: AppConfig, localAddress: String, gatewayAddress: String) throws -> PortMappingResult
     func removeMappings(_ mappings: [ActiveRouterMapping]) -> RouterMappingRemovalReport
-    func legacyRemovalCandidates(
+    func removeLegacyMappings(
         config: AppConfig,
         localIPv4: String?,
         gatewayIPv4: String?,
         localIPv6: String?,
         gatewayIPv6: String?
-    ) throws -> [ActiveRouterMapping]
+    ) -> RouterMappingRemovalReport
 }
 
 final class RouterMappingService: RouterMappingServicing {
@@ -256,110 +256,226 @@ final class RouterMappingService: RouterMappingServicing {
         )
     }
 
-    func legacyRemovalCandidates(
+    func removeLegacyMappings(
         config: AppConfig,
         localIPv4: String?,
         gatewayIPv4: String?,
         localIPv6: String?,
         gatewayIPv6: String?
-    ) throws -> [ActiveRouterMapping] {
-        var candidates: [ActiveRouterMapping] = []
-        let transports: [RouterMappingTransport]
-        switch config.mappingProtocolPreference {
-        case .automatic:
-            transports = [.pcp, .natpmp]
-        case .pcp:
-            transports = [.pcp]
-        case .natpmp:
-            transports = [.natpmp]
-        case .upnp:
-            transports = []
-        case .disabled:
-            transports = []
+    ) -> RouterMappingRemovalReport {
+        var attempts: [RouterMappingRemovalAttempt] = []
+
+        func append(_ next: [RouterMappingRemovalAttempt]) -> Bool {
+            attempts.append(contentsOf: next)
+            return next.allSatisfy(\.succeeded)
         }
 
         if config.preferredAddressFamily.usesIPv4,
            let localIPv4,
            let gatewayIPv4 {
-            candidates += transports.map {
-                legacyMapping(
+            let next: [RouterMappingRemovalAttempt]
+            switch config.mappingProtocolPreference {
+            case .automatic:
+                next = removeLegacyAutomaticIPv4Mappings(
                     config: config,
-                    transport: $0,
-                    family: .ipv4,
                     localAddress: localIPv4,
                     gatewayAddress: gatewayIPv4
                 )
-            }
-            if config.mappingProtocolPreference == .automatic
-                || config.mappingProtocolPreference == .upnp {
-                if let reconciled = try reconcileLegacyUPnPIPv4Mapping(
+            case .pcp, .natpmp:
+                let transport: RouterMappingTransport =
+                    config.mappingProtocolPreference == .pcp ? .pcp : .natpmp
+                next = [
+                    removeLegacyMapping(
+                        legacyMapping(
+                            config: config,
+                            transport: transport,
+                            family: .ipv4,
+                            localAddress: localIPv4,
+                            gatewayAddress: gatewayIPv4
+                        )
+                    )
+                ]
+            case .upnp:
+                next = removeLegacyUPnPIPv4Mapping(
                     config: config,
                     localAddress: localIPv4,
                     gatewayAddress: gatewayIPv4
-                ) {
-                    candidates.append(reconciled)
-                }
+                ).map { [$0] } ?? []
+            case .disabled:
+                next = []
+            }
+            guard append(next) else {
+                return RouterMappingRemovalReport(attempts: attempts)
             }
         }
+
         if config.preferredAddressFamily.usesIPv6,
            let localIPv6,
            let gatewayIPv6 {
-            candidates += transports.compactMap { transport in
-                guard transport != .natpmp else { return nil }
-                if transport == .upnp, config.ipv6PinholeID == nil {
-                    return nil
-                }
-                return legacyMapping(
+            _ = append(
+                removeLegacyIPv6Mappings(
                     config: config,
-                    transport: transport,
-                    family: .ipv6,
                     localAddress: localIPv6,
                     gatewayAddress: gatewayIPv6
                 )
-            }
-            if (config.mappingProtocolPreference == .automatic
-                    || config.mappingProtocolPreference == .upnp),
-               config.ipv6PinholeID != nil {
-                throw RouterMappingError.protocolFailure(
-                    "The legacy UPnP IPv6 pinhole has no verifiable IGD identity. "
-                        + "Wait for its router lease to expire or remove it in the original router before continuing."
-                )
-            }
+            )
         }
-        return candidates
+
+        return RouterMappingRemovalReport(attempts: attempts)
     }
 
-    private func reconcileLegacyUPnPIPv4Mapping(
+    private func removeLegacyAutomaticIPv4Mappings(
         config: AppConfig,
         localAddress: String,
         gatewayAddress: String
-    ) throws -> ActiveRouterMapping? {
-        let service = try discoverUPnPService(gatewayAddress: gatewayAddress)
-        let values: [String: String]
-        do {
-            values = try querySpecificUPnPMapping(
-                externalPort: config.externalPort,
-                service: service
+    ) -> [RouterMappingRemovalAttempt] {
+        for transport in [RouterMappingTransport.pcp, .natpmp] {
+            let mapping = legacyMapping(
+                config: config,
+                transport: transport,
+                family: .ipv4,
+                localAddress: localAddress,
+                gatewayAddress: gatewayAddress
             )
-        } catch let error as RouterMappingError where error.isMissingIPv4UPnPMapping {
-            return nil
+            do {
+                try removeMapping(mapping)
+                return [RouterMappingRemovalAttempt(mapping: mapping, errorDescription: nil)]
+            } catch {
+                if Self.isConclusiveLegacyUnsupported(error, transport: transport) {
+                    continue
+                }
+                return [
+                    RouterMappingRemovalAttempt(
+                        mapping: mapping,
+                        errorDescription: error.localizedDescription
+                    )
+                ]
+            }
         }
 
-        guard values["NewInternalClient"] == localAddress,
-              values["NewInternalPort"] == String(config.internalPort),
-              values["NewEnabled"] != "0",
-              values["NewPortMappingDescription"] == "Gatebeam" else {
-            throw RouterMappingError.protocolFailure(
-                "A UPnP rule exists on the original gateway, but its client, port, enabled state, "
-                    + "or description does not exactly match Gatebeam. Refusing to delete it automatically."
-            )
-        }
-
-        let binding = try UPnPControlBinding(
-            service: service,
+        return removeLegacyUPnPIPv4Mapping(
+            config: config,
+            localAddress: localAddress,
             gatewayAddress: gatewayAddress
-        ).encoded()
-        return activeMapping(
+        ).map { [$0] } ?? []
+    }
+
+    private func removeLegacyIPv6Mappings(
+        config: AppConfig,
+        localAddress: String,
+        gatewayAddress: String
+    ) -> [RouterMappingRemovalAttempt] {
+        switch config.mappingProtocolPreference {
+        case .automatic:
+            let pcp = legacyMapping(
+                config: config,
+                transport: .pcp,
+                family: .ipv6,
+                localAddress: localAddress,
+                gatewayAddress: gatewayAddress
+            )
+            do {
+                try removeMapping(pcp)
+                return [RouterMappingRemovalAttempt(mapping: pcp, errorDescription: nil)]
+            } catch {
+                guard Self.isConclusiveLegacyUnsupported(error, transport: .pcp) else {
+                    return [
+                        RouterMappingRemovalAttempt(
+                            mapping: pcp,
+                            errorDescription: error.localizedDescription
+                        )
+                    ]
+                }
+            }
+            guard config.ipv6PinholeID != nil else {
+                return []
+            }
+            return [
+                RouterMappingRemovalAttempt(
+                    mapping: legacyMapping(
+                        config: config,
+                        transport: .upnp,
+                        family: .ipv6,
+                        localAddress: localAddress,
+                        gatewayAddress: gatewayAddress
+                    ),
+                    errorDescription:
+                        "The legacy UPnP IPv6 pinhole has no verifiable IGD identity. "
+                            + "Wait for its router lease to expire or remove it in the original router before continuing."
+                )
+            ]
+        case .pcp:
+            return [
+                removeLegacyMapping(
+                    legacyMapping(
+                        config: config,
+                        transport: .pcp,
+                        family: .ipv6,
+                        localAddress: localAddress,
+                        gatewayAddress: gatewayAddress
+                    )
+                )
+            ]
+        case .natpmp, .disabled:
+            return []
+        case .upnp:
+            guard config.ipv6PinholeID != nil else {
+                return []
+            }
+            return [
+                RouterMappingRemovalAttempt(
+                    mapping: legacyMapping(
+                        config: config,
+                        transport: .upnp,
+                        family: .ipv6,
+                        localAddress: localAddress,
+                        gatewayAddress: gatewayAddress
+                    ),
+                    errorDescription:
+                        "The legacy UPnP IPv6 pinhole has no verifiable IGD identity. "
+                            + "Wait for its router lease to expire or remove it in the original router before continuing."
+                )
+            ]
+        }
+    }
+
+    private func removeLegacyUPnPIPv4Mapping(
+        config: AppConfig,
+        localAddress: String,
+        gatewayAddress: String
+    ) -> RouterMappingRemovalAttempt? {
+        let unbound = legacyMapping(
+            config: config,
+            transport: .upnp,
+            family: .ipv4,
+            localAddress: localAddress,
+            gatewayAddress: gatewayAddress
+        )
+        let service: UPnPService
+        do {
+            service = try discoverUPnPService(gatewayAddress: gatewayAddress)
+        } catch {
+            return RouterMappingRemovalAttempt(
+                mapping: unbound,
+                errorDescription:
+                    "The original UPnP IGD could not be discovered, so its legacy rule could not be verified: "
+                        + error.localizedDescription
+            )
+        }
+
+        let binding: String
+        do {
+            binding = try UPnPControlBinding(
+                service: service,
+                gatewayAddress: gatewayAddress
+            ).encoded()
+        } catch {
+            return RouterMappingRemovalAttempt(
+                mapping: unbound,
+                errorDescription: error.localizedDescription
+            )
+        }
+        let candidate = activeMapping(
             config: config,
             transport: .upnp,
             family: .ipv4,
@@ -369,6 +485,88 @@ final class RouterMappingService: RouterMappingServicing {
             lifetime: 1,
             protocolState: binding
         )
+        let values: [String: String]
+        do {
+            values = try querySpecificUPnPMapping(
+                externalPort: config.externalPort,
+                service: service
+            )
+        } catch let error as RouterMappingError where error.isMissingIPv4UPnPMapping {
+            return nil
+        } catch {
+            return RouterMappingRemovalAttempt(
+                mapping: candidate,
+                errorDescription:
+                    "The legacy UPnP rule could not be verified on the original IGD: "
+                        + error.localizedDescription
+            )
+        }
+
+        do {
+            try validateUPnPIPv4Mapping(values, matches: candidate)
+        } catch {
+            return RouterMappingRemovalAttempt(
+                mapping: candidate,
+                errorDescription: error.localizedDescription
+            )
+        }
+        return removeLegacyMapping(candidate)
+    }
+
+    private func removeLegacyMapping(
+        _ mapping: ActiveRouterMapping
+    ) -> RouterMappingRemovalAttempt {
+        do {
+            try removeMapping(mapping)
+            return RouterMappingRemovalAttempt(mapping: mapping, errorDescription: nil)
+        } catch {
+            return RouterMappingRemovalAttempt(
+                mapping: mapping,
+                errorDescription: error.localizedDescription
+            )
+        }
+    }
+
+    private static func isConclusiveLegacyUnsupported(
+        _ error: Error,
+        transport: RouterMappingTransport
+    ) -> Bool {
+        guard let mappingError = error as? RouterMappingError else {
+            return false
+        }
+        switch (transport, mappingError) {
+        case (.pcp, .pcpResultCode(let code)):
+            return [1, 4, 9].contains(code)
+        case (.natpmp, .natPMPResultCode(let code)):
+            return [1, 5].contains(code)
+        default:
+            return false
+        }
+    }
+
+    private func validateUPnPIPv4Mapping(
+        _ values: [String: String],
+        matches mapping: ActiveRouterMapping
+    ) throws {
+        let acceptedDescriptions = ["Gatebeam", "Remote Control Network"]
+        let echoedExternalPortMatches = values["NewExternalPort"].map {
+            $0 == String(mapping.externalPort)
+        } ?? true
+        let echoedProtocolMatches = values["NewProtocol"].map {
+            $0.caseInsensitiveCompare("TCP") == .orderedSame
+        } ?? true
+        guard echoedExternalPortMatches,
+              echoedProtocolMatches,
+              values["NewInternalClient"] == mapping.localAddress,
+              values["NewInternalPort"] == String(mapping.internalPort),
+              values["NewEnabled"] != "0",
+              values["NewPortMappingDescription"].map(acceptedDescriptions.contains) == true else {
+            throw RouterMappingError.protocolFailure(
+                "A UPnP rule exists on the original gateway, but its external port, protocol, "
+                    + "client, internal port, enabled state, or Gatebeam description does not "
+                    + "exactly match. Refusing to delete it automatically."
+            )
+        }
     }
 
     private func removeMapping(_ mapping: ActiveRouterMapping) throws {
@@ -398,6 +596,16 @@ final class RouterMappingService: RouterMappingServicing {
             )
         case (.ipv4, .upnp):
             let service = try boundUPnPService(for: mapping, expectedService: .ipv4PortMapping)
+            let values: [String: String]
+            do {
+                values = try querySpecificUPnPMapping(
+                    externalPort: mapping.externalPort,
+                    service: service
+                )
+            } catch let error as RouterMappingError where error.isMissingIPv4UPnPMapping {
+                return
+            }
+            try validateUPnPIPv4Mapping(values, matches: mapping)
             try deleteUPnPMapping(externalPort: mapping.externalPort, service: service)
         case (.ipv6, .upnp):
             guard let pinholeID = mapping.pinholeID else {
@@ -675,7 +883,7 @@ final class RouterMappingService: RouterMappingServicing {
         }
         let resultCode = response.readUInt16(at: 2)
         guard resultCode == 0 else {
-            throw RouterMappingError.protocolFailure("NAT-PMP result code \(resultCode)")
+            throw RouterMappingError.natPMPResultCode(resultCode)
         }
         let internalPort = response.readUInt16(at: 8)
         let externalPort = response.readUInt16(at: 10)
@@ -753,7 +961,7 @@ final class RouterMappingService: RouterMappingServicing {
             )
         } catch {
             do {
-                try deleteUPnPMapping(externalPort: config.externalPort, service: service)
+                try removeMapping(mapping)
             } catch let cleanupError {
                 throw RouterMappingRecoveryRequiredError(
                     mapping: mapping,
@@ -1667,7 +1875,7 @@ struct PCPMessageCodec {
         internalPort: UInt16,
         requestedLifetime: UInt32
     ) throws -> PCPMappingResponse {
-        guard response.count >= 60 else {
+        guard response.count >= 24 else {
             throw RouterMappingError.invalidResponse("PCP MAP response too short")
         }
         guard response[0] == 2, response[1] == 0x81 else {
@@ -1675,7 +1883,10 @@ struct PCPMessageCodec {
         }
         let resultCode = response[3]
         guard resultCode == 0 else {
-            throw RouterMappingError.protocolFailure("PCP MAP result code \(resultCode)")
+            throw RouterMappingError.pcpResultCode(resultCode)
+        }
+        guard response.count >= 60 else {
+            throw RouterMappingError.invalidResponse("PCP MAP response too short")
         }
         guard Data(response[24..<36]) == nonce, response[36] == 6 else {
             throw RouterMappingError.invalidResponse("PCP MAP response did not match the request")
@@ -2007,6 +2218,8 @@ enum RouterMappingError: Error, LocalizedError {
     case uncertainAfterSend(String)
     case invalidResponse(String)
     case protocolFailure(String)
+    case pcpResultCode(UInt8)
+    case natPMPResultCode(UInt16)
     case upnpFault(action: String, serviceType: String, statusCode: Int, errorCode: Int?, description: String?)
     case allProtocolsFailed(String)
 
@@ -2016,6 +2229,10 @@ enum RouterMappingError: Error, LocalizedError {
             return "Router mapping is disabled"
         case .socket(let message), .timeout(let message), .uncertainAfterSend(let message), .invalidResponse(let message), .protocolFailure(let message), .allProtocolsFailed(let message):
             return message
+        case .pcpResultCode(let code):
+            return "PCP MAP result code \(code)"
+        case .natPMPResultCode(let code):
+            return "NAT-PMP result code \(code)"
         case .upnpFault(let action, _, let statusCode, let errorCode, let description):
             let code = errorCode.map { " code \($0)" } ?? ""
             let detail = description.map { ": \($0)" } ?? ""

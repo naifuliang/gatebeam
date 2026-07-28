@@ -31,6 +31,42 @@ func response(_ json: String, status: Int = 200) -> HTTPResponse {
     HTTPResponse(statusCode: status, data: Data(json.utf8), headers: [:])
 }
 
+func pcpDeletionResponse(for request: Data, resultCode: UInt8 = 0) -> Data {
+    var result = request
+    result[1] = 0x81
+    result[3] = resultCode
+    return result
+}
+
+func natPMPDeletionResponse(for request: Data, resultCode: UInt16 = 0) -> Data {
+    var result = Data(repeating: 0, count: 16)
+    result[1] = 130
+    result[2] = UInt8((resultCode >> 8) & 0xff)
+    result[3] = UInt8(resultCode & 0xff)
+    result[8] = request[4]
+    result[9] = request[5]
+    result[10] = request[6]
+    result[11] = request[7]
+    return result
+}
+
+func upnpNoSuchEntryResponse() -> HTTPResponse {
+    response("""
+    <s:Envelope>
+      <s:Body>
+        <s:Fault>
+          <detail>
+            <UPnPError>
+              <errorCode>714</errorCode>
+              <errorDescription>NoSuchEntryInArray</errorDescription>
+            </UPnPError>
+          </detail>
+        </s:Fault>
+      </s:Body>
+    </s:Envelope>
+    """, status: 500)
+}
+
 func expect(_ condition: @autoclosure () -> Bool, _ message: String) throws {
     guard condition() else { throw TestFailure(message) }
 }
@@ -386,15 +422,31 @@ func testUPnPRemovalStaysBoundToOriginalRouter() throws {
         },
         soapRequestHandler: { controlURL, _, action, _ in
             deletionURLs.append(controlURL)
-            try expect(action == "DeletePortMapping", "IPv4 removal must issue DeletePortMapping")
-            return response("")
+            switch action {
+            case "GetSpecificPortMappingEntry":
+                return response("""
+                <response>
+                  <NewInternalClient>192.0.2.20</NewInternalClient>
+                  <NewInternalPort>5900</NewInternalPort>
+                  <NewEnabled>1</NewEnabled>
+                  <NewPortMappingDescription>Gatebeam</NewPortMappingDescription>
+                </response>
+                """)
+            case "DeletePortMapping":
+                return response("")
+            default:
+                throw TestFailure("Unexpected IPv4 removal action \(action)")
+            }
         }
     )
     let success = remover.removeMappings([tracked])
     try expect(success.allSucceeded, "The original reachable IGD should remove its tracked mapping")
     try expect(deletionDiscoveryCount == 0, "Removal must never rediscover the current network IGD")
     try expect(verifiedDescriptionURLs == [originalDescriptionURL], "Removal must verify the original IGD identity once")
-    try expect(deletionURLs == [originalControlURL], "Removal must target only the exact original control URL")
+    try expect(
+        deletionURLs == [originalControlURL, originalControlURL],
+        "Removal must query and delete only on the exact original control URL"
+    )
     try expect(!deletionURLs.contains(currentControlURL), "Removal must never touch the new router")
 
     var idempotentIdentityChecks = 0
@@ -411,7 +463,10 @@ func testUPnPRemovalStaysBoundToOriginalRouter() throws {
         soapRequestHandler: { controlURL, _, action, _ in
             idempotentDeleteCalls += 1
             try expect(controlURL == originalControlURL, "Idempotent removal must stay on the original control URL")
-            try expect(action == "DeletePortMapping", "Idempotent removal must only issue DeletePortMapping")
+            try expect(
+                action == "GetSpecificPortMappingEntry",
+                "Idempotent removal must query the exact rule before deciding it is absent"
+            )
             return response("""
             <s:Envelope>
               <s:Body>
@@ -431,7 +486,7 @@ func testUPnPRemovalStaysBoundToOriginalRouter() throws {
     let alreadyAbsentReport = alreadyAbsent.removeMappings([tracked])
     try expect(alreadyAbsentReport.allSucceeded, "UPnP 714 must be treated as an idempotent delete success")
     try expect(idempotentIdentityChecks == 1, "Idempotent delete must verify the original IGD exactly once")
-    try expect(idempotentDeleteCalls == 1, "Idempotent delete must issue exactly one bound request")
+    try expect(idempotentDeleteCalls == 1, "Idempotent cleanup must issue exactly one bound query")
 
     var failedDeletionDiscoveryCount = 0
     var unreachableSOAPCalls = 0
@@ -497,6 +552,22 @@ func testUPnPVerificationFailurePreservesRecoveryIdentity() throws {
     var actions: [String] = []
     let mapper = RouterMappingService(
         upnpDiscoveryHandler: { [service] },
+        upnpDescriptionHandler: { requestedURL in
+            try expect(requestedURL == descriptionURL, "Cleanup must verify the original IGD")
+            return Data("""
+            <root>
+              <device>
+                <UDN>uuid:gatebeam-verification-router</UDN>
+                <serviceList>
+                  <service>
+                    <serviceType>\(service.serviceType)</serviceType>
+                    <controlURL>\(controlURL.absoluteString)</controlURL>
+                  </service>
+                </serviceList>
+              </device>
+            </root>
+            """.utf8)
+        },
         soapRequestHandler: { requestURL, _, action, _ in
             try expect(requestURL == controlURL, "Every UPnP request must stay on the selected IGD")
             actions.append(action)
@@ -512,7 +583,7 @@ func testUPnPVerificationFailurePreservesRecoveryIdentity() throws {
                 </response>
                 """)
             case "DeletePortMapping":
-                throw TestFailure("simulated verification cleanup failure")
+                throw TestFailure("A foreign mapping must never be deleted")
             default:
                 throw TestFailure("Unexpected UPnP action \(action)")
             }
@@ -528,8 +599,12 @@ func testUPnPVerificationFailurePreservesRecoveryIdentity() throws {
         throw TestFailure("Verification failure must not report a successful mapping")
     } catch let recovery as RouterMappingRecoveryRequiredError {
         try expect(
-            actions == ["AddPortMapping", "GetSpecificPortMappingEntry", "DeletePortMapping"],
-            "A failed post-add verification must immediately attempt exact cleanup"
+            actions == [
+                "AddPortMapping",
+                "GetSpecificPortMappingEntry",
+                "GetSpecificPortMappingEntry"
+            ],
+            "A failed post-add verification must re-query and stop before deleting a foreign rule"
         )
         try expect(recovery.mapping.transport == .upnp, "Recovery identity must retain the UPnP transport")
         try expect(recovery.mapping.addressFamily == .ipv4, "Recovery identity must retain the IPv4 family")
@@ -541,8 +616,8 @@ func testUPnPVerificationFailurePreservesRecoveryIdentity() throws {
             "Recovery identity must retain the bound IGD metadata required for exact deletion"
         )
         try expect(
-            recovery.cleanupDescription.contains("simulated verification cleanup failure"),
-            "Recovery error must retain the cleanup failure"
+            recovery.cleanupDescription.contains("Refusing to delete"),
+            "Recovery error must explain why the foreign rule was preserved"
         )
     }
 }
@@ -1053,7 +1128,7 @@ func testLegacyUPnPReconciliationRequiresExactRuleIdentity() throws {
     var config = AppConfig.default
     config.remoteAccessEnabled = true
     config.preferredAddressFamily = .ipv4
-    config.mappingProtocolPreference = .automatic
+    config.mappingProtocolPreference = .upnp
     config.internalPort = 5900
     config.externalPort = 45900
 
@@ -1096,26 +1171,26 @@ func testLegacyUPnPReconciliationRequiresExactRuleIdentity() throws {
             }
         }
     )
-    let candidates = try reconciler.legacyRemovalCandidates(
+    let report = reconciler.removeLegacyMappings(
         config: config,
         localIPv4: "192.0.2.20",
         gatewayIPv4: gateway,
         localIPv6: nil,
         gatewayIPv6: nil
     )
-    let upnpCandidates = candidates.filter { $0.transport == .upnp }
-    try expect(upnpCandidates.count == 1, "A verified legacy UPnP rule must yield one deletion candidate")
+    try expect(report.allSucceeded, "A verified legacy UPnP rule must be deleted")
+    try expect(report.succeededMappings.count == 1, "A verified legacy UPnP rule must yield one successful deletion")
     try expect(
-        upnpCandidates[0].pcpNonce?.hasPrefix("gatebeam-upnp-v1:") == true,
-        "A legacy UPnP candidate must contain bound IGD metadata"
+        report.succeededMappings[0].pcpNonce?.hasPrefix("gatebeam-upnp-v1:") == true,
+        "A legacy UPnP deletion must retain bound IGD metadata"
     )
     try expect(
-        reconciler.removeMappings(upnpCandidates).allSucceeded,
-        "A strictly reconciled legacy UPnP rule must be removable from the same IGD"
-    )
-    try expect(
-        actions == ["GetSpecificPortMappingEntry", "DeletePortMapping"],
-        "Legacy reconciliation must query before it deletes"
+        actions == [
+            "GetSpecificPortMappingEntry",
+            "GetSpecificPortMappingEntry",
+            "DeletePortMapping"
+        ],
+        "Legacy reconciliation and deletion must each query before the exact delete"
     )
 
     let mismatch = RouterMappingService(
@@ -1131,21 +1206,457 @@ func testLegacyUPnPReconciliationRequiresExactRuleIdentity() throws {
             """)
         }
     )
-    do {
-        _ = try mismatch.legacyRemovalCandidates(
+    let mismatchReport = mismatch.removeLegacyMappings(
+        config: config,
+        localIPv4: "192.0.2.20",
+        gatewayIPv4: gateway,
+        localIPv6: nil,
+        gatewayIPv6: nil
+    )
+    try expect(!mismatchReport.allSucceeded, "A mismatched legacy UPnP rule must fail closed")
+    try expect(
+        mismatchReport.failureDescription.contains("Refusing to delete"),
+        "Legacy mismatch must explain the fail-closed decision"
+    )
+    try expect(
+        mismatchReport.remainingMappings.count == 1,
+        "Legacy mismatch must retain a bound recovery identity"
+    )
+}
+
+func testLegacyAutomaticRemovalUsesStrictProtocolOrder() throws {
+    let gateway = "192.0.2.1"
+    let localAddress = "192.0.2.20"
+    let serviceType = "urn:schemas-upnp-org:service:WANIPConnection:1"
+    let controlURL = URL(string: "http://192.0.2.1:5000/upnp/control/WANIPConn1")!
+    let descriptionURL = URL(string: "http://192.0.2.1:5000/rootDesc.xml")!
+    let deviceIdentity = "uuid:automatic-legacy-router"
+    let service = UPnPService(
+        serviceType: serviceType,
+        controlURL: controlURL,
+        gatewayIdentity: gateway,
+        descriptionURL: descriptionURL,
+        deviceIdentity: deviceIdentity
+    )
+    let description = Data("""
+    <root>
+      <device>
+        <UDN>\(deviceIdentity)</UDN>
+        <serviceList>
+          <service>
+            <serviceType>\(serviceType)</serviceType>
+            <controlURL>\(controlURL.absoluteString)</controlURL>
+          </service>
+        </serviceList>
+      </device>
+    </root>
+    """.utf8)
+    var config = AppConfig.default
+    config.remoteAccessEnabled = true
+    config.preferredAddressFamily = .ipv4
+    config.mappingProtocolPreference = .automatic
+    config.internalPort = 5900
+    config.externalPort = 45900
+    config.pcpNonce = Data(repeating: 21, count: 12).base64EncodedString()
+
+    func remove(using mapper: RouterMappingService) -> RouterMappingRemovalReport {
+        mapper.removeLegacyMappings(
             config: config,
-            localIPv4: "192.0.2.20",
+            localIPv4: localAddress,
             gatewayIPv4: gateway,
             localIPv6: nil,
             gatewayIPv6: nil
         )
-        throw TestFailure("A mismatched legacy UPnP rule must fail closed")
-    } catch let error as RouterMappingError {
-        try expect(
-            error.localizedDescription.contains("Refusing to delete"),
-            "Legacy mismatch must explain the fail-closed decision"
-        )
     }
+
+    var pcpOnlyActions: [String] = []
+    var pcpOnlyDiscoveryCount = 0
+    let pcpOnly = RouterMappingService(
+        upnpDiscoveryHandler: {
+            pcpOnlyDiscoveryCount += 1
+            return [service]
+        },
+        udpRequestHandler: { request, _, _, _ in
+            pcpOnlyActions.append("PCP")
+            return pcpDeletionResponse(for: request)
+        }
+    )
+    let pcpOnlyReport = remove(using: pcpOnly)
+    try expect(pcpOnlyReport.allSucceeded, "A confirmed PCP deletion must close legacy Automatic")
+    try expect(
+        pcpOnlyReport.succeededMappings.map(\.transport) == [.pcp],
+        "PCP-only cleanup must retain the exact successful protocol"
+    )
+    try expect(pcpOnlyActions == ["PCP"], "PCP success must stop before NAT-PMP")
+    try expect(pcpOnlyDiscoveryCount == 0, "PCP success must stop before UPnP discovery")
+
+    var natPMPActions: [String] = []
+    var natPMPDiscoveryCount = 0
+    let natPMPOnly = RouterMappingService(
+        upnpDiscoveryHandler: {
+            natPMPDiscoveryCount += 1
+            return [service]
+        },
+        udpRequestHandler: { request, _, _, _ in
+            if request.first == 2 {
+                natPMPActions.append("PCP unsupported")
+                return pcpDeletionResponse(for: request, resultCode: 4)
+            }
+            natPMPActions.append("NAT-PMP")
+            return natPMPDeletionResponse(for: request)
+        }
+    )
+    let natPMPReport = remove(using: natPMPOnly)
+    try expect(natPMPReport.allSucceeded, "A confirmed NAT-PMP deletion must close legacy Automatic")
+    try expect(
+        natPMPReport.succeededMappings.map(\.transport) == [.natpmp],
+        "NAT-PMP-only cleanup must retain the exact successful protocol"
+    )
+    try expect(
+        natPMPActions == ["PCP unsupported", "NAT-PMP"],
+        "Automatic must try NAT-PMP only after conclusive PCP unsupported"
+    )
+    try expect(natPMPDiscoveryCount == 0, "NAT-PMP success must stop before UPnP discovery")
+
+    var upnpUDPActions: [String] = []
+    var upnpSOAPActions: [String] = []
+    let upnpOnly = RouterMappingService(
+        upnpDiscoveryHandler: { [service] },
+        upnpDescriptionHandler: { requestedURL in
+            try expect(requestedURL == descriptionURL, "UPnP cleanup must verify the discovered IGD")
+            return description
+        },
+        soapRequestHandler: { requestURL, _, action, body in
+            try expect(requestURL == controlURL, "UPnP cleanup must stay on the selected IGD")
+            upnpSOAPActions.append(action)
+            switch action {
+            case "GetSpecificPortMappingEntry":
+                try expect(
+                    body.contains("<NewExternalPort>45900</NewExternalPort>")
+                        && body.contains("<NewProtocol>TCP</NewProtocol>"),
+                    "Every UPnP query must select the exact external port and TCP protocol"
+                )
+                return response("""
+                <response>
+                  <NewInternalClient>192.0.2.20</NewInternalClient>
+                  <NewInternalPort>5900</NewInternalPort>
+                  <NewEnabled>1</NewEnabled>
+                  <NewPortMappingDescription>Remote Control Network</NewPortMappingDescription>
+                </response>
+                """)
+            case "DeletePortMapping":
+                return response("")
+            default:
+                throw TestFailure("Unexpected legacy UPnP action \(action)")
+            }
+        },
+        udpRequestHandler: { request, _, _, _ in
+            if request.first == 2 {
+                upnpUDPActions.append("PCP unsupported")
+                return pcpDeletionResponse(for: request, resultCode: 9)
+            }
+            upnpUDPActions.append("NAT-PMP unsupported")
+            return natPMPDeletionResponse(for: request, resultCode: 5)
+        }
+    )
+    let upnpReport = remove(using: upnpOnly)
+    try expect(upnpReport.allSucceeded, "An exactly matched legacy UPnP rule must be deleted")
+    try expect(
+        upnpReport.succeededMappings.map(\.transport) == [.upnp],
+        "UPnP-only cleanup must retain the exact successful protocol"
+    )
+    try expect(
+        upnpUDPActions == ["PCP unsupported", "NAT-PMP unsupported"],
+        "UPnP must run only after both UDP protocols are conclusively unsupported"
+    )
+    try expect(
+        upnpSOAPActions == [
+            "GetSpecificPortMappingEntry",
+            "GetSpecificPortMappingEntry",
+            "DeletePortMapping"
+        ],
+        "UPnP must reconcile, re-query on the bound IGD, then delete"
+    )
+
+    var foreignActions: [String] = []
+    let foreignRule = RouterMappingService(
+        upnpDiscoveryHandler: { [service] },
+        soapRequestHandler: { _, _, action, _ in
+            foreignActions.append(action)
+            return response("""
+            <response>
+              <NewInternalClient>192.0.2.99</NewInternalClient>
+              <NewInternalPort>5900</NewInternalPort>
+              <NewEnabled>1</NewEnabled>
+              <NewPortMappingDescription>Other App</NewPortMappingDescription>
+            </response>
+            """)
+        },
+        udpRequestHandler: { request, _, _, _ in
+            request.first == 2
+                ? pcpDeletionResponse(for: request, resultCode: 4)
+                : natPMPDeletionResponse(for: request, resultCode: 5)
+        }
+    )
+    let foreignReport = remove(using: foreignRule)
+    try expect(!foreignReport.allSucceeded, "A foreign UPnP rule must make cleanup fail closed")
+    try expect(
+        foreignReport.remainingMappings.map(\.transport) == [.upnp],
+        "A foreign UPnP rule must retain only the bound UPnP recovery identity"
+    )
+    try expect(
+        foreignActions == ["GetSpecificPortMappingEntry"],
+        "A foreign UPnP rule must never reach DeletePortMapping"
+    )
+
+    var unsupportedActions: [String] = []
+    let unsupported = RouterMappingService(
+        upnpDiscoveryHandler: { [service] },
+        soapRequestHandler: { _, _, action, _ in
+            unsupportedActions.append(action)
+            return upnpNoSuchEntryResponse()
+        },
+        udpRequestHandler: { request, _, _, _ in
+            request.first == 2
+                ? pcpDeletionResponse(for: request, resultCode: 1)
+                : natPMPDeletionResponse(for: request, resultCode: 1)
+        }
+    )
+    let unsupportedReport = remove(using: unsupported)
+    try expect(
+        unsupportedReport.allSucceeded && unsupportedReport.attempts.isEmpty,
+        "Unsupported UDP protocols followed by no UPnP entry must close idempotently"
+    )
+    try expect(
+        unsupportedActions == ["GetSpecificPortMappingEntry"],
+        "A no-entry result must not issue DeletePortMapping"
+    )
+
+    var uncertainPCPActions: [String] = []
+    var uncertainPCPDiscoveryCount = 0
+    let uncertainPCP = RouterMappingService(
+        upnpDiscoveryHandler: {
+            uncertainPCPDiscoveryCount += 1
+            return [service]
+        },
+        udpRequestHandler: { _, _, _, _ in
+            uncertainPCPActions.append("PCP uncertain")
+            throw RouterMappingError.uncertainAfterSend("Injected PCP deletion response loss")
+        }
+    )
+    let uncertainPCPReport = remove(using: uncertainPCP)
+    try expect(!uncertainPCPReport.allSucceeded, "Uncertain PCP deletion must fail closed")
+    try expect(
+        uncertainPCPReport.remainingMappings.map(\.transport) == [.pcp],
+        "Uncertain PCP deletion must retain only the PCP recovery identity"
+    )
+    try expect(uncertainPCPActions == ["PCP uncertain"], "Uncertain PCP must stop Automatic")
+    try expect(uncertainPCPDiscoveryCount == 0, "Uncertain PCP must block UPnP discovery")
+
+    var uncertainNATPMPActions: [String] = []
+    var uncertainNATPMPDiscoveryCount = 0
+    let uncertainNATPMP = RouterMappingService(
+        upnpDiscoveryHandler: {
+            uncertainNATPMPDiscoveryCount += 1
+            return [service]
+        },
+        udpRequestHandler: { request, _, _, _ in
+            if request.first == 2 {
+                uncertainNATPMPActions.append("PCP unsupported")
+                return pcpDeletionResponse(for: request, resultCode: 4)
+            }
+            uncertainNATPMPActions.append("NAT-PMP uncertain")
+            throw RouterMappingError.uncertainAfterSend("Injected NAT-PMP deletion response loss")
+        }
+    )
+    let uncertainNATPMPReport = remove(using: uncertainNATPMP)
+    try expect(!uncertainNATPMPReport.allSucceeded, "Uncertain NAT-PMP deletion must fail closed")
+    try expect(
+        uncertainNATPMPReport.remainingMappings.map(\.transport) == [.natpmp],
+        "Uncertain NAT-PMP deletion must retain only the NAT-PMP recovery identity"
+    )
+    try expect(
+        uncertainNATPMPActions == ["PCP unsupported", "NAT-PMP uncertain"],
+        "NAT-PMP uncertainty must stop Automatic after conclusive PCP unsupported"
+    )
+    try expect(uncertainNATPMPDiscoveryCount == 0, "NAT-PMP uncertainty must block UPnP discovery")
+
+    var discoveryFailureCalls = 0
+    let discoveryFailure = RouterMappingService(
+        upnpDiscoveryHandler: {
+            discoveryFailureCalls += 1
+            throw RouterMappingError.timeout("Injected UPnP discovery timeout")
+        },
+        udpRequestHandler: { request, _, _, _ in
+            request.first == 2
+                ? pcpDeletionResponse(for: request, resultCode: 4)
+                : natPMPDeletionResponse(for: request, resultCode: 5)
+        }
+    )
+    let discoveryFailureReport = remove(using: discoveryFailure)
+    try expect(!discoveryFailureReport.allSucceeded, "UPnP discovery timeout must remain unknown")
+    try expect(
+        discoveryFailureReport.remainingMappings.map(\.transport) == [.upnp],
+        "UPnP discovery timeout must retain a manual-recovery identity"
+    )
+    try expect(discoveryFailureCalls == 1, "UPnP discovery must be attempted exactly once")
+
+    var dualStackPCPCalls = 0
+    let partialDualStack = RouterMappingService(
+        udpRequestHandler: { request, _, _, _ in
+            dualStackPCPCalls += 1
+            if dualStackPCPCalls == 1 {
+                return pcpDeletionResponse(for: request)
+            }
+            throw RouterMappingError.uncertainAfterSend(
+                "Injected IPv6 PCP deletion response loss"
+            )
+        }
+    )
+    var dualStackConfig = config
+    dualStackConfig.preferredAddressFamily = .dualStack
+    let partialReport = partialDualStack.removeLegacyMappings(
+        config: dualStackConfig,
+        localIPv4: localAddress,
+        gatewayIPv4: gateway,
+        localIPv6: "2606:4700:4700::20",
+        gatewayIPv6: "fe80::1%en0"
+    )
+    try expect(!partialReport.allSucceeded, "Partial dual-stack cleanup must fail closed")
+    try expect(
+        partialReport.succeededMappings.map(\.addressFamily) == [.ipv4],
+        "Partial cleanup must retain the confirmed IPv4 deletion"
+    )
+    try expect(
+        partialReport.remainingMappings.map(\.addressFamily) == [.ipv6],
+        "Partial cleanup must preserve only the uncertain IPv6 identity"
+    )
+}
+
+func testUPnPUncertainAddRecoveryQueriesBeforeDelete() throws {
+    let gateway = "192.0.2.1"
+    let localAddress = "192.0.2.20"
+    let controlURL = URL(string: "http://192.0.2.1:5000/upnp/control/WANIPConn1")!
+    let descriptionURL = URL(string: "http://192.0.2.1:5000/rootDesc.xml")!
+    let serviceType = "urn:schemas-upnp-org:service:WANIPConnection:1"
+    let deviceIdentity = "uuid:uncertain-add-router"
+    let service = UPnPService(
+        serviceType: serviceType,
+        controlURL: controlURL,
+        gatewayIdentity: gateway,
+        descriptionURL: descriptionURL,
+        deviceIdentity: deviceIdentity
+    )
+    let description = Data("""
+    <root>
+      <device>
+        <UDN>\(deviceIdentity)</UDN>
+        <serviceList>
+          <service>
+            <serviceType>\(serviceType)</serviceType>
+            <controlURL>\(controlURL.absoluteString)</controlURL>
+          </service>
+        </serviceList>
+      </device>
+    </root>
+    """.utf8)
+    var config = AppConfig.default
+    config.mappingProtocolPreference = .upnp
+    config.preferredAddressFamily = .ipv4
+    config.internalPort = 5900
+    config.externalPort = 45900
+
+    let creator = RouterMappingService(
+        upnpDiscoveryHandler: { [service] },
+        soapRequestHandler: { _, _, action, _ in
+            try expect(action == "AddPortMapping", "The fixture must lose only the Add response")
+            throw RouterMappingError.timeout("Injected AddPortMapping response loss")
+        }
+    )
+    let recovery: RouterMappingRecoveryRequiredError
+    do {
+        _ = try creator.ensureMapping(
+            config: config,
+            localAddress: localAddress,
+            gatewayAddress: gateway
+        )
+        throw TestFailure("Uncertain AddPortMapping must require recovery")
+    } catch let captured as RouterMappingRecoveryRequiredError {
+        recovery = captured
+    }
+
+    var foreignActions: [String] = []
+    let foreignRemover = RouterMappingService(
+        upnpDescriptionHandler: { _ in description },
+        soapRequestHandler: { _, _, action, body in
+            foreignActions.append(action)
+            try expect(
+                body.contains("<NewExternalPort>45900</NewExternalPort>")
+                    && body.contains("<NewProtocol>TCP</NewProtocol>"),
+                "Recovery must query the exact external port and protocol"
+            )
+            return response("""
+            <response>
+              <NewInternalClient>192.0.2.99</NewInternalClient>
+              <NewInternalPort>5900</NewInternalPort>
+              <NewEnabled>1</NewEnabled>
+              <NewPortMappingDescription>Other App</NewPortMappingDescription>
+            </response>
+            """)
+        }
+    )
+    let foreignReport = foreignRemover.removeMappings([recovery.mapping])
+    try expect(!foreignReport.allSucceeded, "A foreign rule must keep uncertain Add recovery unresolved")
+    try expect(
+        foreignActions == ["GetSpecificPortMappingEntry"],
+        "A foreign rule must stop recovery before DeletePortMapping"
+    )
+
+    var exactActions: [String] = []
+    let exactRemover = RouterMappingService(
+        upnpDescriptionHandler: { _ in description },
+        soapRequestHandler: { _, _, action, _ in
+            exactActions.append(action)
+            switch action {
+            case "GetSpecificPortMappingEntry":
+                return response("""
+                <response>
+                  <NewExternalPort>45900</NewExternalPort>
+                  <NewProtocol>TCP</NewProtocol>
+                  <NewInternalClient>192.0.2.20</NewInternalClient>
+                  <NewInternalPort>5900</NewInternalPort>
+                  <NewEnabled>1</NewEnabled>
+                  <NewPortMappingDescription>Gatebeam</NewPortMappingDescription>
+                </response>
+                """)
+            case "DeletePortMapping":
+                return response("")
+            default:
+                throw TestFailure("Unexpected exact recovery action \(action)")
+            }
+        }
+    )
+    let exactReport = exactRemover.removeMappings([recovery.mapping])
+    try expect(exactReport.allSucceeded, "An exact Gatebeam rule may be deleted during recovery")
+    try expect(
+        exactActions == ["GetSpecificPortMappingEntry", "DeletePortMapping"],
+        "Exact recovery must query immediately before deletion"
+    )
+
+    var timeoutActions: [String] = []
+    let timeoutRemover = RouterMappingService(
+        upnpDescriptionHandler: { _ in description },
+        soapRequestHandler: { _, _, action, _ in
+            timeoutActions.append(action)
+            throw RouterMappingError.timeout("Injected recovery query timeout")
+        }
+    )
+    let timeoutReport = timeoutRemover.removeMappings([recovery.mapping])
+    try expect(!timeoutReport.allSucceeded, "An unconfirmed recovery query must fail closed")
+    try expect(
+        timeoutActions == ["GetSpecificPortMappingEntry"],
+        "An unconfirmed recovery query must never issue DeletePortMapping"
+    )
 }
 
 func testUPnPAddResponseLossPreservesFiniteRecoveryState() throws {
@@ -1619,6 +2130,8 @@ let tests: [(String, () throws -> Void)] = [
     ("preserves IPv6 pinhole ID on uncertain renewal", testIPv6PinholeRenewalPreservesOldIDUnlessExplicitlyMissing),
     ("caps every router lease to temporary access", testTemporaryAccessCapsEveryRouterLease),
     ("reconciles legacy UPnP only after exact identity match", testLegacyUPnPReconciliationRequiresExactRuleIdentity),
+    ("removes legacy Automatic in strict protocol order", testLegacyAutomaticRemovalUsesStrictProtocolOrder),
+    ("queries uncertain UPnP Add recovery before deletion", testUPnPUncertainAddRecoveryQueriesBeforeDelete),
     ("preserves finite recovery state after UPnP add response loss", testUPnPAddResponseLossPreservesFiniteRecoveryState),
     ("discovers IPv6 firewall service with scoped SSDP", testIPv6ScopedSSDPAllowsSameUDNDualStackControlURL),
     ("encodes and decodes PCP MAP", testPCPMapCodec),

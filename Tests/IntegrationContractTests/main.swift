@@ -121,6 +121,8 @@ final class MockRouterMappingService: RouterMappingServicing {
     private var failedRemovalIDs: Set<String> = []
     private var failedEnsureFamilies: Set<RouterMappingAddressFamily> = []
     private var recoveryFailure: RouterMappingRecoveryRequiredError?
+    private var legacyRemovalReport = RouterMappingRemovalReport(attempts: [])
+    private var storedLegacyRemovalCallCount = 0
     var failAllRemovals = false
     var beforeRemoval: (() -> Void)?
     var externalIPv4 = "8.8.8.8"
@@ -143,6 +145,13 @@ final class MockRouterMappingService: RouterMappingServicing {
         operations.current
     }
 
+    var legacyRemovalCallCount: Int {
+        lock.lock()
+        let result = storedLegacyRemovalCallCount
+        lock.unlock()
+        return result
+    }
+
     func setRemovalFailures(_ mappings: [ActiveRouterMapping]) {
         lock.lock()
         failedRemovalIDs = Set(mappings.map(\.identifier))
@@ -158,6 +167,12 @@ final class MockRouterMappingService: RouterMappingServicing {
     func setRecoveryFailure(_ failure: RouterMappingRecoveryRequiredError?) {
         lock.lock()
         recoveryFailure = failure
+        lock.unlock()
+    }
+
+    func setLegacyRemovalReport(_ report: RouterMappingRemovalReport) {
+        lock.lock()
+        legacyRemovalReport = report
         lock.unlock()
     }
 
@@ -212,15 +227,19 @@ final class MockRouterMappingService: RouterMappingServicing {
         )
     }
 
-    func legacyRemovalCandidates(
+    func removeLegacyMappings(
         config: AppConfig,
         localIPv4: String?,
         gatewayIPv4: String?,
         localIPv6: String?,
         gatewayIPv6: String?
-    ) -> [ActiveRouterMapping] {
+    ) -> RouterMappingRemovalReport {
         operations.increment()
-        return []
+        lock.lock()
+        storedLegacyRemovalCallCount += 1
+        let report = legacyRemovalReport
+        lock.unlock()
+        return report
     }
 
     private func ensure(
@@ -2012,6 +2031,85 @@ func testRemoteAccessDisableRetainsFailedMappingForRetry() throws {
     try expect(closedDiskState.activeRouterMappings.isEmpty, "A fully successful close must clear retry state")
 }
 
+func testLegacyAutomaticCleanupPersistsOnlyUnknownProtocol() throws {
+    let baseDirectory = try makeTemporaryDirectory(named: "legacy-automatic-cleanup")
+    defer { try? FileManager.default.removeItem(at: baseDirectory) }
+
+    var previous = AppConfig.default
+    previous.remoteAccessEnabled = true
+    previous.dnsProvider = .disabled
+    previous.preferredAddressFamily = .ipv4
+    previous.mappingProtocolPreference = .automatic
+    previous.pcpNonce = Data(repeating: 27, count: 12).base64EncodedString()
+    previous.activeRouterMappings = []
+
+    let unknown = ActiveRouterMapping(
+        transport: .natpmp,
+        addressFamily: .ipv4,
+        localAddress: "192.0.2.20",
+        gatewayAddress: "192.0.2.1",
+        internalPort: previous.internalPort,
+        externalPort: previous.externalPort,
+        pinholeID: nil,
+        pcpNonce: nil,
+        leaseExpiresAt: .distantFuture,
+        renewAfter: .distantFuture
+    )
+    let store = AppConfigStore(baseDirectory: baseDirectory)
+    try store.save(previous)
+    let router = MockRouterMappingService()
+    router.setLegacyRemovalReport(
+        RouterMappingRemovalReport(
+            attempts: [
+                RouterMappingRemovalAttempt(
+                    mapping: unknown,
+                    errorDescription: "NAT-PMP deletion response was uncertain"
+                )
+            ]
+        )
+    )
+    let agent = NetworkAgent(
+        configStore: store,
+        keychain: inMemoryKeychain(),
+        initialConfig: previous,
+        localNetworkService: MockLocalNetworkService(),
+        routerMappingService: router
+    )
+
+    agent.setRemoteAccessEnabled(false)
+    try expect(
+        waitUntil {
+            router.legacyRemovalCallCount == 1
+                && agent.status.settingsErrorMessage?.contains("retained the failed rules") == true
+        },
+        "An uncertain legacy protocol must block the close transaction"
+    )
+    try expect(agent.config.remoteAccessEnabled, "Legacy uncertainty must keep remote access enabled")
+    try expect(
+        agent.config.activeRouterMappings == [unknown],
+        "Only the exact uncertain legacy protocol may be retained for retry"
+    )
+    let failedDiskState = try store.load()
+    try expect(
+        failedDiskState.activeRouterMappings == [unknown],
+        "The exact uncertain legacy protocol must be checkpointed on disk"
+    )
+
+    agent.setRemoteAccessEnabled(false)
+    try expect(
+        waitUntil {
+            !agent.config.remoteAccessEnabled
+                && agent.config.activeRouterMappings.isEmpty
+                && router.removalCalls == [unknown]
+        },
+        "A retry must use the persisted exact protocol instead of rerunning Automatic discovery"
+    )
+    try expect(
+        router.legacyRemovalCallCount == 1,
+        "Once an uncertain protocol is known, retries must not run the legacy Automatic batch again"
+    )
+}
+
 func testMappingIdentityChangeMustDeleteOldRuleFirst() throws {
     let oldMapping = activeMappingFixture(transport: .pcp, family: .ipv4)
     var previous = AppConfig.default
@@ -3033,6 +3131,7 @@ let tests: [(String, () throws -> Void)] = [
     ("local-origin TCP status semantics", testLocalOriginTCPStatusSemantics),
     ("start-at-login result visibility", testStartAtLoginFailureIsVisibleAndRevertsConfig),
     ("mapping disable retry state", testRemoteAccessDisableRetainsFailedMappingForRetry),
+    ("legacy Automatic exact retry state", testLegacyAutomaticCleanupPersistsOnlyUnknownProtocol),
     ("mapping identity transaction", testMappingIdentityChangeMustDeleteOldRuleFirst),
     ("post-cleanup persistence truth", testPostCleanupPersistenceFailureKeepsTruthfulMappingState),
     ("temporary access cleanup retry", testTemporaryAccessExpiryDoesNotHideCleanupFailure),

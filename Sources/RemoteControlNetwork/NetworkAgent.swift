@@ -2225,25 +2225,7 @@ final class NetworkAgent {
         let localIPv6 = localNetworkService.globalIPv6Address()
         let gatewayIPv6 = localNetworkService.defaultGatewayIPv6()
         let trackedMappings = previous.activeRouterMappings
-        let candidates: [ActiveRouterMapping]
-        if trackedMappings.isEmpty {
-            candidates = try withRevisionBoundSideEffect(
-                revision: expectedRevision,
-                label: "router.mapping.legacy-discovery"
-            ) {
-                try routerMappingService.legacyRemovalCandidates(
-                    config: previous,
-                    localIPv4: localIPv4,
-                    gatewayIPv4: gatewayIPv4,
-                    localIPv6: localIPv6,
-                    gatewayIPv6: gatewayIPv6
-                )
-            }
-        } else {
-            candidates = trackedMappings
-        }
-
-        if candidates.isEmpty,
+        if trackedMappings.isEmpty,
            let missingContext = missingLegacyRemovalContext(
             config: previous,
             localIPv4: localIPv4,
@@ -2259,11 +2241,27 @@ final class NetworkAgent {
             throw NetworkAgentError.transactionFailed(message)
         }
 
-        let report = try withRevisionBoundSideEffect(
-            revision: expectedRevision,
-            label: "router.mapping.config-delete"
-        ) {
-            routerMappingService.removeMappings(candidates)
+        let report: RouterMappingRemovalReport
+        if trackedMappings.isEmpty {
+            report = try withRevisionBoundSideEffect(
+                revision: expectedRevision,
+                label: "router.mapping.legacy-delete"
+            ) {
+                routerMappingService.removeLegacyMappings(
+                    config: previous,
+                    localIPv4: localIPv4,
+                    gatewayIPv4: gatewayIPv4,
+                    localIPv6: localIPv6,
+                    gatewayIPv6: gatewayIPv6
+                )
+            }
+        } else {
+            report = try withRevisionBoundSideEffect(
+                revision: expectedRevision,
+                label: "router.mapping.config-delete"
+            ) {
+                routerMappingService.removeMappings(trackedMappings)
+            }
         }
         var checkpoint = previous
         checkpoint.activeRouterMappings = report.remainingMappings
