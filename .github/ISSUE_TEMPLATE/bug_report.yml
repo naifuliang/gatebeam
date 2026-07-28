@@ -1,5 +1,5 @@
 name: Bug report
-description: Report a reproducible problem.
+description: Report a reproducible Gatebeam problem.
 title: "[Bug] "
 labels:
   - bug
@@ -7,13 +7,33 @@ body:
   - type: markdown
     attributes:
       value: |
-        Please remove credentials, private hostnames, public IP addresses, and other sensitive data before submitting.
+        Before submitting, remove API tokens, domains and hostnames, public IP
+        addresses, router serial numbers, MAC addresses, Keychain content, and
+        other identifying data. Never attach a router backup or configuration
+        export. For a vulnerability or possible remote-desktop exposure, follow
+        SECURITY.md instead of opening a public issue.
   - type: textarea
     id: summary
     attributes:
       label: What happened?
       description: Describe the observed behavior and the expected behavior.
       placeholder: Tell us what went wrong and what you expected instead.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Affected area
+      options:
+        - Menu-bar status or settings UI
+        - Cloudflare DDNS
+        - Public IPv4 or IPv6 discovery
+        - Proxy policy
+        - Router mapping
+        - Temporary access
+        - Keychain authorization
+        - Installation, upgrade, or rollback
+        - Other
     validations:
       required: true
   - type: textarea
@@ -42,8 +62,30 @@ body:
     validations:
       required: true
   - type: textarea
+    id: network
+    attributes:
+      label: Sanitized network context
+      description: |
+        State only relevant characteristics such as IPv4-only, IPv6-only,
+        dual-stack, VPN/TUN, proxy mode, or router protocol. Do not include a
+        domain, hostname, public address, router backup, or account identifier.
+      placeholder: "Example: dual-stack, Direct public-IP discovery, UPnP enabled"
+  - type: textarea
     id: logs
     attributes:
-      label: Relevant logs
-      description: Include sanitized logs or screenshots. Do not include tokens or private network details.
+      label: Sanitized evidence
+      description: |
+        Paste the minimum relevant error text or attach a redacted screenshot.
+        Gatebeam does not currently export diagnostics. Do not include tokens,
+        domains, hostnames, public IP addresses, Keychain prompts containing
+        account names, or router configuration.
       render: text
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy confirmation
+      options:
+        - label: I removed API tokens, domains, hostnames, public IP addresses, router backups, Keychain data, and personal information.
+          required: true
+        - label: This report does not describe a security vulnerability or possible unintended public exposure.
+          required: true
