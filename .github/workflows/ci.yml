@@ -13,13 +13,16 @@ permissions:
 
 jobs:
   macos:
-    name: Backend, proxy policy, and app build
+    name: Test, isolate, and build Gatebeam
     runs-on: macos-14
-    timeout-minutes: 20
+    timeout-minutes: 30
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        # actions/checkout v4.4.0, verified against the official release ref.
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
 
       - name: Run backend tests
         run: ./scripts/test_backend.sh
@@ -27,5 +30,30 @@ jobs:
       - name: Run proxy policy tests
         run: ./scripts/test_proxy_policy.sh
 
-      - name: Build app
+      - name: Run integration contract tests
+        run: ./scripts/test_integration_contract.sh
+
+      - name: Run upgrade compatibility tests
+        run: ./scripts/test_upgrade.sh
+
+      - name: Run UI validation isolation tests
+        run: ./scripts/test_ui_validation.sh
+
+      - name: Validate build assets
+        run: ./scripts/test_build_assets.sh
+
+      - name: Build complete app
         run: ./scripts/build_app.sh
+
+      - name: Verify app signature
+        run: codesign --verify --deep --strict ./dist/Gatebeam.app
+
+      - name: Scan source and app for private material
+        run: ./scripts/test_privacy.sh
+
+      - name: Check committed patch whitespace
+        run: git show --check HEAD
+
+      - name: Check pull request range whitespace
+        if: github.event_name == 'pull_request'
+        run: git diff --check "${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}"

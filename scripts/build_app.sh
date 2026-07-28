@@ -1,4 +1,4 @@
-#!/bin/zsh
+#!/bin/zsh -f
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -11,12 +11,13 @@ CONTENTS_DIR="$APP_DIR/Contents"
 MACOS_DIR="$CONTENTS_DIR/MacOS"
 RESOURCES_DIR="$CONTENTS_DIR/Resources"
 EXECUTABLE="$MACOS_DIR/Gatebeam"
+BUILT_ICON="$BUILD_DIR/app-assets/AppIcon.icns"
 
 mkdir -p "$BUILD_DIR" "$MODULE_CACHE_DIR" "$DIST_DIR"
 rm -rf "$APP_DIR"
 mkdir -p "$MACOS_DIR" "$RESOURCES_DIR"
 
-"$ROOT_DIR/scripts/build_icon.sh"
+/bin/zsh -f "$ROOT_DIR/scripts/build_icon.sh" "$BUILT_ICON"
 
 swiftc \
   -swift-version 5 \
@@ -28,7 +29,7 @@ swiftc \
   -o "$EXECUTABLE"
 
 cp "$ROOT_DIR/Resources/Info.plist" "$CONTENTS_DIR/Info.plist"
-cp "$ROOT_DIR/Resources/AppIcon.icns" "$RESOURCES_DIR/AppIcon.icns"
+cp "$BUILT_ICON" "$RESOURCES_DIR/AppIcon.icns"
 chmod +x "$EXECUTABLE"
 
 if command -v codesign >/dev/null 2>&1; then

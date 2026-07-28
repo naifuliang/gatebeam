@@ -1,0 +1,9 @@
+#!/bin/zsh -f
+set -euo pipefail
+
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+unset CDPATH ENV BASH_ENV
+IFS=$' \t\n'
+
+readonly SCRIPT_DIR="${0:A:h}"
+exec "$SCRIPT_DIR/migrate_legacy_install.sh"

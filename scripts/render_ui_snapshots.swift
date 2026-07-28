@@ -72,6 +72,11 @@ struct UISnapshotRenderer {
                         let settingsSize = NSSize(width: 880, height: 880)
                         let settingsURL = outputDir.appendingPathComponent("\(theme.name)-settings-\(scenario.name).png")
                         render(view: contentView, size: settingsSize, to: settingsURL)
+                        validateSettingsLayout(
+                            contentView,
+                            scenarioName: scenario.name,
+                            themeName: theme.name
+                        )
                         rendered.append((settingsURL, settingsSize))
                     }
                 }
@@ -208,12 +213,31 @@ struct UISnapshotRenderer {
             lastCheckedAt: Date()
         )
 
+        var invalidCustomProxyConfig = makeBaseConfig()
+        invalidCustomProxyConfig.ddnsProxyMode = .custom
+        invalidCustomProxyConfig.publicIPProxyMode = .direct
+        invalidCustomProxyConfig.customProxyURL = "https://proxy.example.net:443/unsupported"
+        let invalidCustomProxyStatus = AppStatus(
+            ddnsStatus: .warning("Custom proxy needs attention"),
+            routerStatus: .ok("Local router traffic stays direct"),
+            remoteDesktopStatus: .ok("Screen Sharing is listening"),
+            externalReachabilityStatus: .disabled("Waiting for a valid proxy configuration"),
+            publicAddress: "203.0.113.42",
+            localAddress: "192.168.1.24",
+            gatewayAddress: "192.168.1.1",
+            externalPort: 45900,
+            connectionURL: "vnc://203.0.113.42:45900",
+            connectionURLIPv4: "vnc://203.0.113.42:45900",
+            lastCheckedAt: Date()
+        )
+
         return [
             SnapshotScenario(name: "ready", config: readyConfig, status: readyStatus),
             SnapshotScenario(name: "off", config: offConfig, status: offStatus),
             SnapshotScenario(name: "error", config: errorConfig, status: errorStatus),
             SnapshotScenario(name: "long-ipv6", config: longIPv6Config, status: longIPv6Status),
-            SnapshotScenario(name: "custom-proxy", config: customProxyConfig, status: customProxyStatus)
+            SnapshotScenario(name: "custom-proxy", config: customProxyConfig, status: customProxyStatus),
+            SnapshotScenario(name: "invalid-custom-proxy", config: invalidCustomProxyConfig, status: invalidCustomProxyStatus)
         ]
     }
 
@@ -276,6 +300,100 @@ struct UISnapshotRenderer {
             try data.write(to: url, options: [.atomic])
         } catch {
             fatalError("Could not write \(url.path): \(error)")
+        }
+    }
+
+    private static func validateSettingsLayout(
+        _ contentView: NSView,
+        scenarioName: String,
+        themeName: String
+    ) {
+        let context = "\(themeName) \(scenarioName)"
+        let views = descendants(of: contentView)
+        guard let scrollView = views.compactMap({ $0 as? NSScrollView }).first,
+              let documentView = scrollView.documentView else {
+            fatalError("\(context): settings content is not inside a scroll view")
+        }
+
+        let cards = views.filter {
+            $0.frame.width > 350 &&
+            abs(($0.layer?.cornerRadius ?? 0) - 8) < 0.1 &&
+            ($0.layer?.borderWidth ?? 0) > 0
+        }
+        guard cards.count == 4 else {
+            fatalError("\(context): expected four settings cards, found \(cards.count)")
+        }
+        let cardWidths = cards.map(\.frame.width)
+        guard let narrowest = cardWidths.min(),
+              let widest = cardWidths.max(),
+              widest - narrowest < 1 else {
+            fatalError("\(context): settings cards are not equal width")
+        }
+
+        guard let headline = textField(containing: [
+            "Remote access is off",
+            "Ready for remote connection",
+            "Needs attention",
+            "Checking connection",
+            "Settings need attention"
+        ], in: views),
+        let intervalHelp = textField(containing: [
+            "Interval defaults to 300 seconds"
+        ], in: views),
+        let saveButton = views.compactMap({ $0 as? NSButton }).first(where: {
+            $0.title == "Save Changes"
+        }) else {
+            fatalError("\(context): required settings controls are missing")
+        }
+
+        assertVisible(headline, inside: contentView, context: "\(context) headline")
+        assertVisible(intervalHelp, inside: scrollView.contentView, context: "\(context) interval help")
+        assertVisible(saveButton, inside: contentView, context: "\(context) save button")
+
+        if scenarioName == "invalid-custom-proxy" {
+            guard let errorLabel = textField(containing: [
+                "Use http://host:port or socks5://host:port."
+            ], in: views), !errorLabel.isHidden else {
+                fatalError("\(context): invalid proxy error is not visible")
+            }
+            assertVisible(errorLabel, inside: scrollView.contentView, context: "\(context) proxy error")
+        }
+
+        let originalFrame = contentView.frame
+        contentView.frame = NSRect(origin: .zero, size: NSSize(width: 880, height: 620))
+        contentView.bounds = NSRect(origin: .zero, size: NSSize(width: 880, height: 620))
+        contentView.layoutSubtreeIfNeeded()
+        scrollView.layoutSubtreeIfNeeded()
+        documentView.layoutSubtreeIfNeeded()
+
+        assertVisible(headline, inside: contentView, context: "\(context) compact headline")
+        assertVisible(saveButton, inside: contentView, context: "\(context) compact save button")
+        guard documentView.frame.height > scrollView.contentView.bounds.height else {
+            fatalError("\(context): compact settings content does not expose a vertical scroll range")
+        }
+
+        contentView.frame = originalFrame
+        contentView.bounds = NSRect(origin: .zero, size: originalFrame.size)
+        contentView.layoutSubtreeIfNeeded()
+    }
+
+    private static func descendants(of root: NSView) -> [NSView] {
+        root.subviews.flatMap { [$0] + descendants(of: $0) }
+    }
+
+    private static func textField(containing candidates: [String], in views: [NSView]) -> NSTextField? {
+        views.compactMap { $0 as? NSTextField }.first { field in
+            candidates.contains { field.stringValue.contains($0) }
+        }
+    }
+
+    private static func assertVisible(_ view: NSView, inside container: NSView, context: String) {
+        let rect = view.convert(view.bounds, to: container)
+        guard !view.isHidden,
+              rect.width > 0,
+              rect.height > 0,
+              container.bounds.intersects(rect) else {
+            fatalError("\(context) is clipped or hidden")
         }
     }
 }
