@@ -265,9 +265,8 @@ final class RouterMappingService: RouterMappingServicing {
     ) -> RouterMappingRemovalReport {
         var attempts: [RouterMappingRemovalAttempt] = []
 
-        func append(_ next: [RouterMappingRemovalAttempt]) -> Bool {
+        func append(_ next: [RouterMappingRemovalAttempt]) {
             attempts.append(contentsOf: next)
-            return next.allSatisfy(\.succeeded)
         }
 
         if config.preferredAddressFamily.usesIPv4,
@@ -304,15 +303,13 @@ final class RouterMappingService: RouterMappingServicing {
             case .disabled:
                 next = []
             }
-            guard append(next) else {
-                return RouterMappingRemovalReport(attempts: attempts)
-            }
+            append(next)
         }
 
         if config.preferredAddressFamily.usesIPv6,
            let localIPv6,
            let gatewayIPv6 {
-            _ = append(
+            append(
                 removeLegacyIPv6Mappings(
                     config: config,
                     localAddress: localIPv6,
@@ -329,6 +326,7 @@ final class RouterMappingService: RouterMappingServicing {
         localAddress: String,
         gatewayAddress: String
     ) -> [RouterMappingRemovalAttempt] {
+        var attempts: [RouterMappingRemovalAttempt] = []
         for transport in [RouterMappingTransport.pcp, .natpmp] {
             let mapping = legacyMapping(
                 config: config,
@@ -339,25 +337,30 @@ final class RouterMappingService: RouterMappingServicing {
             )
             do {
                 try removeMapping(mapping)
-                return [RouterMappingRemovalAttempt(mapping: mapping, errorDescription: nil)]
+                attempts.append(
+                    RouterMappingRemovalAttempt(mapping: mapping, errorDescription: nil)
+                )
             } catch {
                 if Self.isConclusiveLegacyUnsupported(error, transport: transport) {
                     continue
                 }
-                return [
+                attempts.append(
                     RouterMappingRemovalAttempt(
                         mapping: mapping,
                         errorDescription: error.localizedDescription
                     )
-                ]
+                )
             }
         }
 
-        return removeLegacyUPnPIPv4Mapping(
+        if let upnpAttempt = removeLegacyUPnPIPv4Mapping(
             config: config,
             localAddress: localAddress,
             gatewayAddress: gatewayAddress
-        ).map { [$0] } ?? []
+        ) {
+            attempts.append(upnpAttempt)
+        }
+        return attempts
     }
 
     private func removeLegacyIPv6Mappings(
@@ -367,6 +370,7 @@ final class RouterMappingService: RouterMappingServicing {
     ) -> [RouterMappingRemovalAttempt] {
         switch config.mappingProtocolPreference {
         case .automatic:
+            var attempts: [RouterMappingRemovalAttempt] = []
             let pcp = legacyMapping(
                 config: config,
                 transport: .pcp,
@@ -376,21 +380,23 @@ final class RouterMappingService: RouterMappingServicing {
             )
             do {
                 try removeMapping(pcp)
-                return [RouterMappingRemovalAttempt(mapping: pcp, errorDescription: nil)]
+                attempts.append(
+                    RouterMappingRemovalAttempt(mapping: pcp, errorDescription: nil)
+                )
             } catch {
-                guard Self.isConclusiveLegacyUnsupported(error, transport: .pcp) else {
-                    return [
+                if !Self.isConclusiveLegacyUnsupported(error, transport: .pcp) {
+                    attempts.append(
                         RouterMappingRemovalAttempt(
                             mapping: pcp,
                             errorDescription: error.localizedDescription
                         )
-                    ]
+                    )
                 }
             }
             guard config.ipv6PinholeID != nil else {
-                return []
+                return attempts
             }
-            return [
+            attempts.append(
                 RouterMappingRemovalAttempt(
                     mapping: legacyMapping(
                         config: config,
@@ -403,7 +409,8 @@ final class RouterMappingService: RouterMappingServicing {
                         "The legacy UPnP IPv6 pinhole has no verifiable IGD identity. "
                             + "Wait for its router lease to expire or remove it in the original router before continuing."
                 )
-            ]
+            )
+            return attempts
         case .pcp:
             return [
                 removeLegacyMapping(
@@ -606,6 +613,8 @@ final class RouterMappingService: RouterMappingServicing {
                 return
             }
             try validateUPnPIPv4Mapping(values, matches: mapping)
+            // UPnP IGD exposes no conditional delete operation. Another controller
+            // can replace this port between the identity query and this delete.
             try deleteUPnPMapping(externalPort: mapping.externalPort, service: service)
         case (.ipv6, .upnp):
             guard let pinholeID = mapping.pinholeID else {
@@ -696,6 +705,34 @@ final class RouterMappingService: RouterMappingServicing {
         return min(requested, UInt32(min(remaining, TimeInterval(UInt32.max))))
     }
 
+    private func enforceAbsoluteAccessDeadline(
+        config: AppConfig,
+        protocolName: String,
+        mapping: ActiveRouterMapping
+    ) throws -> ActiveRouterMapping {
+        guard let deadline = config.accessExpiresAt else {
+            return mapping
+        }
+        let now = nowProvider()
+        guard now < deadline, mapping.leaseExpiresAt <= deadline else {
+            do {
+                try removeMapping(mapping)
+            } catch {
+                throw RouterMappingRecoveryRequiredError(
+                    mapping: mapping,
+                    operationDescription:
+                        "\(protocolName) completed too late to remain within the temporary-access deadline.",
+                    cleanupDescription:
+                        "Immediate cleanup could not be confirmed: \(error.localizedDescription)"
+                )
+            }
+            throw RouterMappingError.protocolFailure(
+                "\(protocolName) completed too late for temporary access and was closed immediately"
+            )
+        }
+        return mapping
+    }
+
     private func addPCPMapping(
         config: AppConfig,
         localAddress: String,
@@ -735,24 +772,6 @@ final class RouterMappingService: RouterMappingServicing {
                 cleanupDescription: error.localizedDescription
             )
         }
-        guard response.lifetimeSeconds <= requestedLease else {
-            var candidate = activeMapping(
-                config: config,
-                transport: .pcp,
-                family: family,
-                localAddress: localAddress,
-                gatewayAddress: gatewayAddress,
-                externalPort: response.externalPort,
-                lifetime: response.lifetimeSeconds
-            )
-            candidate.pcpNonce = nonce.base64EncodedString()
-            throw RouterMappingRecoveryRequiredError(
-                mapping: candidate,
-                operationDescription:
-                    "PCP returned a \(response.lifetimeSeconds)s lease after Gatebeam requested at most \(requestedLease)s.",
-                cleanupDescription: "The overlong lease must be removed before temporary access can be trusted."
-            )
-        }
         var mapping = activeMapping(
             config: config,
             transport: .pcp,
@@ -763,6 +782,19 @@ final class RouterMappingService: RouterMappingServicing {
             lifetime: response.lifetimeSeconds
         )
         mapping.pcpNonce = nonce.base64EncodedString()
+        mapping = try enforceAbsoluteAccessDeadline(
+            config: config,
+            protocolName: "PCP \(familyName)",
+            mapping: mapping
+        )
+        guard response.lifetimeSeconds <= requestedLease else {
+            throw RouterMappingRecoveryRequiredError(
+                mapping: mapping,
+                operationDescription:
+                    "PCP returned a \(response.lifetimeSeconds)s lease after Gatebeam requested at most \(requestedLease)s.",
+                cleanupDescription: "The overlong lease must be removed before temporary access can be trusted."
+            )
+        }
         return PortMappingResult(
             protocolName: "PCP \(familyName)",
             externalPort: response.externalPort,
@@ -830,8 +862,10 @@ final class RouterMappingService: RouterMappingServicing {
                 cleanupDescription: error.localizedDescription
             )
         }
-        guard response.lifetimeSeconds <= requestedLease else {
-            let candidate = activeMapping(
+        var mapping = try enforceAbsoluteAccessDeadline(
+            config: config,
+            protocolName: "NAT-PMP",
+            mapping: activeMapping(
                 config: config,
                 transport: .natpmp,
                 family: .ipv4,
@@ -840,28 +874,27 @@ final class RouterMappingService: RouterMappingServicing {
                 externalPort: response.externalPort,
                 lifetime: response.lifetimeSeconds
             )
+        )
+        guard response.lifetimeSeconds <= requestedLease else {
             throw RouterMappingRecoveryRequiredError(
-                mapping: candidate,
+                mapping: mapping,
                 operationDescription:
                     "NAT-PMP returned a \(response.lifetimeSeconds)s lease after Gatebeam requested at most \(requestedLease)s.",
                 cleanupDescription: "The overlong lease must be removed before temporary access can be trusted."
             )
         }
         let routerExternalAddress = try? queryNATPMPExternalAddress(gatewayAddress: gatewayAddress)
+        mapping = try enforceAbsoluteAccessDeadline(
+            config: config,
+            protocolName: "NAT-PMP",
+            mapping: mapping
+        )
         return PortMappingResult(
             protocolName: "NAT-PMP",
             externalPort: response.externalPort,
             routerExternalAddress: routerExternalAddress,
             message: "Verified TCP \(response.externalPort) -> \(config.internalPort) for \(response.lifetimeSeconds)s",
-            activeMapping: activeMapping(
-                config: config,
-                transport: .natpmp,
-                family: .ipv4,
-                localAddress: localAddress,
-                gatewayAddress: gatewayAddress,
-                externalPort: response.externalPort,
-                lifetime: response.lifetimeSeconds
-            )
+            activeMapping: mapping
         )
     }
 
@@ -923,16 +956,6 @@ final class RouterMappingService: RouterMappingServicing {
             config: config,
             protocolName: "UPnP IPv4"
         )
-        let mapping = activeMapping(
-            config: config,
-            transport: .upnp,
-            family: .ipv4,
-            localAddress: localAddress,
-            gatewayAddress: gatewayAddress,
-            externalPort: config.externalPort,
-            lifetime: lease,
-            protocolState: binding
-        )
         do {
             try addUPnPMapping(
                 config: config,
@@ -945,6 +968,16 @@ final class RouterMappingService: RouterMappingServicing {
                mappingError.isConclusiveUPnPAddRejection {
                 throw error
             }
+            let mapping = activeMapping(
+                config: config,
+                transport: .upnp,
+                family: .ipv4,
+                localAddress: localAddress,
+                gatewayAddress: gatewayAddress,
+                externalPort: config.externalPort,
+                lifetime: lease,
+                protocolState: binding
+            )
             throw RouterMappingRecoveryRequiredError(
                 mapping: mapping,
                 operationDescription:
@@ -952,14 +985,25 @@ final class RouterMappingService: RouterMappingServicing {
                 cleanupDescription: error.localizedDescription
             )
         }
+        let confirmedLease: UInt32
         do {
-            try verifyUPnPMapping(
+            confirmedLease = try verifyUPnPMapping(
                 config: config,
                 localAddress: localAddress,
                 maximumLease: lease,
                 service: service
             )
         } catch {
+            let mapping = activeMapping(
+                config: config,
+                transport: .upnp,
+                family: .ipv4,
+                localAddress: localAddress,
+                gatewayAddress: gatewayAddress,
+                externalPort: config.externalPort,
+                lifetime: lease,
+                protocolState: binding
+            )
             do {
                 try removeMapping(mapping)
             } catch let cleanupError {
@@ -971,12 +1015,31 @@ final class RouterMappingService: RouterMappingServicing {
             }
             throw error
         }
+        var mapping = try enforceAbsoluteAccessDeadline(
+            config: config,
+            protocolName: "UPnP IPv4",
+            mapping: activeMapping(
+                config: config,
+                transport: .upnp,
+                family: .ipv4,
+                localAddress: localAddress,
+                gatewayAddress: gatewayAddress,
+                externalPort: config.externalPort,
+                lifetime: confirmedLease,
+                protocolState: binding
+            )
+        )
         let routerExternalAddress = try? queryUPnPExternalAddress(service: service)
+        mapping = try enforceAbsoluteAccessDeadline(
+            config: config,
+            protocolName: "UPnP IPv4",
+            mapping: mapping
+        )
         return PortMappingResult(
             protocolName: "UPnP IGD",
             externalPort: config.externalPort,
             routerExternalAddress: routerExternalAddress,
-            message: "Verified TCP \(config.externalPort) -> \(localAddress):\(config.internalPort), \(lease)s lease",
+            message: "Verified TCP \(config.externalPort) -> \(localAddress):\(config.internalPort), \(confirmedLease)s lease",
             activeMapping: mapping
         )
     }
@@ -1012,14 +1075,14 @@ final class RouterMappingService: RouterMappingServicing {
         localAddress: String,
         maximumLease: UInt32,
         service: UPnPService
-    ) throws {
+    ) throws -> UInt32 {
         let values = try querySpecificUPnPMapping(
             externalPort: config.externalPort,
             service: service
         )
         guard values["NewInternalClient"] == localAddress,
               values["NewInternalPort"] == String(config.internalPort),
-              values["NewEnabled"] != "0",
+              values["NewEnabled"]?.trimmingCharacters(in: .whitespacesAndNewlines) == "1",
               values["NewPortMappingDescription"] == "Gatebeam",
               let confirmedLease = values["NewLeaseDuration"].flatMap(UInt32.init),
               confirmedLease > 0,
@@ -1028,6 +1091,7 @@ final class RouterMappingService: RouterMappingServicing {
                 "UPnP mapping could not be confirmed with the requested client, port, description, and finite lease"
             )
         }
+        return confirmedLease
     }
 
     private func querySpecificUPnPMapping(
@@ -1184,13 +1248,10 @@ final class RouterMappingService: RouterMappingServicing {
             }
         }
 
-        return PortMappingResult(
-            protocolName: "UPnP IPv6 Firewall",
-            externalPort: config.internalPort,
-            routerExternalAddress: localAddress,
-            message: "Opened IPv6 TCP \(config.internalPort) to \(localAddress) for \(lease)s",
-            pinholeID: pinholeID,
-            activeMapping: activeMapping(
+        let mapping = try enforceAbsoluteAccessDeadline(
+            config: config,
+            protocolName: "UPnP IPv6",
+            mapping: activeMapping(
                 config: config,
                 transport: .upnp,
                 family: .ipv6,
@@ -1201,6 +1262,14 @@ final class RouterMappingService: RouterMappingServicing {
                 pinholeID: pinholeID,
                 protocolState: binding
             )
+        )
+        return PortMappingResult(
+            protocolName: "UPnP IPv6 Firewall",
+            externalPort: config.internalPort,
+            routerExternalAddress: localAddress,
+            message: "Opened IPv6 TCP \(config.internalPort) to \(localAddress) for \(lease)s",
+            pinholeID: pinholeID,
+            activeMapping: mapping
         )
     }
 

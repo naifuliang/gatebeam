@@ -2455,7 +2455,7 @@ func testRemoteAccessDisableRetainsFailedMappingForRetry() throws {
     try expect(closedDiskState.activeRouterMappings.isEmpty, "A fully successful close must clear retry state")
 }
 
-func testLegacyAutomaticCleanupPersistsOnlyUnknownProtocol() throws {
+func testLegacyAutomaticCleanupPersistsEveryUnknownProtocol() throws {
     let baseDirectory = try makeTemporaryDirectory(named: "legacy-automatic-cleanup")
     defer { try? FileManager.default.removeItem(at: baseDirectory) }
 
@@ -2467,7 +2467,7 @@ func testLegacyAutomaticCleanupPersistsOnlyUnknownProtocol() throws {
     previous.pcpNonce = Data(repeating: 27, count: 12).base64EncodedString()
     previous.activeRouterMappings = []
 
-    let unknown = ActiveRouterMapping(
+    let confirmed = ActiveRouterMapping(
         transport: .natpmp,
         addressFamily: .ipv4,
         localAddress: "192.0.2.20",
@@ -2479,6 +2479,31 @@ func testLegacyAutomaticCleanupPersistsOnlyUnknownProtocol() throws {
         leaseExpiresAt: .distantFuture,
         renewAfter: .distantFuture
     )
+    let unknownPCP = ActiveRouterMapping(
+        transport: .pcp,
+        addressFamily: .ipv4,
+        localAddress: "192.0.2.20",
+        gatewayAddress: "192.0.2.1",
+        internalPort: previous.internalPort,
+        externalPort: previous.externalPort,
+        pinholeID: nil,
+        pcpNonce: previous.pcpNonce,
+        leaseExpiresAt: .distantFuture,
+        renewAfter: .distantFuture
+    )
+    let unknownUPnP = ActiveRouterMapping(
+        transport: .upnp,
+        addressFamily: .ipv4,
+        localAddress: "192.0.2.20",
+        gatewayAddress: "192.0.2.1",
+        internalPort: previous.internalPort,
+        externalPort: previous.externalPort,
+        pinholeID: nil,
+        pcpNonce: "gatebeam-upnp-v1:fixture",
+        leaseExpiresAt: .distantFuture,
+        renewAfter: .distantFuture
+    )
+    let unknownMappings = [unknownPCP, unknownUPnP]
     let store = AppConfigStore(baseDirectory: baseDirectory)
     try store.save(previous)
     let router = MockRouterMappingService()
@@ -2486,8 +2511,16 @@ func testLegacyAutomaticCleanupPersistsOnlyUnknownProtocol() throws {
         RouterMappingRemovalReport(
             attempts: [
                 RouterMappingRemovalAttempt(
-                    mapping: unknown,
-                    errorDescription: "NAT-PMP deletion response was uncertain"
+                    mapping: confirmed,
+                    errorDescription: nil
+                ),
+                RouterMappingRemovalAttempt(
+                    mapping: unknownPCP,
+                    errorDescription: "PCP deletion response was uncertain"
+                ),
+                RouterMappingRemovalAttempt(
+                    mapping: unknownUPnP,
+                    errorDescription: "UPnP rule identity could not be confirmed"
                 )
             ]
         )
@@ -2506,17 +2539,17 @@ func testLegacyAutomaticCleanupPersistsOnlyUnknownProtocol() throws {
             router.legacyRemovalCallCount == 1
                 && agent.status.settingsErrorMessage?.contains("retained the failed rules") == true
         },
-        "An uncertain legacy protocol must block the close transaction"
+        "Uncertain legacy protocols must block the close transaction"
     )
     try expect(agent.config.remoteAccessEnabled, "Legacy uncertainty must keep remote access enabled")
     try expect(
-        agent.config.activeRouterMappings == [unknown],
-        "Only the exact uncertain legacy protocol may be retained for retry"
+        agent.config.activeRouterMappings == unknownMappings,
+        "Every exact uncertain legacy protocol must be retained for retry"
     )
     let failedDiskState = try store.load()
     try expect(
-        failedDiskState.activeRouterMappings == [unknown],
-        "The exact uncertain legacy protocol must be checkpointed on disk"
+        failedDiskState.activeRouterMappings == unknownMappings,
+        "Every exact uncertain legacy protocol must be checkpointed on disk without collapsing state"
     )
 
     agent.setRemoteAccessEnabled(false)
@@ -2524,13 +2557,13 @@ func testLegacyAutomaticCleanupPersistsOnlyUnknownProtocol() throws {
         waitUntil {
             !agent.config.remoteAccessEnabled
                 && agent.config.activeRouterMappings.isEmpty
-                && router.removalCalls == [unknown]
+                && router.removalCalls == unknownMappings
         },
-        "A retry must use the persisted exact protocol instead of rerunning Automatic discovery"
+        "A retry must use every persisted exact protocol instead of rerunning Automatic discovery"
     )
     try expect(
         router.legacyRemovalCallCount == 1,
-        "Once an uncertain protocol is known, retries must not run the legacy Automatic batch again"
+        "Once uncertain protocols are known, retries must not run the legacy Automatic batch again"
     )
 }
 
@@ -3558,7 +3591,7 @@ let tests: [(String, () throws -> Void)] = [
     ("local-origin TCP status semantics", testLocalOriginTCPStatusSemantics),
     ("start-at-login result visibility", testStartAtLoginFailureIsVisibleAndRevertsConfig),
     ("mapping disable retry state", testRemoteAccessDisableRetainsFailedMappingForRetry),
-    ("legacy Automatic exact retry state", testLegacyAutomaticCleanupPersistsOnlyUnknownProtocol),
+    ("legacy Automatic exact retry state", testLegacyAutomaticCleanupPersistsEveryUnknownProtocol),
     ("UPnP recovery explicit enabled contract", testUPnPRecoveryRequiresExplicitEnabledRule),
     ("mapping identity transaction", testMappingIdentityChangeMustDeleteOldRuleFirst),
     ("post-cleanup persistence truth", testPostCleanupPersistenceFailureKeepsTruthfulMappingState),
