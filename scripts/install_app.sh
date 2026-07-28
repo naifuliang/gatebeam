@@ -75,6 +75,13 @@ has_valid_code_signature() {
   /usr/bin/codesign --verify --deep --strict "$1" >/dev/null 2>&1
 }
 
+is_recognized_destination_app() {
+  local app_path="$1"
+
+  is_recognized_app "$app_path" "Gatebeam" "$BUNDLE_ID" ||
+    is_recognized_app "$app_path" "Gatebeam" "$LEGACY_BUNDLE_ID"
+}
+
 validate_legacy_code_signature() {
   has_valid_code_signature "$LEGACY_APP" && return 0
   /bin/echo \
@@ -287,8 +294,12 @@ has_valid_code_signature "$APP_DIR" || {
 }
 
 if path_exists "$DESTINATION"; then
-  is_recognized_app "$DESTINATION" "Gatebeam" "$BUNDLE_ID" || {
+  is_recognized_destination_app "$DESTINATION" || {
     fail "Refusing to replace an unrecognized app: $DESTINATION"
+    exit 1
+  }
+  has_valid_code_signature "$DESTINATION" || {
+    fail "Refusing to replace an application with an invalid code signature: $DESTINATION"
     exit 1
   }
 fi

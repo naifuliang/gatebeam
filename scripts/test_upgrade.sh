@@ -152,6 +152,17 @@ swiftc \
 fixture_root="$(mktemp -d "/private/tmp/gatebeam-upgrade.XXXXXX")"
 trap 'chmod -R u+rwx -- "$fixture_root" 2>/dev/null || true; rm -rf -- "$fixture_root"' EXIT
 
+sign_app() {
+  local app_path="$1"
+  local identifier="$2"
+  codesign \
+    --force \
+    --deep \
+    --sign - \
+    --requirements "=designated => identifier \"$identifier\"" \
+    "$app_path" >/dev/null
+}
+
 make_app() {
   local app_path="$1"
   local identifier="$2"
@@ -164,12 +175,7 @@ make_app() {
   cp /usr/bin/true "$app_path/Contents/MacOS/$executable"
   chmod 0755 "$app_path/Contents/MacOS/$executable"
   if [[ "$sign_app" == true ]]; then
-    codesign \
-      --force \
-      --deep \
-      --sign - \
-      --requirements "=designated => identifier \"$identifier\"" \
-      "$app_path" >/dev/null
+    sign_app "$app_path" "$identifier"
   fi
 }
 
@@ -291,6 +297,24 @@ assert_no_transaction() {
   fi
 }
 
+assert_rejected_destination_unchanged() {
+  local case_name="$1"
+  local source="$2"
+  local destination="$3"
+  local home="$4"
+  local before_manifest="$5"
+
+  if GATEBEAM_APP_DIR="$source" \
+    GATEBEAM_INSTALL_DIR="${destination:h}" \
+    GATEBEAM_USER_HOME="$home" \
+      "$INSTALLER" >/dev/null 2>&1; then
+    print -u2 -- "FAIL: installer accepted unsafe legacy Gatebeam destination: $case_name"
+    exit 1
+  fi
+  assert_tree_snapshot "$before_manifest" "$home"
+  assert_no_transaction "$home"
+}
+
 assert_rollback_state() {
   local rollback_root="$1"
   local destination="$2"
@@ -299,7 +323,7 @@ assert_rollback_state() {
   local transitional="$5"
   local home="$6"
 
-  assert_file_content "old-destination" "$destination/old-marker"
+  assert_file_content "old-destination" "$destination/Contents/Resources/old-marker"
   assert_file_content "old-legacy" "$legacy/Contents/Resources/old-marker"
   assert_tree_snapshot "$rollback_root/destination-before.manifest" "$destination"
   assert_tree_snapshot "$rollback_root/legacy-before.manifest" "$legacy"
@@ -483,6 +507,127 @@ assert_file_content "previous-install" "$signature_destination/old-marker"
 assert_exists "$signature_stable"
 assert_no_transaction "$signature_home"
 
+legacy_gatebeam_root="$fixture_root/developer-legacy-gatebeam"
+legacy_gatebeam_home="$legacy_gatebeam_root/home"
+legacy_gatebeam_apps="$legacy_gatebeam_home/Applications"
+legacy_gatebeam_source="$legacy_gatebeam_root/source/Gatebeam.app"
+legacy_gatebeam_destination="$legacy_gatebeam_apps/Gatebeam.app"
+mkdir -p "$legacy_gatebeam_apps"
+make_app "$legacy_gatebeam_source" "$current_bundle_id" "Gatebeam" true
+make_app "$legacy_gatebeam_destination" "com.local.RemoteControlNetwork" "Gatebeam" true
+mkdir -p "$legacy_gatebeam_destination/Contents/Resources"
+print -r -- "legacy-gatebeam-install" > "$legacy_gatebeam_destination/Contents/Resources/old-marker"
+sign_app "$legacy_gatebeam_destination" "com.local.RemoteControlNetwork"
+
+GATEBEAM_APP_DIR="$legacy_gatebeam_source" \
+GATEBEAM_INSTALL_DIR="$legacy_gatebeam_apps" \
+GATEBEAM_USER_HOME="$legacy_gatebeam_home" \
+  "$INSTALLER" >/dev/null
+
+assert_exists "$legacy_gatebeam_destination"
+assert_missing "$legacy_gatebeam_destination/Contents/Resources/old-marker"
+[[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$legacy_gatebeam_destination/Contents/Info.plist")" == "$current_bundle_id" ]]
+[[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$legacy_gatebeam_destination/Contents/Info.plist")" == "Gatebeam" ]]
+/usr/bin/codesign --verify --deep --strict "$legacy_gatebeam_destination"
+assert_no_transaction "$legacy_gatebeam_home"
+
+legacy_gatebeam_rollback_root="$fixture_root/developer-legacy-gatebeam-rollback"
+legacy_gatebeam_rollback_home="$legacy_gatebeam_rollback_root/home"
+legacy_gatebeam_rollback_apps="$legacy_gatebeam_rollback_home/Applications"
+legacy_gatebeam_rollback_source="$legacy_gatebeam_rollback_root/source/Gatebeam.app"
+legacy_gatebeam_rollback_destination="$legacy_gatebeam_rollback_apps/Gatebeam.app"
+legacy_gatebeam_rollback_before="$legacy_gatebeam_rollback_root/before.manifest"
+mkdir -p "$legacy_gatebeam_rollback_apps"
+make_app "$legacy_gatebeam_rollback_source" "$current_bundle_id" "Gatebeam" true
+make_app "$legacy_gatebeam_rollback_destination" "com.local.RemoteControlNetwork" "Gatebeam" true
+mkdir -p "$legacy_gatebeam_rollback_destination/Contents/Resources"
+print -r -- "restore-legacy-gatebeam" > "$legacy_gatebeam_rollback_destination/Contents/Resources/old-marker"
+sign_app "$legacy_gatebeam_rollback_destination" "com.local.RemoteControlNetwork"
+snapshot_tree "$legacy_gatebeam_rollback_home" "$legacy_gatebeam_rollback_before"
+
+if GATEBEAM_APP_DIR="$legacy_gatebeam_rollback_source" \
+  GATEBEAM_INSTALL_DIR="$legacy_gatebeam_rollback_apps" \
+  GATEBEAM_USER_HOME="$legacy_gatebeam_rollback_home" \
+  GATEBEAM_TEST_FAILURE_POINT=after-app-swap \
+    "$INSTALLER" >/dev/null 2>&1; then
+  print -u2 -- "FAIL: injected legacy Gatebeam upgrade failure unexpectedly succeeded"
+  exit 1
+fi
+assert_tree_snapshot "$legacy_gatebeam_rollback_before" "$legacy_gatebeam_rollback_home"
+assert_file_content \
+  "restore-legacy-gatebeam" \
+  "$legacy_gatebeam_rollback_destination/Contents/Resources/old-marker"
+assert_no_transaction "$legacy_gatebeam_rollback_home"
+
+for rejection_case in unsigned-legacy unsigned-current forged-executable wrong-identifier symlink; do
+  rejection_root="$fixture_root/developer-legacy-gatebeam-$rejection_case"
+  rejection_home="$rejection_root/home"
+  rejection_apps="$rejection_home/Applications"
+  rejection_source="$rejection_root/source/Gatebeam.app"
+  rejection_destination="$rejection_apps/Gatebeam.app"
+  rejection_before="$rejection_root/before.manifest"
+  mkdir -p "$rejection_apps"
+  make_app "$rejection_source" "$current_bundle_id" "Gatebeam" true
+
+  case "$rejection_case" in
+    unsigned-legacy)
+      make_app "$rejection_destination" "com.local.RemoteControlNetwork" "Gatebeam"
+      ;;
+    unsigned-current)
+      make_app "$rejection_destination" "$current_bundle_id" "Gatebeam"
+      ;;
+    forged-executable)
+      make_app "$rejection_destination" "com.local.RemoteControlNetwork" "RemoteControlNetwork" true
+      ;;
+    wrong-identifier)
+      make_app "$rejection_destination" "com.example.Forged" "Gatebeam" true
+      ;;
+    symlink)
+      make_app "$rejection_root/outside/Gatebeam.app" "com.local.RemoteControlNetwork" "Gatebeam" true
+      snapshot_tree "$rejection_root/outside" "$rejection_root/outside-before.manifest"
+      ln -s "$rejection_root/outside/Gatebeam.app" "$rejection_destination"
+      ;;
+  esac
+
+  snapshot_tree "$rejection_home" "$rejection_before"
+  assert_rejected_destination_unchanged \
+    "$rejection_case" \
+    "$rejection_source" \
+    "$rejection_destination" \
+    "$rejection_home" \
+    "$rejection_before"
+  if [[ "$rejection_case" == symlink ]]; then
+    assert_tree_snapshot "$rejection_root/outside-before.manifest" "$rejection_root/outside"
+  fi
+done
+
+legacy_source_root="$fixture_root/developer-legacy-source-rejection"
+legacy_source_home="$legacy_source_root/home"
+legacy_source_apps="$legacy_source_home/Applications"
+legacy_source_app="$legacy_source_root/source/Gatebeam.app"
+legacy_source_destination="$legacy_source_apps/Gatebeam.app"
+legacy_source_before="$legacy_source_root/before.manifest"
+mkdir -p "$legacy_source_apps"
+make_app "$legacy_source_app" "com.local.RemoteControlNetwork" "Gatebeam" true
+make_app "$legacy_source_destination" "$current_bundle_id" "Gatebeam" true
+mkdir -p "$legacy_source_destination/Contents/Resources"
+print -r -- "preserve-current-gatebeam" > "$legacy_source_destination/Contents/Resources/old-marker"
+sign_app "$legacy_source_destination" "$current_bundle_id"
+snapshot_tree "$legacy_source_home" "$legacy_source_before"
+
+if GATEBEAM_APP_DIR="$legacy_source_app" \
+  GATEBEAM_INSTALL_DIR="$legacy_source_apps" \
+  GATEBEAM_USER_HOME="$legacy_source_home" \
+    "$INSTALLER" >/dev/null 2>&1; then
+  print -u2 -- "FAIL: installer accepted a legacy Bundle ID as the source package"
+  exit 1
+fi
+assert_tree_snapshot "$legacy_source_before" "$legacy_source_home"
+assert_file_content \
+  "preserve-current-gatebeam" \
+  "$legacy_source_destination/Contents/Resources/old-marker"
+assert_no_transaction "$legacy_source_home"
+
 legacy_signature_root="$fixture_root/developer-legacy-signature-rejection"
 legacy_signature_home="$legacy_signature_root/home"
 legacy_signature_apps="$legacy_signature_home/Applications"
@@ -550,11 +695,13 @@ rollback_stable="$rollback_agents/$stable_label.plist"
 rollback_transitional="$rollback_agents/$transitional_label.plist"
 mkdir -p "$rollback_apps" "$rollback_agents"
 make_app "$rollback_source" "$current_bundle_id" "Gatebeam" true
-make_app "$rollback_destination" "$current_bundle_id" "Gatebeam"
+make_app "$rollback_destination" "$current_bundle_id" "Gatebeam" true
 make_app "$rollback_legacy" "com.local.RemoteControlNetwork" "RemoteControlNetwork" true
-print "old-destination" > "$rollback_destination/old-marker"
+mkdir -p "$rollback_destination/Contents/Resources"
+print "old-destination" > "$rollback_destination/Contents/Resources/old-marker"
 mkdir -p "$rollback_legacy/Contents/Resources"
 print "old-legacy" > "$rollback_legacy/Contents/Resources/old-marker"
+sign_app "$rollback_destination" "$current_bundle_id"
 codesign \
   --force \
   --deep \
@@ -667,8 +814,10 @@ restore_failure_destination="$restore_failure_apps/Gatebeam.app"
 restore_failure_log="$restore_failure_root/install.log"
 mkdir -p "$restore_failure_apps"
 make_app "$restore_failure_source" "$current_bundle_id" "Gatebeam" true
-make_app "$restore_failure_destination" "$current_bundle_id" "Gatebeam"
-print "recoverable-previous-app" > "$restore_failure_destination/old-marker"
+make_app "$restore_failure_destination" "$current_bundle_id" "Gatebeam" true
+mkdir -p "$restore_failure_destination/Contents/Resources"
+print "recoverable-previous-app" > "$restore_failure_destination/Contents/Resources/old-marker"
+sign_app "$restore_failure_destination" "$current_bundle_id"
 
 set +e
 GATEBEAM_APP_DIR="$restore_failure_source" \
@@ -692,7 +841,7 @@ restore_failure_transaction="$(
 }
 assert_file_content \
   "recoverable-previous-app" \
-  "$restore_failure_transaction/previous.app/old-marker"
+  "$restore_failure_transaction/previous.app/Contents/Resources/old-marker"
 assert_text_present \
   fixed \
   "Recovery files were preserved at: $restore_failure_transaction" \
