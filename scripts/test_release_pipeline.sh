@@ -43,6 +43,7 @@ new_fixture() {
   cp "$FIXTURE_SOURCE/fake_package_pkg.sh" "$fixture/scripts/package_pkg.sh"
   cp "$FIXTURE_SOURCE/fake_package_dmg.sh" "$fixture/scripts/package_dmg.sh"
   cp "$FIXTURE_SOURCE/fake_release_tool.sh" "$tool_dir/release-tool"
+  cp "$FIXTURE_SOURCE/fake_github_api.py" "$tool_dir/fake_github_api.py"
   print -r -- "Gatebeam release test fixture v1" \
     >"$fixture/.gatebeam-release-test-fixture"
   cp \
@@ -50,7 +51,7 @@ new_fixture() {
     "$tool_dir/.gatebeam-release-test-fixture"
   chmod +x "$fixture/scripts/"*.sh "$tool_dir/release-tool"
 
-  for tool in codesign ditto hdiutil lipo pkgutil productsign spctl xcrun; do
+  for tool in codesign curl ditto hdiutil lipo pkgutil productsign spctl xcrun; do
     cp "$tool_dir/release-tool" "$tool_dir/$tool"
   done
 
@@ -103,11 +104,8 @@ run_release() {
     GATEBEAM_DEVELOPER_TEAM_ID="ABCDE12345" \
     GATEBEAM_INSTALLER_SIGN_IDENTITY="Developer ID Installer: Gatebeam Tests (ABCDE12345)" \
     GATEBEAM_NOTARY_PROFILE="fixture profile" \
-    GATEBEAM_PREVIOUS_PUBLIC_BUILD_VERSION=4 \
-    GATEBEAM_RELEASE_TEST_EVIDENCE_URL="https://github.com/gatebeam-tests/gatebeam/actions/runs/123456" \
-    GATEBEAM_RELEASE_CLEAN_MACHINE_EVIDENCE_URL="https://github.com/gatebeam-tests/gatebeam/actions/runs/123457" \
-    GATEBEAM_RELEASE_ROLLBACK_VERSION=0.4.0 \
-    GATEBEAM_RELEASE_ROLLBACK_URL="https://github.com/gatebeam-tests/gatebeam/releases/tag/v0.4.0" \
+    GATEBEAM_RELEASE_CI_RUN_ID=123456 \
+    GATEBEAM_RELEASE_CLEAN_MACHINE_RUN_ID=123457 \
     GATEBEAM_RELEASE_TEST_MODE=1 \
     GATEBEAM_RELEASE_TEST_TOOL_DIR="$tool_dir" \
     GATEBEAM_FAKE_CALL_LOG="$fixture/calls.log" \
@@ -249,76 +247,40 @@ test_two_parent_merge_required() {
 test_release_metadata_inputs() {
   local fixture
 
-  fixture="$(new_fixture missing-previous-build)"
+  fixture="$(new_fixture missing-ci-run)"
   expect_failure \
-    "missing previous public build" \
+    "missing CI run ID" \
     "$fixture" \
-    "GATEBEAM_PREVIOUS_PUBLIC_BUILD_VERSION is required" \
-    GATEBEAM_PREVIOUS_PUBLIC_BUILD_VERSION=
+    "GATEBEAM_RELEASE_CI_RUN_ID is required" \
+    GATEBEAM_RELEASE_CI_RUN_ID=
 
-  fixture="$(new_fixture unsafe-previous-build)"
+  fixture="$(new_fixture unsafe-ci-run)"
   expect_failure \
-    "unsafe previous public build" \
+    "unsafe CI run ID" \
     "$fixture" \
-    "must be a positive decimal integer without leading zeroes" \
-    GATEBEAM_PREVIOUS_PUBLIC_BUILD_VERSION=04
+    "must be a positive GitHub Actions run ID" \
+    GATEBEAM_RELEASE_CI_RUN_ID="https://github.com/attacker/gatebeam/actions/runs/1"
 
-  fixture="$(new_fixture missing-test-evidence)"
+  fixture="$(new_fixture missing-clean-machine-run)"
   expect_failure \
-    "missing release test evidence" \
+    "missing clean-machine run ID" \
     "$fixture" \
-    "GATEBEAM_RELEASE_TEST_EVIDENCE_URL is required" \
-    GATEBEAM_RELEASE_TEST_EVIDENCE_URL=
+    "GATEBEAM_RELEASE_CLEAN_MACHINE_RUN_ID is required" \
+    GATEBEAM_RELEASE_CLEAN_MACHINE_RUN_ID=
 
-  fixture="$(new_fixture unsafe-test-evidence)"
+  fixture="$(new_fixture unsafe-clean-machine-run)"
   expect_failure \
-    "unsafe release test evidence" \
+    "unsafe clean-machine run ID" \
     "$fixture" \
-    "must be an immutable GitHub Actions run URL" \
-    GATEBEAM_RELEASE_TEST_EVIDENCE_URL="https://user:secret""@github.com/gatebeam-tests/gatebeam/actions/runs/1"
+    "must be a positive GitHub Actions run ID" \
+    GATEBEAM_RELEASE_CLEAN_MACHINE_RUN_ID=latest
 
-  fixture="$(new_fixture missing-clean-machine-evidence)"
+  fixture="$(new_fixture unsafe-bootstrap-mode)"
   expect_failure \
-    "missing clean-machine evidence" \
+    "unsafe bootstrap mode" \
     "$fixture" \
-    "GATEBEAM_RELEASE_CLEAN_MACHINE_EVIDENCE_URL is required" \
-    GATEBEAM_RELEASE_CLEAN_MACHINE_EVIDENCE_URL=
-
-  fixture="$(new_fixture unsafe-clean-machine-evidence)"
-  expect_failure \
-    "unsafe clean-machine evidence" \
-    "$fixture" \
-    "GATEBEAM_RELEASE_CLEAN_MACHINE_EVIDENCE_URL must be an immutable GitHub Actions run URL" \
-    GATEBEAM_RELEASE_CLEAN_MACHINE_EVIDENCE_URL="https://github.com/gatebeam-tests/gatebeam/actions/runs/latest"
-
-  fixture="$(new_fixture missing-rollback-version)"
-  expect_failure \
-    "missing rollback version" \
-    "$fixture" \
-    "GATEBEAM_RELEASE_ROLLBACK_VERSION is required" \
-    GATEBEAM_RELEASE_ROLLBACK_VERSION=
-
-  fixture="$(new_fixture unsafe-rollback-version)"
-  expect_failure \
-    "unsafe rollback version" \
-    "$fixture" \
-    "must be a safe version different from the release" \
-    GATEBEAM_RELEASE_ROLLBACK_VERSION=0.5.0 \
-    GATEBEAM_RELEASE_ROLLBACK_URL="https://github.com/gatebeam-tests/gatebeam/releases/tag/v0.5.0"
-
-  fixture="$(new_fixture missing-rollback-url)"
-  expect_failure \
-    "missing rollback URL" \
-    "$fixture" \
-    "GATEBEAM_RELEASE_ROLLBACK_URL is required" \
-    GATEBEAM_RELEASE_ROLLBACK_URL=
-
-  fixture="$(new_fixture unsafe-rollback-url)"
-  expect_failure \
-    "unsafe rollback URL" \
-    "$fixture" \
-    "must be an immutable GitHub release tag URL" \
-    GATEBEAM_RELEASE_ROLLBACK_URL="https://github.com/gatebeam-tests/gatebeam/releases/latest?token=secret"
+    "GATEBEAM_RELEASE_BOOTSTRAP must be 0 or 1" \
+    GATEBEAM_RELEASE_BOOTSTRAP=yes
 
   fixture="$(new_fixture unsafe-notary-profile)"
   expect_failure \
@@ -328,6 +290,95 @@ test_release_metadata_inputs() {
     GATEBEAM_NOTARY_PROFILE="--fixture-profile"
 }
 
+test_github_evidence_binding() {
+  local fixture
+
+  fixture="$(new_fixture github-wrong-repository)"
+  expect_failure \
+    "GitHub workflow wrong repository" \
+    "$fixture" \
+    "GitHub ci workflow evidence did not satisfy the release contract" \
+    GATEBEAM_FAKE_GITHUB_SCENARIO=wrong-repo
+
+  fixture="$(new_fixture github-wrong-head)"
+  expect_failure \
+    "GitHub workflow wrong HEAD" \
+    "$fixture" \
+    "GitHub ci workflow evidence did not satisfy the release contract" \
+    GATEBEAM_FAKE_GITHUB_SCENARIO=wrong-head
+
+  fixture="$(new_fixture github-wrong-conclusion)"
+  expect_failure \
+    "GitHub workflow wrong conclusion" \
+    "$fixture" \
+    "GitHub ci workflow evidence did not satisfy the release contract" \
+    GATEBEAM_FAKE_GITHUB_SCENARIO=wrong-conclusion
+
+  fixture="$(new_fixture github-wrong-workflow)"
+  expect_failure \
+    "GitHub workflow wrong path and name" \
+    "$fixture" \
+    "GitHub ci workflow evidence did not satisfy the release contract" \
+    GATEBEAM_FAKE_GITHUB_SCENARIO=wrong-workflow
+
+  fixture="$(new_fixture github-missing-step)"
+  expect_failure \
+    "GitHub workflow missing required step" \
+    "$fixture" \
+    "GitHub ci workflow evidence did not satisfy the release contract" \
+    GATEBEAM_FAKE_GITHUB_SCENARIO=missing-step
+
+  fixture="$(new_fixture github-immutable-disabled)"
+  expect_failure \
+    "GitHub immutable release setting disabled" \
+    "$fixture" \
+    "GitHub immutable releases are not enabled for the fixed repository" \
+    GATEBEAM_FAKE_GITHUB_SCENARIO=immutable-disabled
+
+  fixture="$(new_fixture github-mutable-release)"
+  expect_failure \
+    "GitHub mutable previous release" \
+    "$fixture" \
+    "latest GitHub release is not a complete immutable formal release" \
+    GATEBEAM_FAKE_GITHUB_SCENARIO=mutable-release
+
+  fixture="$(new_fixture github-rollback-mismatch)"
+  expect_failure \
+    "GitHub rollback asset mismatch" \
+    "$fixture" \
+    "previous immutable release manifest, checksum, build, or rollback asset did not validate" \
+    GATEBEAM_FAKE_GITHUB_SCENARIO=rollback-mismatch
+
+  fixture="$(new_fixture github-network-failure)"
+  expect_failure \
+    "GitHub network failure" \
+    "$fixture" \
+    "GitHub API request failed for immutable release policy" \
+    GATEBEAM_FAKE_GITHUB_SCENARIO=network-failure
+
+  fixture="$(new_fixture github-malformed-json)"
+  expect_failure \
+    "GitHub malformed JSON" \
+    "$fixture" \
+    "GitHub immutable releases are not enabled for the fixed repository" \
+    GATEBEAM_FAKE_GITHUB_SCENARIO=malformed-json
+
+  fixture="$(new_fixture github-asset-failure)"
+  expect_failure \
+    "GitHub release asset failure" \
+    "$fixture" \
+    "GitHub release asset download failed for previous release manifest" \
+    GATEBEAM_FAKE_GITHUB_SCENARIO=asset-failure
+
+  fixture="$(new_fixture bootstrap-existing-release)"
+  expect_failure \
+    "bootstrap with existing release" \
+    "$fixture" \
+    "bootstrap requires proof that the repository has no published release" \
+    GATEBEAM_RELEASE_BOOTSTRAP=1 \
+    GATEBEAM_FAKE_GITHUB_SCENARIO=bootstrap-existing-release
+}
+
 test_build_version_contract() {
   local fixture
 
@@ -335,8 +386,8 @@ test_build_version_contract() {
   expect_failure \
     "non-increasing application build version" \
     "$fixture" \
-    "must be greater than GATEBEAM_PREVIOUS_PUBLIC_BUILD_VERSION" \
-    GATEBEAM_PREVIOUS_PUBLIC_BUILD_VERSION=5
+    "must be greater than the latest immutable release build" \
+    GATEBEAM_FAKE_GITHUB_SCENARIO=stale-build
 
   fixture="$(new_fixture unsafe-built-build-version)"
   expect_failure \
@@ -344,6 +395,54 @@ test_build_version_contract() {
     "$fixture" \
     "built application CFBundleVersion must be a positive decimal integer without leading zeroes" \
     GATEBEAM_FAKE_APP_BUILD_VERSION=05
+}
+
+test_bootstrap_success() {
+  local fixture
+  local manifest
+  fixture="$(new_fixture bootstrap-success)"
+  manifest="$fixture/dist/release-0.5.0/release-manifest.json"
+
+  if ! run_release \
+       "$fixture" \
+       GATEBEAM_RELEASE_BOOTSTRAP=1 >"$fixture/test-output.log" 2>&1; then
+    fail_test "bootstrap without published releases failed"
+    return
+  fi
+  if [[ "$(/usr/bin/plutil -extract previousBuildVersion raw -o - "$manifest")" != "0" ||
+        "$(/usr/bin/plutil -extract rollback.available raw -o - "$manifest")" != "false" ||
+        "$(/usr/bin/plutil -extract rollback.bootstrap raw -o - "$manifest")" != "true" ]]; then
+    fail_test "bootstrap manifest did not record zero history and no rollback"
+    return
+  fi
+  if /usr/bin/plutil -extract rollback.version raw -o - "$manifest" >/dev/null 2>&1 ||
+     /usr/bin/plutil -extract rollback.releaseURL raw -o - "$manifest" >/dev/null 2>&1; then
+    fail_test "bootstrap manifest invented historical rollback metadata"
+    return
+  fi
+  pass "bootstrap without published releases"
+}
+
+test_github_token_not_logged() {
+  local fixture
+  local token="fixture_secret_github_token"
+  fixture="$(new_fixture github-token-privacy)"
+
+  if ! run_release \
+       "$fixture" \
+       "GATEBEAM_GITHUB_TOKEN=$token" >"$fixture/test-output.log" 2>&1; then
+    fail_test "GitHub token privacy fixture failed"
+    return
+  fi
+  if /usr/bin/grep -R -Fq \
+       "$token" \
+       "$fixture/test-output.log" \
+       "$fixture/calls.log" \
+       "$fixture/dist/release-0.5.0"; then
+    fail_test "GitHub token entered release logs or output"
+    return
+  fi
+  pass "GitHub token is absent from logs and release output"
 }
 
 test_wrong_identity() {
@@ -357,11 +456,8 @@ test_wrong_identity() {
     GATEBEAM_DEVELOPER_TEAM_ID="ABCDE12345" \
     GATEBEAM_INSTALLER_SIGN_IDENTITY="Developer ID Installer: Gatebeam Tests (ABCDE12345)" \
     GATEBEAM_NOTARY_PROFILE="fixture profile" \
-    GATEBEAM_PREVIOUS_PUBLIC_BUILD_VERSION=4 \
-    GATEBEAM_RELEASE_TEST_EVIDENCE_URL="https://github.com/gatebeam-tests/gatebeam/actions/runs/123456" \
-    GATEBEAM_RELEASE_CLEAN_MACHINE_EVIDENCE_URL="https://github.com/gatebeam-tests/gatebeam/actions/runs/123457" \
-    GATEBEAM_RELEASE_ROLLBACK_VERSION=0.4.0 \
-    GATEBEAM_RELEASE_ROLLBACK_URL="https://github.com/gatebeam-tests/gatebeam/releases/tag/v0.4.0" \
+    GATEBEAM_RELEASE_CI_RUN_ID=123456 \
+    GATEBEAM_RELEASE_CLEAN_MACHINE_RUN_ID=123457 \
     GATEBEAM_RELEASE_TEST_MODE=1 \
     GATEBEAM_RELEASE_TEST_TOOL_DIR="$fixture/fake tools" \
     /bin/zsh -f "$fixture/scripts/release_formal.sh" >"$output" 2>&1; then
@@ -766,17 +862,18 @@ test_success_and_order() {
   manifest="$release_dir/release-manifest.json"
   [[ "$(/usr/bin/plutil -extract version raw -o - "$manifest")" == "0.5.0" &&
       "$(/usr/bin/plutil -extract buildVersion raw -o - "$manifest")" == "5" &&
-      "$(/usr/bin/plutil -extract previousPublicBuildVersion raw -o - "$manifest")" == "4" &&
+      "$(/usr/bin/plutil -extract previousBuildVersion raw -o - "$manifest")" == "4" &&
       "$(/usr/bin/plutil -extract bundleIdentifier raw -o - "$manifest")" == "io.github.naifuliang.gatebeam" &&
       "$(/usr/bin/plutil -extract teamIdentifier raw -o - "$manifest")" == "ABCDE12345" &&
       "$(/usr/bin/plutil -extract "$manifest_app_submission_key" raw -o - "$manifest")" == "11111111-1111-1111-1111-111111111111" &&
       "$(/usr/bin/plutil -extract "$manifest_app_status_key" raw -o - "$manifest")" == "Accepted" &&
       "$(/usr/bin/plutil -extract "$manifest_pkg_status_key" raw -o - "$manifest")" == "Accepted" &&
       "$(/usr/bin/plutil -extract "$manifest_dmg_status_key" raw -o - "$manifest")" == "Accepted" &&
-      "$(/usr/bin/plutil -extract testing.evidenceURL raw -o - "$manifest")" == "https://github.com/gatebeam-tests/gatebeam/actions/runs/123456" &&
-      "$(/usr/bin/plutil -extract testing.cleanMachineEvidenceURL raw -o - "$manifest")" == "https://github.com/gatebeam-tests/gatebeam/actions/runs/123457" &&
+      "$(/usr/bin/plutil -extract testing.evidenceURL raw -o - "$manifest")" == "https://github.com/naifuliang/gatebeam/actions/runs/123456" &&
+      "$(/usr/bin/plutil -extract testing.cleanMachineEvidenceURL raw -o - "$manifest")" == "https://github.com/naifuliang/gatebeam/actions/runs/123457" &&
       "$(/usr/bin/plutil -extract rollback.version raw -o - "$manifest")" == "0.4.0" &&
-      "$(/usr/bin/plutil -extract rollback.releaseURL raw -o - "$manifest")" == "https://github.com/gatebeam-tests/gatebeam/releases/tag/v0.4.0" &&
+      "$(/usr/bin/plutil -extract rollback.releaseURL raw -o - "$manifest")" == "https://github.com/naifuliang/gatebeam/releases/tag/v0.4.0" &&
+      "$(/usr/bin/plutil -extract rollback.assetName raw -o - "$manifest")" == "Gatebeam-0.4.0.pkg" &&
       "$(/usr/bin/plutil -extract platform.name raw -o - "$manifest")" == "macOS" &&
       "$(/usr/bin/plutil -extract platform.supportedMacOSVersionRange raw -o - "$manifest")" == "13.0 or later" &&
       "$(/usr/bin/plutil -extract testing.status raw -o - "$manifest")" == "Passed" &&
@@ -889,11 +986,8 @@ test_override_restriction() {
     GATEBEAM_DEVELOPER_TEAM_ID="ABCDE12345" \
     GATEBEAM_INSTALLER_SIGN_IDENTITY="Developer ID Installer: Gatebeam Tests (ABCDE12345)" \
     GATEBEAM_NOTARY_PROFILE="fixture profile" \
-    GATEBEAM_PREVIOUS_PUBLIC_BUILD_VERSION=4 \
-    GATEBEAM_RELEASE_TEST_EVIDENCE_URL="https://github.com/gatebeam-tests/gatebeam/actions/runs/123456" \
-    GATEBEAM_RELEASE_CLEAN_MACHINE_EVIDENCE_URL="https://github.com/gatebeam-tests/gatebeam/actions/runs/123457" \
-    GATEBEAM_RELEASE_ROLLBACK_VERSION=0.4.0 \
-    GATEBEAM_RELEASE_ROLLBACK_URL="https://github.com/gatebeam-tests/gatebeam/releases/tag/v0.4.0" \
+    GATEBEAM_RELEASE_CI_RUN_ID=123456 \
+    GATEBEAM_RELEASE_CLEAN_MACHINE_RUN_ID=123457 \
     GATEBEAM_RELEASE_TEST_MODE=1 \
     GATEBEAM_RELEASE_TEST_TOOL_DIR="$TEST_ROOT/not-used" \
     /bin/zsh -f "$ROOT_DIR/scripts/release_formal.sh" >"$output" 2>&1; then
@@ -925,7 +1019,10 @@ test_tag_mismatch
 test_annotated_tag_required
 test_two_parent_merge_required
 test_release_metadata_inputs
+test_github_evidence_binding
 test_build_version_contract
+test_bootstrap_success
+test_github_token_not_logged
 test_wrong_identity
 test_wrong_signed_identity
 test_hardened_runtime

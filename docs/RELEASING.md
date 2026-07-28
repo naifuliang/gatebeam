@@ -33,6 +33,9 @@ A Formal Release requires all preview gates plus:
 - Gatekeeper assessment and clean-machine installation/upgrade verification.
 - Final checksums, a manifest, release notes, rollback material, and a signed or
   otherwise protected release record.
+- Repository-level GitHub Immutable Releases enforcement and an immutable
+  published release whose assets and tag are covered by GitHub's release
+  attestation.
 
 Do not publish a Formal Release when any item is missing.
 
@@ -122,6 +125,7 @@ Run the complete repository suite:
 ./scripts/test_integration_tsan.sh
 ./scripts/test_keychain_identity.sh
 ./scripts/test_upgrade.sh
+./scripts/test_clean_machine_validation.sh
 ./scripts/test_ui_validation.sh
 ./scripts/test_build_assets.sh
 ./scripts/test_release_pipeline.sh
@@ -152,25 +156,56 @@ fail closed unless:
 - Checksums and the manifest are generated only from the final stapled
   artifacts, and output publication is atomic.
 
-`release_formal.sh` also requires explicit, non-secret audit inputs:
+`release_formal.sh` accepts only the numeric run IDs for the two GitHub Actions
+evidence records:
 
 ```sh
-export GATEBEAM_PREVIOUS_PUBLIC_BUILD_VERSION='PREVIOUS_POSITIVE_DECIMAL'
-export GATEBEAM_RELEASE_TEST_EVIDENCE_URL='https://github.com/OWNER/REPOSITORY/actions/runs/RUN_ID'
-export GATEBEAM_RELEASE_CLEAN_MACHINE_EVIDENCE_URL='https://github.com/OWNER/REPOSITORY/actions/runs/RUN_ID'
-export GATEBEAM_RELEASE_ROLLBACK_VERSION='PREVIOUS_VERSION'
-export GATEBEAM_RELEASE_ROLLBACK_URL='https://github.com/OWNER/REPOSITORY/releases/tag/vPREVIOUS_VERSION'
+export GATEBEAM_RELEASE_CI_RUN_ID='CI_RUN_ID'
+export GATEBEAM_RELEASE_CLEAN_MACHINE_RUN_ID='CLEAN_MACHINE_RUN_ID'
 ```
 
-The previous build value must come from the protected manifest of the latest
-public release, contain only a positive decimal integer without leading zeroes,
-and be lower than the `CFBundleVersion` read back from the newly built app.
-Both evidence URLs must identify immutable numeric GitHub Actions runs for the
-exact release commit; the clean-machine run must contain the installation,
-upgrade, rollback, and removal evidence described below. The rollback URL must
-be an immutable GitHub release tag URL matching the rollback version. The
-script rejects missing values, URL credentials, query strings, fragments,
-moving aliases, malformed versions, and unsafe Keychain profile names.
+The script never accepts a repository, evidence URL, previous build number,
+rollback version, rollback URL, or rollback asset from the caller. It uses only
+fixed HTTPS REST endpoints under `api.github.com/repos/naifuliang/gatebeam`,
+with connection and total timeouts, environment proxies disabled, no redirects
+for JSON, and HTTPS-only bounded redirects for protected release-asset bytes.
+Every network, HTTP, JSON, pagination, digest, checksum, and asset failure stops
+the release.
+
+Before building, the script requires
+`GET /repos/naifuliang/gatebeam/immutable-releases` to return `enabled: true`.
+For both run IDs it fetches the workflow run and its jobs/steps, then verifies
+the public repository, exact workflow path and name, `head_sha == HEAD`,
+`completed/success`, the required job, and every required step. The regular CI
+record must be `.github/workflows/ci.yml`; the clean-machine record must be
+`.github/workflows/release-validation.yml`, whose isolated test actually runs
+installation, upgrade, injected-failure rollback, and uninstall validation.
+Only after those machine checks validate may the manifest record `Passed`.
+
+For every release after the first, the script reads `/releases/latest`, requires
+that published release to be immutable, resolves its tag commit, and downloads
+its protected `release-manifest.json` and `SHA256SUMS` assets. GitHub asset
+digests, local bytes, manifest product/tag/version/commit/build fields,
+checksums, and the previous PKG rollback asset must all agree. The new
+`CFBundleVersion` must be greater than that validated manifest's
+`buildVersion`; rollback metadata is derived from the same immutable release.
+
+The first formal release is the only exception and must be explicit:
+
+```sh
+export GATEBEAM_RELEASE_BOOTSTRAP=1
+```
+
+Bootstrap succeeds only when the published releases API returns an empty list.
+It records `previousBuildVersion` as `0` and `rollback.available` as `false`;
+it cannot invent a historical rollback version or URL. Bootstrap is rejected
+as soon as any published release exists.
+
+The fixed repository is public, so authentication is optional. When API rate
+limits require it, `GATEBEAM_GITHUB_TOKEN` may be supplied through a protected
+environment; the script passes it through a mode-`0600` temporary curl config,
+unsets it before child processes run, and never writes it or the notarization
+Keychain profile to retained logs or release output.
 
 ## Build and Sign
 
@@ -308,12 +343,17 @@ shasum -a 256 dist/Gatebeam-VERSION.dmg \
   dist/Gatebeam-VERSION.zip
 ```
 
-On a clean supported macOS account or machine:
+Dispatch `.github/workflows/release-validation.yml` at the exact release tag.
+The resulting run must remain bound to the release `HEAD` and pass its single
+isolated macOS job. That job:
 
-- Install from the final DMG and final signed PKG independently.
-- Confirm Gatekeeper accepts both without bypass instructions.
-- Verify first launch, menu-bar behavior, token authorization, save, restart,
-  upgrade from the previous public build, failed-upgrade rollback, and removal.
+- Builds the application from the checked-out SHA.
+- Runs the package migration and developer installer fixtures, including fresh
+  install, upgrade, repeated install, and failures injected across the
+  transaction with previous-state restoration checks.
+- Installs into a fresh temporary HOME, verifies the application, removes the
+  application and any owned launch agent, and proves no transaction state
+  remains.
 - Exercise only approved test DNS names and router mappings.
 - Do not publish hostnames, public addresses, tokens, router exports, or
   screenshots containing them.
@@ -326,7 +366,8 @@ Create a release manifest containing:
 - Exact source merge commit and annotated tag, which must resolve to the same
   commit.
 - `CFBundleShortVersionString` and the monotonically increasing
-  `CFBundleVersion`, plus the explicitly trusted previous public build version.
+  `CFBundleVersion`, plus `previousBuildVersion` derived from the latest
+  immutable release manifest or `0` in API-proven bootstrap mode.
 - Artifact filenames, byte sizes, and SHA-256 checksums.
 - Bundle ID, Team ID, signing certificate common names and non-secret
   fingerprints.
@@ -335,8 +376,8 @@ Create a release manifest containing:
   Xcode/Swift toolchain versions.
 - Exact release-suite, TSan, and clean-machine evidence URLs for the release
   commit.
-- Known limitations, rollback version, immutable rollback release URL, and
-  rollback instructions.
+- Known limitations and rollback asset metadata derived from the latest
+  immutable release, or an explicit no-history rollback record for bootstrap.
 
 `release_formal.sh` writes these fields from the final stapled artifacts and
 validated inputs. It records byte counts after publication staging, extracts
@@ -347,10 +388,26 @@ must not appear in the manifest or retained notary logs.
 
 Re-run the privacy scan against the tag and release notes. Reconfirm that the
 already-created annotated tag points to the exact merge commit used to build
-the artifacts, then push it once. Publish a GitHub Release whose notes are
-derived from `CHANGELOG.md`. Clearly distinguish Developer Preview notes from
-Formal Release notes. Attach only final verified artifacts, the manifest, and
-checksums.
+the artifacts, then push it once. Follow GitHub's immutable release sequence:
+
+1. Create the GitHub Release as a draft for the exact annotated tag.
+2. Upload every intended release asset to the draft: the final ZIP, PKG, DMG,
+   `release-manifest.json`, and `SHA256SUMS`. Verify every local checksum and
+   uploaded asset before publication; do not plan to add or replace an asset
+   later.
+3. Publish the draft. With Immutable Releases enabled, publication locks the
+   release assets and tag and creates GitHub's release attestation.
+4. Require the release API to report `immutable: true`, run
+   `gh release verify vVERSION`, and run `gh release verify-asset vVERSION`
+   against each local uploaded asset. A human statement or screenshot is not
+   release evidence.
+
+Release notes are derived from `CHANGELOG.md` and must clearly distinguish
+Developer Preview notes from Formal Release notes. See GitHub's
+[Immutable releases](https://docs.github.com/en/code-security/concepts/supply-chain-security/immutable-releases)
+and
+[Verifying the integrity of a release](https://docs.github.com/en/code-security/how-tos/secure-your-supply-chain/secure-your-dependencies/verify-release-integrity)
+for the protection and attestation model.
 
 ## Rollback and Revocation
 
@@ -360,10 +417,10 @@ requires token reauthorization.
 
 If a release is defective but credentials remain trustworthy:
 
-1. Mark the GitHub Release and notes as affected.
-2. Remove unsafe downloadable artifacts without moving or reusing the tag.
-3. Restore the previous verified release as the recommended download.
-4. Publish a fixed version with a new tag and complete the full process again.
+1. Publish an advisory that identifies the affected immutable version; do not
+   attempt to edit its locked assets or tag.
+2. Restore the previous verified immutable release as the recommended download.
+3. Publish a fixed version with a new tag and complete the full process again.
 
 If a signing key, notarization credential, Cloudflare secret, or distributed
 artifact may be compromised:

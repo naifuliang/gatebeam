@@ -1,0 +1,22 @@
+name: Release clean-machine validation
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  clean-machine:
+    name: Validate install, upgrade, rollback, and uninstall
+    runs-on: macos-14
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+
+      - name: Build and validate isolated install, upgrade, rollback, and uninstall
+        run: ./scripts/test_clean_machine_validation.sh

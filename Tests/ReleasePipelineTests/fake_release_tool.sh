@@ -24,6 +24,9 @@ notary_id() {
 }
 
 case "$TOOL_NAME" in
+  curl)
+    exec /usr/bin/python3 -I -E -s "$0:h/fake_github_api.py" "$@"
+    ;;
   ditto)
     if [[ "$1" == "-c" ]]; then
       source_path="${@: -2:1}"

@@ -12,9 +12,25 @@ TEST_MODE="${GATEBEAM_RELEASE_TEST_MODE:-0}"
 TEST_FAILURE_POINT="${GATEBEAM_RELEASE_TEST_FAILURE_POINT:-}"
 FIXTURE_MARKER=".gatebeam-release-test-fixture"
 EXPECTED_BUNDLE_ID="io.github.naifuliang.gatebeam"
+GITHUB_REPOSITORY="naifuliang/gatebeam"
+GITHUB_API_ROOT="https://api.github.com/repos/$GITHUB_REPOSITORY"
+GITHUB_WEB_ROOT="https://github.com/$GITHUB_REPOSITORY"
+CI_WORKFLOW_NAME="CI"
+CI_WORKFLOW_PATH=".github/workflows/ci.yml"
+CLEAN_WORKFLOW_NAME="Release clean-machine validation"
+CLEAN_WORKFLOW_PATH=".github/workflows/release-validation.yml"
 TEMP_ROOT=""
 PUBLISH_STAGING=""
 PUBLISH_LOCK=""
+GITHUB_CURL_CONFIG=""
+PREVIOUS_BUILD_VERSION=""
+PREVIOUS_RELEASE_VERSION=""
+PREVIOUS_RELEASE_TAG=""
+PREVIOUS_RELEASE_COMMIT=""
+PREVIOUS_RELEASE_URL=""
+ROLLBACK_ASSET_NAME=""
+ROLLBACK_ASSET_SHA256=""
+ROLLBACK_AVAILABLE=0
 
 fail() {
   print -u2 -- "error: $*"
@@ -99,6 +115,14 @@ sanitize_environment() {
     GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES \
     GIT_REPLACE_REF_BASE GIT_CONFIG_PARAMETERS GIT_CONFIG_COUNT \
     GIT_EXEC_PATH GIT_TEMPLATE_DIR GIT_EXTERNAL_DIFF \
+    http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY \
+    CURL_CA_BUNDLE SSL_CERT_FILE SSL_CERT_DIR \
+    GITHUB_TOKEN GH_TOKEN \
+    GATEBEAM_PREVIOUS_PUBLIC_BUILD_VERSION \
+    GATEBEAM_RELEASE_TEST_EVIDENCE_URL \
+    GATEBEAM_RELEASE_CLEAN_MACHINE_EVIDENCE_URL \
+    GATEBEAM_RELEASE_ROLLBACK_VERSION \
+    GATEBEAM_RELEASE_ROLLBACK_URL \
     GATEBEAM_PACKAGE_TMPDIR GATEBEAM_TEST_TMPDIR \
     GATEBEAM_TEST_PKG_FAILURE_POINT GATEBEAM_TEST_PKG_SIGNAL_POINT
 
@@ -106,6 +130,8 @@ sanitize_environment() {
   export GIT_CONFIG_GLOBAL=/dev/null
   export GIT_NO_REPLACE_OBJECTS=1
   export PYTHONNOUSERSITE=1
+  export NO_PROXY="*"
+  export no_proxy="*"
 }
 
 git_safe() {
@@ -170,20 +196,406 @@ validate_identity_input() {
   fi
 }
 
-validate_test_evidence_url() {
-  [[ "$GATEBEAM_RELEASE_TEST_EVIDENCE_URL" =~ '^https://github[.]com/[A-Za-z0-9][A-Za-z0-9._-]{0,99}/[A-Za-z0-9][A-Za-z0-9._-]{0,99}/actions/runs/[1-9][0-9]*$' ]] ||
-    fail "GATEBEAM_RELEASE_TEST_EVIDENCE_URL must be an immutable GitHub Actions run URL"
-  [[ "$GATEBEAM_RELEASE_CLEAN_MACHINE_EVIDENCE_URL" =~ '^https://github[.]com/[A-Za-z0-9][A-Za-z0-9._-]{0,99}/[A-Za-z0-9][A-Za-z0-9._-]{0,99}/actions/runs/[1-9][0-9]*$' ]] ||
-    fail "GATEBEAM_RELEASE_CLEAN_MACHINE_EVIDENCE_URL must be an immutable GitHub Actions run URL"
+validate_run_id() {
+  local value="$1"
+  local label="$2"
+
+  [[ "$value" =~ '^[1-9][0-9]*$' ]] ||
+    fail "$label must be a positive GitHub Actions run ID"
 }
 
-validate_rollback_inputs() {
-  [[ "$GATEBEAM_RELEASE_ROLLBACK_VERSION" =~ '^[0-9]+([.][0-9]+){2}([-.][A-Za-z0-9.]+)?$' &&
-      "$GATEBEAM_RELEASE_ROLLBACK_VERSION" != "$VERSION" ]] ||
-    fail "GATEBEAM_RELEASE_ROLLBACK_VERSION must be a safe version different from the release"
-  [[ "$GATEBEAM_RELEASE_ROLLBACK_URL" =~ '^https://github[.]com/[A-Za-z0-9][A-Za-z0-9._-]{0,99}/[A-Za-z0-9][A-Za-z0-9._-]{0,99}/releases/tag/v[0-9]+([.][0-9]+){2}([-.][A-Za-z0-9.]+)?$' &&
-      "$GATEBEAM_RELEASE_ROLLBACK_URL" == */releases/tag/v"$GATEBEAM_RELEASE_ROLLBACK_VERSION" ]] ||
-    fail "GATEBEAM_RELEASE_ROLLBACK_URL must be an immutable GitHub release tag URL matching the rollback version"
+prepare_github_auth() {
+  local token="${GATEBEAM_GITHUB_TOKEN:-}"
+
+  if [[ -n "$token" ]]; then
+    [[ ${#token} -le 255 && "$token" =~ '^[A-Za-z0-9_.=-]+$' ]] ||
+      fail "GATEBEAM_GITHUB_TOKEN contains unsafe characters"
+    GITHUB_CURL_CONFIG="$TEMP_ROOT/github-auth.conf"
+    print -r -- "header = \"Authorization: Bearer $token\"" \
+      >"$GITHUB_CURL_CONFIG"
+    chmod 0600 "$GITHUB_CURL_CONFIG"
+  fi
+  unset GATEBEAM_GITHUB_TOKEN GITHUB_TOKEN GH_TOKEN
+}
+
+github_api_json() {
+  local url="$1"
+  local output_path="$2"
+  local label="$3"
+  local -a curl_arguments
+
+  [[ "$url" == "$GITHUB_API_ROOT/"* ]] ||
+    fail "internal GitHub API endpoint escaped the fixed repository"
+  curl_arguments=(
+    --disable
+    --silent
+    --show-error
+    --fail
+    --noproxy '*'
+    --proto '=https'
+    --max-redirs 0
+    --connect-timeout 10
+    --max-time 30
+    --header 'Accept: application/vnd.github+json'
+    --header 'X-GitHub-Api-Version: 2026-03-10'
+  )
+  if [[ -n "$GITHUB_CURL_CONFIG" ]]; then
+    curl_arguments+=(--config "$GITHUB_CURL_CONFIG")
+  fi
+  curl_arguments+=(--output "$output_path" "$url")
+
+  if ! "$CURL" "${curl_arguments[@]}"; then
+    rm -f -- "$output_path"
+    fail "GitHub API request failed for $label"
+  fi
+  [[ -f "$output_path" && ! -L "$output_path" && -s "$output_path" ]] ||
+    fail "GitHub API returned no safe JSON for $label"
+  (( $(/usr/bin/stat -f '%z' "$output_path") <= 10485760 )) ||
+    fail "GitHub API response was too large for $label"
+}
+
+github_asset_download() {
+  local asset_id="$1"
+  local expected_size="$2"
+  local output_path="$3"
+  local label="$4"
+  local url="$GITHUB_API_ROOT/releases/assets/$asset_id"
+  local -a curl_arguments
+
+  [[ "$asset_id" =~ '^[1-9][0-9]*$' &&
+      "$expected_size" =~ '^[1-9][0-9]*$' &&
+      "$expected_size" -le 1073741824 ]] ||
+    fail "GitHub release asset metadata is unsafe for $label"
+  curl_arguments=(
+    --disable
+    --silent
+    --show-error
+    --fail
+    --noproxy '*'
+    --proto '=https'
+    --proto-redir '=https'
+    --location
+    --max-redirs 3
+    --connect-timeout 10
+    --max-time 300
+    --header 'Accept: application/octet-stream'
+    --header 'X-GitHub-Api-Version: 2026-03-10'
+  )
+  if [[ -n "$GITHUB_CURL_CONFIG" ]]; then
+    curl_arguments+=(--config "$GITHUB_CURL_CONFIG")
+  fi
+  curl_arguments+=(--output "$output_path" "$url")
+
+  if ! "$CURL" "${curl_arguments[@]}"; then
+    rm -f -- "$output_path"
+    fail "GitHub release asset download failed for $label"
+  fi
+  [[ -f "$output_path" && ! -L "$output_path" &&
+      "$(/usr/bin/stat -f '%z' "$output_path")" == "$expected_size" ]] ||
+    fail "GitHub release asset size did not match protected metadata for $label"
+}
+
+validate_workflow_evidence() {
+  local evidence_kind="$1"
+  local run_id="$2"
+  local workflow_name="$3"
+  local workflow_path="$4"
+  local job_name="$5"
+  shift 5
+  local run_json="$TEMP_ROOT/github-$evidence_kind-run.json"
+  local jobs_json="$TEMP_ROOT/github-$evidence_kind-jobs.json"
+  local run_url="$GITHUB_API_ROOT/actions/runs/$run_id"
+  local jobs_url="$run_url/jobs?per_page=100"
+
+  github_api_json "$run_url" "$run_json" "$evidence_kind workflow run"
+  github_api_json "$jobs_url" "$jobs_json" "$evidence_kind workflow jobs"
+  /usr/bin/python3 -I -E -s -c '
+import json
+import sys
+
+run_path, jobs_path, repository, run_id, head_sha, workflow_name, workflow_path, job_name, *required_steps = sys.argv[1:]
+with open(run_path, "rb") as stream:
+    run = json.load(stream)
+with open(jobs_path, "rb") as stream:
+    jobs_document = json.load(stream)
+
+api_root = f"https://api.github.com/repos/{repository}"
+web_root = f"https://github.com/{repository}"
+expected_run_url = f"{api_root}/actions/runs/{run_id}"
+if not isinstance(run, dict):
+    raise SystemExit(1)
+if run.get("id") != int(run_id):
+    raise SystemExit(2)
+repo = run.get("repository")
+if not isinstance(repo, dict) or repo.get("full_name") != repository or repo.get("private") is not False:
+    raise SystemExit(3)
+if run.get("url") != expected_run_url or run.get("html_url") != f"{web_root}/actions/runs/{run_id}":
+    raise SystemExit(4)
+if run.get("jobs_url") != f"{expected_run_url}/jobs":
+    raise SystemExit(5)
+if run.get("name") != workflow_name or str(run.get("path", "")).split("@", 1)[0] != workflow_path:
+    raise SystemExit(6)
+if run.get("head_sha") != head_sha or run.get("status") != "completed" or run.get("conclusion") != "success":
+    raise SystemExit(7)
+
+if not isinstance(jobs_document, dict) or not isinstance(jobs_document.get("jobs"), list):
+    raise SystemExit(8)
+jobs = jobs_document["jobs"]
+if jobs_document.get("total_count") != len(jobs) or len(jobs) > 100:
+    raise SystemExit(9)
+matching_jobs = [job for job in jobs if isinstance(job, dict) and job.get("name") == job_name]
+if len(matching_jobs) != 1:
+    raise SystemExit(10)
+job = matching_jobs[0]
+if job.get("head_sha") != head_sha or job.get("status") != "completed" or job.get("conclusion") != "success":
+    raise SystemExit(11)
+if job.get("workflow_name") != workflow_name or job.get("run_url") != expected_run_url:
+    raise SystemExit(12)
+steps = job.get("steps")
+if not isinstance(steps, list):
+    raise SystemExit(13)
+for required_name in required_steps:
+    matching_steps = [step for step in steps if isinstance(step, dict) and step.get("name") == required_name]
+    if len(matching_steps) != 1:
+        raise SystemExit(14)
+    step = matching_steps[0]
+    if step.get("status") != "completed" or step.get("conclusion") != "success":
+        raise SystemExit(15)
+' \
+    "$run_json" \
+    "$jobs_json" \
+    "$GITHUB_REPOSITORY" \
+    "$run_id" \
+    "$HEAD_COMMIT" \
+    "$workflow_name" \
+    "$workflow_path" \
+    "$job_name" \
+    "$@" ||
+    fail "GitHub $evidence_kind workflow evidence did not satisfy the release contract"
+}
+
+validate_immutable_release_policy() {
+  local policy_json="$TEMP_ROOT/github-immutable-release-policy.json"
+
+  github_api_json \
+    "$GITHUB_API_ROOT/immutable-releases" \
+    "$policy_json" \
+    "immutable release policy"
+  /usr/bin/python3 -I -E -s -c '
+import json
+import sys
+
+with open(sys.argv[1], "rb") as stream:
+    policy = json.load(stream)
+if not isinstance(policy, dict) or policy.get("enabled") is not True:
+    raise SystemExit(1)
+' "$policy_json" ||
+    fail "GitHub immutable releases are not enabled for the fixed repository"
+}
+
+validate_release_history() {
+  local releases_json="$TEMP_ROOT/github-releases.json"
+  local latest_json="$TEMP_ROOT/github-latest-release.json"
+  local selection_json="$TEMP_ROOT/github-release-selection.json"
+  local commit_json="$TEMP_ROOT/github-previous-release-commit.json"
+  local manifest_path="$TEMP_ROOT/previous-release-manifest.json"
+  local checksums_path="$TEMP_ROOT/previous-release-SHA256SUMS"
+  local rollback_path="$TEMP_ROOT/previous-release-rollback.pkg"
+  local validated_json="$TEMP_ROOT/github-validated-history.json"
+  local manifest_id manifest_digest manifest_size
+  local checksums_id checksums_digest checksums_size
+  local rollback_id rollback_size
+
+  if [[ "$GATEBEAM_RELEASE_BOOTSTRAP" == "1" ]]; then
+    github_api_json \
+      "$GITHUB_API_ROOT/releases?per_page=1" \
+      "$releases_json" \
+      "published release list"
+    /usr/bin/python3 -I -E -s -c '
+import json
+import sys
+
+with open(sys.argv[1], "rb") as stream:
+    releases = json.load(stream)
+if not isinstance(releases, list) or releases:
+    raise SystemExit(1)
+' "$releases_json" ||
+      fail "bootstrap requires proof that the repository has no published release"
+    PREVIOUS_BUILD_VERSION=0
+    ROLLBACK_AVAILABLE=0
+    return
+  fi
+
+  github_api_json \
+    "$GITHUB_API_ROOT/releases/latest" \
+    "$latest_json" \
+    "latest published release"
+  /usr/bin/python3 -I -E -s -c '
+import json
+import re
+import sys
+
+source_path, output_path, repository = sys.argv[1:]
+with open(source_path, "rb") as stream:
+    release = json.load(stream)
+if not isinstance(release, dict):
+    raise SystemExit(1)
+if release.get("immutable") is not True or release.get("draft") is not False or release.get("prerelease") is not False:
+    raise SystemExit(2)
+tag = release.get("tag_name")
+if not isinstance(tag, str) or re.fullmatch(r"v[0-9]+(?:[.][0-9]+){2}(?:[-.][A-Za-z0-9.]+)?", tag) is None:
+    raise SystemExit(3)
+version = tag[1:]
+web_root = f"https://github.com/{repository}"
+api_root = f"https://api.github.com/repos/{repository}"
+if release.get("html_url") != f"{web_root}/releases/tag/{tag}":
+    raise SystemExit(4)
+if not isinstance(release.get("id"), int) or release["id"] <= 0:
+    raise SystemExit(5)
+assets = release.get("assets")
+if not isinstance(assets, list):
+    raise SystemExit(6)
+
+def select_asset(name, maximum_size):
+    matches = [asset for asset in assets if isinstance(asset, dict) and asset.get("name") == name]
+    if len(matches) != 1:
+        raise SystemExit(7)
+    asset = matches[0]
+    asset_id = asset.get("id")
+    digest = asset.get("digest")
+    size = asset.get("size")
+    if not isinstance(asset_id, int) or asset_id <= 0:
+        raise SystemExit(8)
+    if not isinstance(size, int) or size <= 0 or size > maximum_size:
+        raise SystemExit(9)
+    if not isinstance(digest, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None:
+        raise SystemExit(10)
+    if asset.get("state") != "uploaded":
+        raise SystemExit(11)
+    if asset.get("url") != f"{api_root}/releases/assets/{asset_id}":
+        raise SystemExit(12)
+    if asset.get("browser_download_url") != f"{web_root}/releases/download/{tag}/{name}":
+        raise SystemExit(13)
+    return {"id": asset_id, "digest": digest[7:], "size": size, "name": name}
+
+selection = {
+    "tag": tag,
+    "version": version,
+    "releaseURL": release["html_url"],
+    "manifest": select_asset("release-manifest.json", 10485760),
+    "checksums": select_asset("SHA256SUMS", 10485760),
+    "rollback": select_asset(f"Gatebeam-{version}.pkg", 1073741824),
+}
+with open(output_path, "w", encoding="utf-8") as stream:
+    json.dump(selection, stream, sort_keys=True)
+' "$latest_json" "$selection_json" "$GITHUB_REPOSITORY" ||
+    fail "latest GitHub release is not a complete immutable formal release"
+
+  PREVIOUS_RELEASE_TAG="$(/usr/bin/plutil -extract tag raw -o - "$selection_json")"
+  PREVIOUS_RELEASE_VERSION="$(/usr/bin/plutil -extract version raw -o - "$selection_json")"
+  PREVIOUS_RELEASE_URL="$(/usr/bin/plutil -extract releaseURL raw -o - "$selection_json")"
+  ROLLBACK_ASSET_NAME="$(/usr/bin/plutil -extract rollback.name raw -o - "$selection_json")"
+  ROLLBACK_ASSET_SHA256="$(/usr/bin/plutil -extract rollback.digest raw -o - "$selection_json")"
+  manifest_id="$(/usr/bin/plutil -extract manifest.id raw -o - "$selection_json")"
+  manifest_digest="$(/usr/bin/plutil -extract manifest.digest raw -o - "$selection_json")"
+  manifest_size="$(/usr/bin/plutil -extract manifest.size raw -o - "$selection_json")"
+  checksums_id="$(/usr/bin/plutil -extract checksums.id raw -o - "$selection_json")"
+  checksums_digest="$(/usr/bin/plutil -extract checksums.digest raw -o - "$selection_json")"
+  checksums_size="$(/usr/bin/plutil -extract checksums.size raw -o - "$selection_json")"
+  rollback_id="$(/usr/bin/plutil -extract rollback.id raw -o - "$selection_json")"
+  rollback_size="$(/usr/bin/plutil -extract rollback.size raw -o - "$selection_json")"
+
+  github_api_json \
+    "$GITHUB_API_ROOT/commits/$PREVIOUS_RELEASE_TAG" \
+    "$commit_json" \
+    "previous release tag commit"
+  github_asset_download \
+    "$manifest_id" "$manifest_size" "$manifest_path" "previous release manifest"
+  github_asset_download \
+    "$checksums_id" "$checksums_size" "$checksums_path" "previous release checksums"
+  github_asset_download \
+    "$rollback_id" "$rollback_size" "$rollback_path" "previous release rollback package"
+  [[ "$(/usr/bin/shasum -a 256 "$manifest_path" | /usr/bin/awk '{print $1}')" == "$manifest_digest" ]] ||
+    fail "previous release manifest did not match its protected GitHub digest"
+  [[ "$(/usr/bin/shasum -a 256 "$checksums_path" | /usr/bin/awk '{print $1}')" == "$checksums_digest" ]] ||
+    fail "previous release checksums did not match their protected GitHub digest"
+  [[ "$(/usr/bin/shasum -a 256 "$rollback_path" | /usr/bin/awk '{print $1}')" == "$ROLLBACK_ASSET_SHA256" ]] ||
+    fail "previous release rollback package did not match its protected GitHub digest"
+
+  /usr/bin/python3 -I -E -s -c '
+import json
+import re
+import sys
+
+manifest_path, checksums_path, commit_path, selection_path, output_path = sys.argv[1:]
+with open(manifest_path, "rb") as stream:
+    manifest = json.load(stream)
+with open(commit_path, "rb") as stream:
+    commit_document = json.load(stream)
+with open(selection_path, "rb") as stream:
+    selection = json.load(stream)
+
+commit = commit_document.get("sha") if isinstance(commit_document, dict) else None
+if not isinstance(commit, str) or re.fullmatch(r"[0-9a-f]{40,64}", commit) is None:
+    raise SystemExit(1)
+if (
+    not isinstance(manifest, dict)
+    or manifest.get("schemaVersion") not in (2, 3)
+    or manifest.get("product") != "Gatebeam"
+    or manifest.get("bundleIdentifier") != "io.github.naifuliang.gatebeam"
+):
+    raise SystemExit(2)
+if manifest.get("tag") != selection["tag"] or manifest.get("version") != selection["version"] or manifest.get("commit") != commit:
+    raise SystemExit(3)
+build = manifest.get("buildVersion")
+if not isinstance(build, str) or re.fullmatch(r"[1-9][0-9]*", build) is None:
+    raise SystemExit(4)
+older_build = manifest.get("previousBuildVersion", manifest.get("previousPublicBuildVersion"))
+if older_build is not None:
+    if not isinstance(older_build, str) or re.fullmatch(r"(?:0|[1-9][0-9]*)", older_build) is None:
+        raise SystemExit(5)
+    if int(older_build) >= int(build):
+        raise SystemExit(6)
+
+rollback = selection["rollback"]
+artifacts = manifest.get("artifacts")
+if not isinstance(artifacts, list):
+    raise SystemExit(7)
+matching_artifacts = [artifact for artifact in artifacts if isinstance(artifact, dict) and artifact.get("name") == rollback["name"]]
+if len(matching_artifacts) != 1:
+    raise SystemExit(8)
+artifact = matching_artifacts[0]
+if (
+    artifact.get("type") != "installer-package"
+    or artifact.get("sha256") != rollback["digest"]
+    or artifact.get("byteCount") != rollback["size"]
+):
+    raise SystemExit(9)
+
+checksums = {}
+with open(checksums_path, "r", encoding="utf-8") as stream:
+    for raw_line in stream:
+        line = raw_line.rstrip("\n")
+        match = re.fullmatch(r"([0-9a-f]{64})  ([A-Za-z0-9][A-Za-z0-9._-]*)", line)
+        if match is None or match.group(2) in checksums:
+            raise SystemExit(10)
+        checksums[match.group(2)] = match.group(1)
+if checksums.get(rollback["name"]) != rollback["digest"]:
+    raise SystemExit(11)
+
+with open(output_path, "w", encoding="utf-8") as stream:
+    json.dump({"commit": commit, "previousBuildVersion": build}, stream, sort_keys=True)
+' "$manifest_path" "$checksums_path" "$commit_json" "$selection_json" "$validated_json" ||
+    fail "previous immutable release manifest, checksum, build, or rollback asset did not validate"
+
+  PREVIOUS_RELEASE_COMMIT="$(/usr/bin/plutil -extract commit raw -o - "$validated_json")"
+  PREVIOUS_BUILD_VERSION="$(/usr/bin/plutil -extract previousBuildVersion raw -o - "$validated_json")"
+  git_safe -C "$ROOT_DIR" cat-file -e "$PREVIOUS_RELEASE_COMMIT^{commit}" 2>/dev/null ||
+    fail "previous immutable release commit is unavailable in the release worktree"
+  git_safe -C "$ROOT_DIR" merge-base --is-ancestor \
+    "$PREVIOUS_RELEASE_COMMIT" "$HEAD_COMMIT" ||
+    fail "previous immutable release commit is not an ancestor of HEAD"
+  ROLLBACK_AVAILABLE=1
 }
 
 inject_test_failure() {
@@ -294,14 +706,14 @@ write_manifest() {
   local notary_app_key="notarization"".app"
 
   /usr/bin/plutil -create xml1 "$plist_path"
-  /usr/bin/plutil -insert schemaVersion -integer 2 "$plist_path"
+  /usr/bin/plutil -insert schemaVersion -integer 3 "$plist_path"
   /usr/bin/plutil -insert product -string Gatebeam "$plist_path"
   /usr/bin/plutil -insert commit -string "$HEAD_COMMIT" "$plist_path"
   /usr/bin/plutil -insert tag -string "$RELEASE_TAG" "$plist_path"
   /usr/bin/plutil -insert version -string "$VERSION" "$plist_path"
   /usr/bin/plutil -insert buildVersion -string "$BUILD_VERSION" "$plist_path"
-  /usr/bin/plutil -insert previousPublicBuildVersion -string \
-    "$GATEBEAM_PREVIOUS_PUBLIC_BUILD_VERSION" "$plist_path"
+  /usr/bin/plutil -insert previousBuildVersion -string \
+    "$PREVIOUS_BUILD_VERSION" "$plist_path"
   /usr/bin/plutil -insert bundleIdentifier -string "$BUNDLE_ID" "$plist_path"
   /usr/bin/plutil -insert teamIdentifier -string "$GATEBEAM_DEVELOPER_TEAM_ID" "$plist_path"
   /usr/bin/plutil -insert source -json '{}' "$plist_path"
@@ -385,21 +797,48 @@ write_manifest() {
 
   /usr/bin/plutil -insert testing -json '{}' "$plist_path"
   /usr/bin/plutil -insert testing.evidenceURL -string \
-    "$GATEBEAM_RELEASE_TEST_EVIDENCE_URL" "$plist_path"
+    "$RELEASE_TEST_EVIDENCE_URL" "$plist_path"
   /usr/bin/plutil -insert testing.cleanMachineEvidenceURL -string \
-    "$GATEBEAM_RELEASE_CLEAN_MACHINE_EVIDENCE_URL" "$plist_path"
+    "$RELEASE_CLEAN_MACHINE_EVIDENCE_URL" "$plist_path"
+  /usr/bin/plutil -insert testing.workflow -string "$CI_WORKFLOW_PATH" "$plist_path"
+  /usr/bin/plutil -insert testing.workflowName -string \
+    "$CI_WORKFLOW_NAME" "$plist_path"
+  /usr/bin/plutil -insert testing.cleanMachineWorkflow -string \
+    "$CLEAN_WORKFLOW_PATH" "$plist_path"
+  /usr/bin/plutil -insert testing.cleanMachineWorkflowName -string \
+    "$CLEAN_WORKFLOW_NAME" "$plist_path"
   /usr/bin/plutil -insert testing.commit -string "$HEAD_COMMIT" "$plist_path"
+  /usr/bin/plutil -insert testing.cleanMachineCommit -string \
+    "$HEAD_COMMIT" "$plist_path"
   /usr/bin/plutil -insert testing.status -string Passed "$plist_path"
   /usr/bin/plutil -insert testing.cleanMachineStatus -string Passed "$plist_path"
   /usr/bin/plutil -insert testing.gates -json \
-    '["test_backend","test_proxy_policy","test_integration_contract","test_integration_tsan","test_keychain_identity","test_upgrade","test_ui_validation","test_build_assets","test_release_pipeline","test_privacy","build_app","codesign_verify","diff_check"]' \
+    '["test_backend","test_proxy_policy","test_integration_contract","test_integration_tsan","test_keychain_identity","test_upgrade","test_ui_validation","test_build_assets","test_release_pipeline","test_privacy","build_app","codesign_verify","diff_check","test_clean_machine_validation"]' \
     "$plist_path"
 
   /usr/bin/plutil -insert rollback -json '{}' "$plist_path"
-  /usr/bin/plutil -insert rollback.version -string \
-    "$GATEBEAM_RELEASE_ROLLBACK_VERSION" "$plist_path"
-  /usr/bin/plutil -insert rollback.releaseURL -string \
-    "$GATEBEAM_RELEASE_ROLLBACK_URL" "$plist_path"
+  if (( ROLLBACK_AVAILABLE )); then
+    /usr/bin/plutil -insert rollback.available -bool true "$plist_path"
+    /usr/bin/plutil -insert rollback.version -string \
+      "$PREVIOUS_RELEASE_VERSION" "$plist_path"
+    /usr/bin/plutil -insert rollback.releaseURL -string \
+      "$PREVIOUS_RELEASE_URL" "$plist_path"
+    /usr/bin/plutil -insert rollback.assetName -string \
+      "$ROLLBACK_ASSET_NAME" "$plist_path"
+    /usr/bin/plutil -insert rollback.assetSHA256 -string \
+      "$ROLLBACK_ASSET_SHA256" "$plist_path"
+    /usr/bin/plutil -insert rollback.sourceCommit -string \
+      "$PREVIOUS_RELEASE_COMMIT" "$plist_path"
+    /usr/bin/plutil -insert rollback.sourceManifestURL -string \
+      "$GITHUB_WEB_ROOT/releases/download/$PREVIOUS_RELEASE_TAG/release-manifest.json" \
+      "$plist_path"
+    /usr/bin/plutil -insert rollback.sourceChecksumsURL -string \
+      "$GITHUB_WEB_ROOT/releases/download/$PREVIOUS_RELEASE_TAG/SHA256SUMS" \
+      "$plist_path"
+  else
+    /usr/bin/plutil -insert rollback.available -bool false "$plist_path"
+    /usr/bin/plutil -insert rollback.bootstrap -bool true "$plist_path"
+  fi
   /usr/bin/plutil -insert rollback.procedure -string \
     "docs/RELEASING.md#rollback-and-revocation" "$plist_path"
   /usr/bin/plutil -insert knownLimitations -json \
@@ -421,14 +860,16 @@ require_environment GATEBEAM_CODE_SIGN_IDENTITY
 require_environment GATEBEAM_DEVELOPER_TEAM_ID
 require_environment GATEBEAM_INSTALLER_SIGN_IDENTITY
 require_environment GATEBEAM_NOTARY_PROFILE
-require_environment GATEBEAM_PREVIOUS_PUBLIC_BUILD_VERSION
-require_environment GATEBEAM_RELEASE_TEST_EVIDENCE_URL
-require_environment GATEBEAM_RELEASE_CLEAN_MACHINE_EVIDENCE_URL
-require_environment GATEBEAM_RELEASE_ROLLBACK_VERSION
-require_environment GATEBEAM_RELEASE_ROLLBACK_URL
+require_environment GATEBEAM_RELEASE_CI_RUN_ID
+require_environment GATEBEAM_RELEASE_CLEAN_MACHINE_RUN_ID
+
+GATEBEAM_RELEASE_BOOTSTRAP="${GATEBEAM_RELEASE_BOOTSTRAP:-0}"
 
 [[ "$TEST_MODE" == "0" || "$TEST_MODE" == "1" ]] ||
   fail "GATEBEAM_RELEASE_TEST_MODE must be 0 or 1"
+[[ "$GATEBEAM_RELEASE_BOOTSTRAP" == "0" ||
+    "$GATEBEAM_RELEASE_BOOTSTRAP" == "1" ]] ||
+  fail "GATEBEAM_RELEASE_BOOTSTRAP must be 0 or 1"
 [[ -z "$TEST_FAILURE_POINT" || "$TEST_FAILURE_POINT" == "before-publish" ]] ||
   fail "GATEBEAM_RELEASE_TEST_FAILURE_POINT is invalid"
 
@@ -442,6 +883,7 @@ PKGUTIL="$(tool_path pkgutil /usr/sbin/pkgutil)"
 LIPO="$(tool_path lipo /usr/bin/lipo)"
 PRODUCTSIGN="$(tool_path productsign /usr/bin/productsign)"
 DITTO="$(tool_path ditto /usr/bin/ditto)"
+CURL="$(tool_path curl /usr/bin/curl)"
 
 [[ "$GATEBEAM_DEVELOPER_TEAM_ID" =~ '^[A-Z0-9]{10}$' ]] ||
   fail "GATEBEAM_DEVELOPER_TEAM_ID must be a 10-character Apple Team ID"
@@ -456,10 +898,10 @@ validate_identity_input \
 [[ ${#GATEBEAM_NOTARY_PROFILE} -le 64 &&
     "$GATEBEAM_NOTARY_PROFILE" =~ '^[A-Za-z0-9][A-Za-z0-9._ -]*$' ]] ||
   fail "GATEBEAM_NOTARY_PROFILE is invalid"
-validate_positive_decimal \
-  "$GATEBEAM_PREVIOUS_PUBLIC_BUILD_VERSION" \
-  "GATEBEAM_PREVIOUS_PUBLIC_BUILD_VERSION"
-validate_test_evidence_url
+validate_run_id "$GATEBEAM_RELEASE_CI_RUN_ID" "GATEBEAM_RELEASE_CI_RUN_ID"
+validate_run_id \
+  "$GATEBEAM_RELEASE_CLEAN_MACHINE_RUN_ID" \
+  "GATEBEAM_RELEASE_CLEAN_MACHINE_RUN_ID"
 
 [[ -f "$INFO_PLIST" && ! -L "$INFO_PLIST" ]] ||
   fail "Gatebeam Info.plist is missing or unsafe"
@@ -473,7 +915,6 @@ BUNDLE_ID="$(
   fail "CFBundleShortVersionString is not a safe release version"
 [[ "$BUNDLE_ID" == "$EXPECTED_BUNDLE_ID" ]] ||
   fail "Gatebeam bundle identifier does not match the formal release contract"
-validate_rollback_inputs
 
 if [[ -e "$DIST_DIR" || -L "$DIST_DIR" ]]; then
   assert_safe_dist
@@ -513,6 +954,40 @@ mkdir "$PUBLISH_LOCK" 2>/dev/null ||
   fail "another formal release is active or left a stale lock: $PUBLISH_LOCK"
 
 TEMP_ROOT="$(mktemp -d "/private/tmp/gatebeam-formal-release.XXXXXX")"
+prepare_github_auth
+validate_immutable_release_policy
+validate_workflow_evidence \
+  ci \
+  "$GATEBEAM_RELEASE_CI_RUN_ID" \
+  "$CI_WORKFLOW_NAME" \
+  "$CI_WORKFLOW_PATH" \
+  "Test, isolate, and build Gatebeam" \
+  "Check out repository" \
+  "Run backend tests" \
+  "Run proxy policy tests" \
+  "Run integration contract tests" \
+  "Run integration contract tests with Thread Sanitizer" \
+  "Run formal release pipeline tests" \
+  "Verify Keychain and code-signing identity" \
+  "Run upgrade compatibility tests" \
+  "Run UI validation isolation tests" \
+  "Validate build assets" \
+  "Build complete app" \
+  "Verify app signature" \
+  "Scan source and app for private material" \
+  "Check committed patch whitespace"
+validate_workflow_evidence \
+  clean-machine \
+  "$GATEBEAM_RELEASE_CLEAN_MACHINE_RUN_ID" \
+  "$CLEAN_WORKFLOW_NAME" \
+  "$CLEAN_WORKFLOW_PATH" \
+  "Validate install, upgrade, rollback, and uninstall" \
+  "Check out repository" \
+  "Build and validate isolated install, upgrade, rollback, and uninstall"
+RELEASE_TEST_EVIDENCE_URL="$GITHUB_WEB_ROOT/actions/runs/$GATEBEAM_RELEASE_CI_RUN_ID"
+RELEASE_CLEAN_MACHINE_EVIDENCE_URL="$GITHUB_WEB_ROOT/actions/runs/$GATEBEAM_RELEASE_CLEAN_MACHINE_RUN_ID"
+validate_release_history
+
 SOURCE_ARCHIVE="$TEMP_ROOT/source.tar"
 WORKSPACE_ROOT="$TEMP_ROOT/source"
 mkdir -p "$WORKSPACE_ROOT"
@@ -549,8 +1024,8 @@ BUILD_VERSION="$(
 validate_positive_decimal "$BUILD_VERSION" "built application CFBundleVersion"
 decimal_is_greater \
   "$BUILD_VERSION" \
-  "$GATEBEAM_PREVIOUS_PUBLIC_BUILD_VERSION" ||
-  fail "built application CFBundleVersion must be greater than GATEBEAM_PREVIOUS_PUBLIC_BUILD_VERSION"
+  "$PREVIOUS_BUILD_VERSION" ||
+  fail "built application CFBundleVersion must be greater than the latest immutable release build"
 MINIMUM_SYSTEM_VERSION="$(
   /usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$APP_INFO_PLIST"
 )" || fail "could not read built application minimum macOS version"
