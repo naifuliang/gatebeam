@@ -1,12 +1,24 @@
 import Foundation
 import Security
 
+struct KeychainOperationHandlers {
+    let set: (String, String) throws -> Void
+    let get: (String) throws -> String?
+    let delete: (String) throws -> Void
+}
+
 final class KeychainStore {
     private let service: String
     private let useDataProtectionKeychain: Bool
+    private let operationHandlers: KeychainOperationHandlers?
 
-    init(useDataProtectionKeychain: Bool = false, service: String? = nil) {
+    init(
+        useDataProtectionKeychain: Bool = false,
+        service: String? = nil,
+        operationHandlers: KeychainOperationHandlers? = nil
+    ) {
         self.useDataProtectionKeychain = useDataProtectionKeychain
+        self.operationHandlers = operationHandlers
         // Retain the established service names so upgrades keep their
         // Keychain access and do not prompt merely because of the rebrand.
         self.service = service ?? (useDataProtectionKeychain
@@ -15,6 +27,11 @@ final class KeychainStore {
     }
 
     func set(_ value: String, account: String) throws {
+        if let operationHandlers {
+            try operationHandlers.set(value, account)
+            return
+        }
+
         let data = Data(value.utf8)
         let query = baseQuery(account: account)
 
@@ -43,6 +60,10 @@ final class KeychainStore {
     }
 
     func get(account: String) throws -> String? {
+        if let operationHandlers {
+            return try operationHandlers.get(account)
+        }
+
         var query = baseQuery(account: account)
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
@@ -59,9 +80,27 @@ final class KeychainStore {
         return String(data: data, encoding: .utf8)
     }
 
-    func delete(account: String) {
+    @discardableResult
+    func delete(account: String) -> Result<Void, Error> {
+        if let operationHandlers {
+            do {
+                try operationHandlers.delete(account)
+                return .success(())
+            } catch {
+                return .failure(error)
+            }
+        }
+
         let query = baseQuery(account: account)
-        SecItemDelete(query as CFDictionary)
+        let status = SecItemDelete(query as CFDictionary)
+        if status == errSecSuccess || status == errSecItemNotFound {
+            return .success(())
+        }
+        return .failure(KeychainError.status(operation: "delete", code: status))
+    }
+
+    func deleteChecked(account: String) throws {
+        try delete(account: account).get()
     }
 
     private func baseQuery(account: String) -> [String: Any] {

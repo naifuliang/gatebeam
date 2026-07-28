@@ -2,7 +2,9 @@ import AppKit
 import Foundation
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    private let configStore = AppConfigStore()
+    private lazy var configStore = isUIValidationMode
+        ? AppConfigStore.isolatedTemporary()
+        : AppConfigStore()
     private let keychain = KeychainStore()
     private var isUIValidationMode: Bool {
         CommandLine.arguments.contains("--ui-validation")
@@ -16,19 +18,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var settingsWindowController: SettingsWindowController?
     private let statusPopover = NSPopover()
     private var statusPopoverController: StatusPopoverViewController?
+    private var launchAgentMigrationError: LaunchAgentManagerError?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        if !isUIValidationMode {
+            LaunchAgentManager().migrateLegacyUserState()
+                .handleFailure { error in
+                    self.launchAgentMigrationError = error
+                }
+        }
         setupStatusItem()
         setupAgent()
         if !isUIValidationMode {
             agent.start()
         }
         runLaunchValidationHooksIfNeeded()
+        presentLaunchAgentMigrationErrorIfNeeded()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
         agent.stop()
+        if isUIValidationMode {
+            configStore.removeTemporaryStorage()
+        }
     }
 
     private func setupStatusItem() {
@@ -82,6 +95,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return .systemBlue
     }
 
+    private func presentLaunchAgentMigrationErrorIfNeeded() {
+        guard let error = launchAgentMigrationError else {
+            return
+        }
+        launchAgentMigrationError = nil
+
+        DispatchQueue.main.async {
+            NSApp.activate(ignoringOtherApps: true)
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = "Start at Login needs attention"
+            alert.informativeText = error.localizedDescription
+            alert.addButton(withTitle: "Open Settings")
+            alert.addButton(withTitle: "Continue")
+            if alert.runModal() == .alertFirstButtonReturn {
+                self.openSettings()
+            }
+        }
+    }
+
     @objc private func togglePopover() {
         guard let button = statusItem.button else { return }
         if statusPopover.isShown {
@@ -95,7 +128,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func openSettings() {
         statusPopover.performClose(nil)
         if settingsWindowController == nil {
-            settingsWindowController = SettingsWindowController(agent: agent)
+            var shouldLoadCloudflare = !isUIValidationMode
+            if shouldLoadCloudflare {
+                do {
+                    try agent.loadCloudflareToken()
+                } catch {
+                    // NetworkAgent publishes the Keychain failure into the settings status.
+                    shouldLoadCloudflare = false
+                }
+            }
+            settingsWindowController = SettingsWindowController(
+                agent: agent,
+                autoLoadCloudflare: !isUIValidationMode && shouldLoadCloudflare
+            )
         }
         settingsWindowController?.showWindow(nil)
         settingsWindowController?.window?.makeKeyAndOrderFront(nil)
@@ -119,6 +164,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if arguments.contains("--show-settings") {
                 self.openSettings()
             }
+        }
+    }
+}
+
+private extension Result where Success == Void, Failure == LaunchAgentManagerError {
+    func handleFailure(_ handler: (LaunchAgentManagerError) -> Void) {
+        if case .failure(let error) = self {
+            handler(error)
         }
     }
 }

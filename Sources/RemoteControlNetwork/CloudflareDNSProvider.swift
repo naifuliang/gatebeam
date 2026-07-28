@@ -111,8 +111,8 @@ final class CloudflareDNSProvider {
     }
 
     func upsertARecord(zoneID: String, recordName: String, ipAddress: String, token: String) throws -> CloudflareDNSResult {
-        guard PublicIPService.looksLikeIPv4(ipAddress) else {
-            throw CloudflareError.configuration("Invalid IPv4 address: \(ipAddress)")
+        guard PublicIPService.isPublicIPv4(ipAddress) else {
+            throw CloudflareError.configuration("IPv4 address is not publicly routable: \(ipAddress)")
         }
         return try upsertRecord(type: .a, zoneID: zoneID, recordName: recordName, address: ipAddress, token: token)
     }

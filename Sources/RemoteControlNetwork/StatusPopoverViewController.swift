@@ -171,7 +171,7 @@ final class StatusPopoverViewController: NSViewController {
         )
         let quitButton = iconOnlyButton(
             symbol: "power",
-            toolTip: "Quit Portlight",
+            toolTip: "Quit Gatebeam",
             action: #selector(quit)
         )
 

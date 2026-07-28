@@ -52,13 +52,14 @@ struct AppStatus: Codable {
     var connectionURL: String?
     var connectionURLIPv4: String? = nil
     var connectionURLIPv6: String? = nil
+    var settingsErrorMessage: String? = nil
     var lastCheckedAt: Date?
 
     static let initial = AppStatus(
         ddnsStatus: .unknown("DDNS not checked yet"),
         routerStatus: .unknown("Router mapping not checked yet"),
         remoteDesktopStatus: .unknown("Remote desktop not checked yet"),
-        externalReachabilityStatus: .unknown("External reachability not checked yet"),
+        externalReachabilityStatus: .unknown("Local-origin TCP check not run yet"),
         publicAddress: nil,
         localAddress: nil,
         gatewayAddress: nil,
@@ -79,6 +80,106 @@ enum MappingProtocolPreference: String, Codable, CaseIterable {
     case upnp
     case natpmp
     case disabled
+}
+
+enum RouterMappingTransport: String, Codable, CaseIterable {
+    case pcp
+    case natpmp
+    case upnp
+
+    var displayName: String {
+        switch self {
+        case .pcp: return "PCP"
+        case .natpmp: return "NAT-PMP"
+        case .upnp: return "UPnP"
+        }
+    }
+
+    var preference: MappingProtocolPreference {
+        switch self {
+        case .pcp: return .pcp
+        case .natpmp: return .natpmp
+        case .upnp: return .upnp
+        }
+    }
+}
+
+enum RouterMappingAddressFamily: String, Codable, CaseIterable {
+    case ipv4
+    case ipv6
+
+    var displayName: String {
+        self == .ipv4 ? "IPv4" : "IPv6"
+    }
+}
+
+struct ActiveRouterMapping: Codable, Equatable {
+    var transport: RouterMappingTransport
+    var addressFamily: RouterMappingAddressFamily
+    var localAddress: String
+    var gatewayAddress: String
+    var internalPort: UInt16
+    var externalPort: UInt16
+    var pinholeID: UInt16?
+    var pcpNonce: String?
+    var leaseExpiresAt: Date
+    var renewAfter: Date
+
+    var identifier: String {
+        [
+            addressFamily.rawValue,
+            transport.rawValue,
+            localAddress,
+            gatewayAddress,
+            String(internalPort),
+            String(externalPort),
+            pinholeID.map(String.init) ?? "",
+            pcpNonce ?? ""
+        ].joined(separator: "|")
+    }
+
+    func isCompatible(
+        with config: AppConfig,
+        family: RouterMappingAddressFamily,
+        localAddress: String,
+        gatewayAddress: String
+    ) -> Bool {
+        guard addressFamily == family,
+              self.localAddress == localAddress,
+              self.gatewayAddress == gatewayAddress,
+              internalPort == config.internalPort else {
+            return false
+        }
+        if family == .ipv4, externalPort != config.externalPort {
+            return false
+        }
+        switch config.mappingProtocolPreference {
+        case .automatic:
+            return true
+        case .pcp:
+            return transport == .pcp
+        case .natpmp:
+            return family == .ipv4 && transport == .natpmp
+        case .upnp:
+            return transport == .upnp
+        case .disabled:
+            return false
+        }
+    }
+}
+
+struct RouterMappingRecoveryRequiredError: Error, LocalizedError {
+    let mapping: ActiveRouterMapping
+    let operationDescription: String
+    let cleanupDescription: String
+
+    var errorDescription: String? {
+        [
+            operationDescription,
+            "Automatic cleanup failed: \(cleanupDescription)",
+            "Recovery mapping: \(mapping.identifier)"
+        ].joined(separator: "\n")
+    }
 }
 
 enum AddressFamilyPreference: String, Codable, CaseIterable {
@@ -115,12 +216,16 @@ enum NetworkProxyMode: String, Codable, CaseIterable {
         case .direct:
             return "Bypasses URLSession HTTP, HTTPS, SOCKS, and PAC proxies. TUN and VPN routes still apply."
         case .custom:
-            return "Uses the validated HTTP, HTTPS, or SOCKS proxy URL below."
+            return "Uses the validated HTTP or SOCKS5 proxy URL below."
         }
     }
 }
 
 struct AppConfig: Codable {
+    static let minimumCheckIntervalSeconds: TimeInterval = 60
+    static let maximumCheckIntervalSeconds: TimeInterval = 24 * 60 * 60
+    static let defaultCheckIntervalSeconds: TimeInterval = 300
+
     var remoteAccessEnabled: Bool
     var dnsProvider: DNSProvider
     var cloudflareZoneID: String
@@ -137,6 +242,7 @@ struct AppConfig: Codable {
     var accessExpiresAt: Date?
     var ipv6PinholeID: UInt16? = nil
     var pcpNonce: String? = nil
+    var activeRouterMappings: [ActiveRouterMapping]
     var ddnsProxyMode: NetworkProxyMode
     var publicIPProxyMode: NetworkProxyMode
     var customProxyURL: String
@@ -153,9 +259,10 @@ struct AppConfig: Codable {
         mappingLeaseSeconds: 3600,
         autoRenewMapping: true,
         startAtLogin: false,
-        checkIntervalSeconds: 300,
+        checkIntervalSeconds: defaultCheckIntervalSeconds,
         externalProbeHost: "",
         accessExpiresAt: nil,
+        activeRouterMappings: [],
         ddnsProxyMode: .system,
         publicIPProxyMode: .direct,
         customProxyURL: ""
@@ -178,6 +285,7 @@ struct AppConfig: Codable {
         case accessExpiresAt
         case ipv6PinholeID
         case pcpNonce
+        case activeRouterMappings
         case ddnsProxyMode
         case publicIPProxyMode
         case customProxyURL
@@ -200,6 +308,7 @@ struct AppConfig: Codable {
         accessExpiresAt: Date?,
         ipv6PinholeID: UInt16? = nil,
         pcpNonce: String? = nil,
+        activeRouterMappings: [ActiveRouterMapping] = [],
         ddnsProxyMode: NetworkProxyMode = .system,
         publicIPProxyMode: NetworkProxyMode = .direct,
         customProxyURL: String = ""
@@ -215,11 +324,12 @@ struct AppConfig: Codable {
         self.mappingLeaseSeconds = mappingLeaseSeconds
         self.autoRenewMapping = autoRenewMapping
         self.startAtLogin = startAtLogin
-        self.checkIntervalSeconds = checkIntervalSeconds
+        self.checkIntervalSeconds = Self.normalizedCheckInterval(checkIntervalSeconds)
         self.externalProbeHost = externalProbeHost
         self.accessExpiresAt = accessExpiresAt
         self.ipv6PinholeID = ipv6PinholeID
         self.pcpNonce = pcpNonce
+        self.activeRouterMappings = activeRouterMappings
         self.ddnsProxyMode = ddnsProxyMode
         self.publicIPProxyMode = publicIPProxyMode
         self.customProxyURL = customProxyURL
@@ -239,11 +349,16 @@ struct AppConfig: Codable {
         mappingLeaseSeconds = try container.decodeIfPresent(UInt32.self, forKey: .mappingLeaseSeconds) ?? defaults.mappingLeaseSeconds
         autoRenewMapping = try container.decodeIfPresent(Bool.self, forKey: .autoRenewMapping) ?? defaults.autoRenewMapping
         startAtLogin = try container.decodeIfPresent(Bool.self, forKey: .startAtLogin) ?? defaults.startAtLogin
-        checkIntervalSeconds = try container.decodeIfPresent(TimeInterval.self, forKey: .checkIntervalSeconds) ?? defaults.checkIntervalSeconds
+        let decodedCheckInterval = try container.decodeIfPresent(
+            TimeInterval.self,
+            forKey: .checkIntervalSeconds
+        ) ?? defaults.checkIntervalSeconds
+        checkIntervalSeconds = Self.normalizedCheckInterval(decodedCheckInterval)
         externalProbeHost = try container.decodeIfPresent(String.self, forKey: .externalProbeHost) ?? defaults.externalProbeHost
         accessExpiresAt = try container.decodeIfPresent(Date.self, forKey: .accessExpiresAt)
         ipv6PinholeID = try container.decodeIfPresent(UInt16.self, forKey: .ipv6PinholeID)
         pcpNonce = try container.decodeIfPresent(String.self, forKey: .pcpNonce)
+        activeRouterMappings = try container.decodeIfPresent([ActiveRouterMapping].self, forKey: .activeRouterMappings) ?? []
         ddnsProxyMode = try container.decodeIfPresent(NetworkProxyMode.self, forKey: .ddnsProxyMode) ?? .system
         publicIPProxyMode = try container.decodeIfPresent(NetworkProxyMode.self, forKey: .publicIPProxyMode) ?? .direct
         customProxyURL = try container.decodeIfPresent(String.self, forKey: .customProxyURL) ?? ""
@@ -262,14 +377,28 @@ struct AppConfig: Codable {
         try container.encode(mappingLeaseSeconds, forKey: .mappingLeaseSeconds)
         try container.encode(autoRenewMapping, forKey: .autoRenewMapping)
         try container.encode(startAtLogin, forKey: .startAtLogin)
-        try container.encode(checkIntervalSeconds, forKey: .checkIntervalSeconds)
+        try container.encode(Self.normalizedCheckInterval(checkIntervalSeconds), forKey: .checkIntervalSeconds)
         try container.encode(externalProbeHost, forKey: .externalProbeHost)
         try container.encodeIfPresent(accessExpiresAt, forKey: .accessExpiresAt)
         try container.encodeIfPresent(ipv6PinholeID, forKey: .ipv6PinholeID)
         try container.encodeIfPresent(pcpNonce, forKey: .pcpNonce)
+        try container.encode(activeRouterMappings, forKey: .activeRouterMappings)
         try container.encode(ddnsProxyMode, forKey: .ddnsProxyMode)
         try container.encode(publicIPProxyMode, forKey: .publicIPProxyMode)
         try container.encode(customProxyURL, forKey: .customProxyURL)
+    }
+
+    static func normalizedCheckInterval(_ value: TimeInterval) -> TimeInterval {
+        guard value.isFinite, value > 0 else {
+            return defaultCheckIntervalSeconds
+        }
+        return min(max(value, minimumCheckIntervalSeconds), maximumCheckIntervalSeconds)
+    }
+
+    func normalizedForPersistence() -> AppConfig {
+        var normalized = self
+        normalized.checkIntervalSeconds = Self.normalizedCheckInterval(checkIntervalSeconds)
+        return normalized
     }
 }
 

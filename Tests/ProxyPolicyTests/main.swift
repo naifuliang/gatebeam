@@ -102,13 +102,67 @@ func testCustomHTTPModeConfiguresBothHTTPAndHTTPS() throws {
     try expect(proxyValue(proxies, kCFNetworkProxiesSOCKSEnable, as: Bool.self) == false, "Custom HTTP mode must not inherit SOCKS proxy settings")
 }
 
-func testCustomProxyCredentialsAreRejected() throws {
+func expectInvalidProxyURL(_ value: String, _ message: String) throws {
     do {
-        _ = try HTTPClient(proxyMode: .custom, customProxyURL: "socks5://user:secret@127.0.0.1:7890")
-        throw ProxyPolicyTestFailure("Custom proxy credentials must not be accepted into the ordinary configuration")
+        _ = try HTTPClient(proxyMode: .custom, customProxyURL: value)
+        throw ProxyPolicyTestFailure(message)
     } catch NetworkError.invalidProxyURL {
-        // Expected: proxy credentials must stay out of the JSON-backed app configuration.
+        // Expected.
     }
+}
+
+func testCustomProxyValidationRejectsUnsupportedForms() throws {
+    let invalidValues: [(String, String)] = [
+        ("proxy.example.test:8080", "Custom proxy URLs must include an explicit supported scheme"),
+        ("https://proxy.example.test:8443", "TLS-to-proxy must not be accepted until it is implemented correctly"),
+        ("socks://127.0.0.1:1080", "The ambiguous socks scheme must not be accepted"),
+        ("http://proxy.example.test", "HTTP custom proxies must include an explicit port"),
+        ("socks5://127.0.0.1", "SOCKS5 custom proxies must include an explicit port"),
+        ("http://proxy.example.test/", "A trailing path separator must not be accepted"),
+        ("http://proxy.example.test:8080/proxy", "Custom proxy paths must not be accepted"),
+        ("http://proxy.example.test:8080?mode=direct", "Custom proxy queries must not be accepted"),
+        ("http://proxy.example.test:8080#local", "Custom proxy fragments must not be accepted"),
+        ("http://user@proxy.example.test:8080", "Custom proxy usernames must not be persisted in the URL"),
+        ("socks5://user:secret@127.0.0.1:1080", "Custom proxy credentials must not be persisted in the URL"),
+        ("http://proxy.example.test:0", "Port zero must not be accepted"),
+        ("http://proxy.example.test:65536", "Ports above 65535 must not be accepted")
+    ]
+
+    for (value, message) in invalidValues {
+        try expectInvalidProxyURL(value, message)
+    }
+}
+
+func testCustomProxyPortBoundariesAreAccepted() throws {
+    let lowerBound = try HTTPClient(proxyMode: .custom, customProxyURL: "http://proxy.example.test:1")
+    let upperBound = try HTTPClient(proxyMode: .custom, customProxyURL: "socks5://127.0.0.1:65535")
+    let lowerProxies = try proxyDictionary(for: lowerBound)
+    let upperProxies = try proxyDictionary(for: upperBound)
+
+    try expect(proxyValue(lowerProxies, kCFNetworkProxiesHTTPPort, as: Int.self) == 1, "Port 1 must be accepted")
+    try expect(proxyValue(upperProxies, kCFNetworkProxiesSOCKSPort, as: Int.self) == 65_535, "Port 65535 must be accepted")
+}
+
+func testCustomHTTPIPv6LiteralIsNormalizedForCFNetwork() throws {
+    let client = try HTTPClient(proxyMode: .custom, customProxyURL: "http://[2001:db8::10]:8080")
+    let proxies = try proxyDictionary(for: client)
+
+    try expect(
+        proxyValue(proxies, kCFNetworkProxiesHTTPProxy, as: String.self) == "2001:db8::10",
+        "CFNetwork must receive an unbracketed HTTP IPv6 proxy host"
+    )
+    try expect(proxyValue(proxies, kCFNetworkProxiesHTTPPort, as: Int.self) == 8080, "The HTTP IPv6 proxy port must be preserved")
+}
+
+func testCustomSOCKSIPv6LiteralIsNormalizedForCFNetwork() throws {
+    let client = try HTTPClient(proxyMode: .custom, customProxyURL: "socks5://[2001:db8::20]:1080")
+    let proxies = try proxyDictionary(for: client)
+
+    try expect(
+        proxyValue(proxies, kCFNetworkProxiesSOCKSProxy, as: String.self) == "2001:db8::20",
+        "CFNetwork must receive an unbracketed SOCKS5 IPv6 proxy host"
+    )
+    try expect(proxyValue(proxies, kCFNetworkProxiesSOCKSPort, as: Int.self) == 1080, "The SOCKS5 IPv6 proxy port must be preserved")
 }
 
 func testOldConfigMigratesToSafeDirectPublicIP() throws {
@@ -174,7 +228,10 @@ let tests: [(String, () throws -> Void)] = [
     ("disables all proxy paths in direct mode", testDirectModeDisablesEverySystemProxyPath),
     ("builds a SOCKS custom proxy dictionary", testCustomModeBuildsACompleteProxyDictionary),
     ("builds an HTTP custom proxy dictionary", testCustomHTTPModeConfiguresBothHTTPAndHTTPS),
-    ("rejects plain-text custom proxy credentials", testCustomProxyCredentialsAreRejected),
+    ("rejects unsupported custom proxy forms", testCustomProxyValidationRejectsUnsupportedForms),
+    ("accepts valid custom proxy port boundaries", testCustomProxyPortBoundariesAreAccepted),
+    ("normalizes an HTTP IPv6 proxy host", testCustomHTTPIPv6LiteralIsNormalizedForCFNetwork),
+    ("normalizes a SOCKS5 IPv6 proxy host", testCustomSOCKSIPv6LiteralIsNormalizedForCFNetwork),
     ("migrates legacy configuration safely", testOldConfigMigratesToSafeDirectPublicIP),
     ("keeps DDNS and public-IP policies independent", testServicePoliciesStayIndependent),
     ("uses distinct Cloudflare and public-IP defaults", testCloudflareAndPublicIPHaveDistinctDefaultPolicies),
