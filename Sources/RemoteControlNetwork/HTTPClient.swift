@@ -56,20 +56,25 @@ final class HTTPClient: HTTPRequesting {
 
     static func validatedProxyURL(_ value: String) throws -> URL {
         let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        let formatMessage = "Use http://host:port or socks5://host:port without credentials, a path, query, or fragment"
         guard !normalized.isEmpty,
               let components = URLComponents(string: normalized),
               let scheme = components.scheme?.lowercased(),
-              ["http", "https", "socks", "socks5"].contains(scheme),
-              components.host?.isEmpty == false,
+              ["http", "socks5"].contains(scheme),
+              let host = components.host,
+              !host.isEmpty,
               components.user == nil,
               components.password == nil,
+              components.path.isEmpty,
               components.query == nil,
-              components.fragment == nil,
-              components.path.isEmpty || components.path == "/" else {
-            throw NetworkError.invalidProxyURL(
-                "Use http://host:port, https://host:port, or socks5://host:port without credentials, a path, query, or fragment"
-            )
+              components.fragment == nil else {
+            throw NetworkError.invalidProxyURL(formatMessage)
         }
+
+        guard let port = components.port, (1...65_535).contains(port) else {
+            throw NetworkError.invalidProxyURL("The custom proxy port must be between 1 and 65535")
+        }
+
         guard let url = components.url else {
             throw NetworkError.invalidProxyURL("The custom proxy URL is invalid")
         }
@@ -112,11 +117,11 @@ final class HTTPClient: HTTPRequesting {
 
     private static func customProxyDictionary(for url: URL) -> [AnyHashable: Any] {
         let scheme = url.scheme?.lowercased() ?? "http"
-        let host = url.host ?? ""
-        let port = url.port ?? defaultProxyPort(for: scheme)
+        let host = normalizedProxyHost(url.host ?? "")
+        let port = url.port ?? 0
         var dictionary = disabledProxyDictionary
 
-        if scheme == "socks" || scheme == "socks5" {
+        if scheme == "socks5" {
             dictionary[kCFNetworkProxiesSOCKSEnable as String] = true
             dictionary[kCFNetworkProxiesSOCKSProxy as String] = host
             dictionary[kCFNetworkProxiesSOCKSPort as String] = port
@@ -132,12 +137,11 @@ final class HTTPClient: HTTPRequesting {
         return dictionary
     }
 
-    private static func defaultProxyPort(for scheme: String) -> Int {
-        switch scheme {
-        case "https": return 443
-        case "socks", "socks5": return 1080
-        default: return 80
+    private static func normalizedProxyHost(_ host: String) -> String {
+        guard host.hasPrefix("["), host.hasSuffix("]") else {
+            return host
         }
+        return String(host.dropFirst().dropLast())
     }
 
     func request(_ request: HTTPRequest) throws -> HTTPResponse {

@@ -40,7 +40,9 @@ struct UISnapshotRenderer {
                 appearance.performAsCurrentDrawingAppearance {
                     let agent = NetworkAgent(
                         configStore: AppConfigStore(),
-                        keychain: KeychainStore(),
+                        keychain: KeychainStore.isolatedValidationStore(
+                            service: "io.github.naifuliang.gatebeam.snapshot-validation"
+                        ),
                         initialConfig: scenario.config
                     )
 
@@ -72,13 +74,34 @@ struct UISnapshotRenderer {
                         let settingsSize = NSSize(width: 880, height: 880)
                         let settingsURL = outputDir.appendingPathComponent("\(theme.name)-settings-\(scenario.name).png")
                         render(view: contentView, size: settingsSize, to: settingsURL)
+                        validateSettingsLayout(
+                            contentView,
+                            scenarioName: scenario.name,
+                            themeName: theme.name
+                        )
                         rendered.append((settingsURL, settingsSize))
+
+                        if scenario.name == "ready" {
+                            let compactSize = NSSize(width: 880, height: 620)
+                            let bottomURL = outputDir.appendingPathComponent("\(theme.name)-settings-ready-bottom.png")
+                            prepareBottomScrolledSettings(
+                                contentView,
+                                size: compactSize,
+                                themeName: theme.name
+                            )
+                            render(view: contentView, size: compactSize, to: bottomURL)
+                            rendered.append((bottomURL, compactSize))
+                        }
                     }
                 }
             }
         }
 
         try createCompatibilityCopies(in: outputDir)
+        try createDocumentationCopies(
+            from: outputDir,
+            to: root.appendingPathComponent("docs/screenshots", isDirectory: true)
+        )
 
         print("Rendered UI snapshots:")
         for (url, size) in rendered {
@@ -93,8 +116,8 @@ struct UISnapshotRenderer {
             routerStatus: .ok("Mapped TCP 45900 -> 5900", detail: "Protocol: NAT-PMP"),
             remoteDesktopStatus: .ok("Screen Sharing is listening", detail: "127.0.0.1:5900"),
             externalReachabilityStatus: .warning(
-                "External probe is not configured",
-                detail: "Add a probe host for internet-side verification."
+                "Local-origin TCP check not configured",
+                detail: "Add a target host to test from this Mac. Internet reachability is not verified."
             ),
             publicAddress: "203.0.113.42",
             localAddress: "192.168.1.24",
@@ -148,8 +171,8 @@ struct UISnapshotRenderer {
                 detail: "Enable Screen Sharing in System Settings."
             ),
             externalReachabilityStatus: .failed(
-                "The public endpoint did not accept a connection from the verification service",
-                detail: "Review the router mapping and upstream NAT."
+                "Local-origin TCP connection failed",
+                detail: "This Mac could not connect to the target. Internet reachability was not tested."
             ),
             publicAddress: "203.0.113.42",
             localAddress: "192.168.1.24",
@@ -167,7 +190,10 @@ struct UISnapshotRenderer {
             ddnsStatus: .ok("a-very-long-remote-hostname.example.com is current"),
             routerStatus: .ok("IPv4 mapping and IPv6 pinhole are active"),
             remoteDesktopStatus: .ok("Screen Sharing is listening"),
-            externalReachabilityStatus: .ok("Both address families are reachable"),
+            externalReachabilityStatus: .ok(
+                "Local-origin TCP connection succeeded",
+                detail: "Connected from this Mac. This does not verify internet reachability."
+            ),
             publicAddress: "203.0.113.42",
             localAddress: "192.168.100.248",
             gatewayAddress: "192.168.100.1",
@@ -191,8 +217,8 @@ struct UISnapshotRenderer {
             routerStatus: .ok("UPnP used the direct local network path"),
             remoteDesktopStatus: .ok("Screen Sharing is listening"),
             externalReachabilityStatus: .warning(
-                "A direct app connection can still follow a VPN or TUN route",
-                detail: "Proxy policy does not override the system route table."
+                "Local-origin TCP connection was partially successful",
+                detail: "At least one local path failed. Internet reachability was not tested."
             ),
             publicAddress: "203.0.113.42",
             localAddress: "192.168.1.24",
@@ -208,12 +234,31 @@ struct UISnapshotRenderer {
             lastCheckedAt: Date()
         )
 
+        var invalidCustomProxyConfig = makeBaseConfig()
+        invalidCustomProxyConfig.ddnsProxyMode = .custom
+        invalidCustomProxyConfig.publicIPProxyMode = .direct
+        invalidCustomProxyConfig.customProxyURL = "https://proxy.example.net:443/unsupported"
+        let invalidCustomProxyStatus = AppStatus(
+            ddnsStatus: .warning("Custom proxy needs attention"),
+            routerStatus: .ok("Local router traffic stays direct"),
+            remoteDesktopStatus: .ok("Screen Sharing is listening"),
+            externalReachabilityStatus: .disabled("Local-origin TCP check not configured"),
+            publicAddress: "203.0.113.42",
+            localAddress: "192.168.1.24",
+            gatewayAddress: "192.168.1.1",
+            externalPort: 45900,
+            connectionURL: "vnc://203.0.113.42:45900",
+            connectionURLIPv4: "vnc://203.0.113.42:45900",
+            lastCheckedAt: Date()
+        )
+
         return [
             SnapshotScenario(name: "ready", config: readyConfig, status: readyStatus),
             SnapshotScenario(name: "off", config: offConfig, status: offStatus),
             SnapshotScenario(name: "error", config: errorConfig, status: errorStatus),
             SnapshotScenario(name: "long-ipv6", config: longIPv6Config, status: longIPv6Status),
-            SnapshotScenario(name: "custom-proxy", config: customProxyConfig, status: customProxyStatus)
+            SnapshotScenario(name: "custom-proxy", config: customProxyConfig, status: customProxyStatus),
+            SnapshotScenario(name: "invalid-custom-proxy", config: invalidCustomProxyConfig, status: invalidCustomProxyStatus)
         ]
     }
 
@@ -257,6 +302,20 @@ struct UISnapshotRenderer {
         }
     }
 
+    private static func createDocumentationCopies(from sourceDirectory: URL, to destinationDirectory: URL) throws {
+        try FileManager.default.createDirectory(at: destinationDirectory, withIntermediateDirectories: true)
+        let copies = [
+            ("aqua-popover-ready.png", "popover.png"),
+            ("aqua-settings-ready.png", "settings.png")
+        ]
+
+        for (sourceName, destinationName) in copies {
+            let source = sourceDirectory.appendingPathComponent(sourceName)
+            let destination = destinationDirectory.appendingPathComponent(destinationName)
+            try Data(contentsOf: source).write(to: destination, options: .atomic)
+        }
+    }
+
     private static func render(view: NSView, size: NSSize, to url: URL) {
         view.frame = NSRect(origin: .zero, size: size)
         view.bounds = NSRect(origin: .zero, size: size)
@@ -276,6 +335,171 @@ struct UISnapshotRenderer {
             try data.write(to: url, options: [.atomic])
         } catch {
             fatalError("Could not write \(url.path): \(error)")
+        }
+    }
+
+    private static func validateSettingsLayout(
+        _ contentView: NSView,
+        scenarioName: String,
+        themeName: String
+    ) {
+        let context = "\(themeName) \(scenarioName)"
+        let views = descendants(of: contentView)
+        guard let scrollView = views.compactMap({ $0 as? NSScrollView }).first,
+              let documentView = scrollView.documentView else {
+            fatalError("\(context): settings content is not inside a scroll view")
+        }
+
+        let cards = views.filter {
+            $0.frame.width > 350 &&
+            abs(($0.layer?.cornerRadius ?? 0) - 8) < 0.1 &&
+            ($0.layer?.borderWidth ?? 0) > 0
+        }
+        guard cards.count == 4 else {
+            fatalError("\(context): expected four settings cards, found \(cards.count)")
+        }
+        let cardWidths = cards.map(\.frame.width)
+        guard let narrowest = cardWidths.min(),
+              let widest = cardWidths.max(),
+              widest - narrowest < 1 else {
+            fatalError("\(context): settings cards are not equal width")
+        }
+
+        guard let headline = textField(containing: [
+            "Remote access is off",
+            "Ready for remote connection",
+            "Needs attention",
+            "Checking connection",
+            "Settings need attention"
+        ], in: views),
+        let intervalHelp = textField(containing: [
+            "Interval defaults to 300 seconds"
+        ], in: views),
+        let saveButton = views.compactMap({ $0 as? NSButton }).first(where: {
+            $0.title == "Save Changes"
+        }) else {
+            fatalError("\(context): required settings controls are missing")
+        }
+
+        assertVisible(headline, inside: contentView, context: "\(context) headline")
+        assertVisible(intervalHelp, inside: scrollView.contentView, context: "\(context) interval help")
+        assertVisible(saveButton, inside: contentView, context: "\(context) save button")
+
+        if scenarioName == "invalid-custom-proxy" {
+            guard let errorLabel = textField(containing: [
+                "Use http://host:port or socks5://host:port."
+            ], in: views), !errorLabel.isHidden else {
+                fatalError("\(context): invalid proxy error is not visible")
+            }
+            assertVisible(errorLabel, inside: scrollView.contentView, context: "\(context) proxy error")
+        }
+
+        let originalFrame = contentView.frame
+        contentView.frame = NSRect(origin: .zero, size: NSSize(width: 880, height: 620))
+        contentView.bounds = NSRect(origin: .zero, size: NSSize(width: 880, height: 620))
+        contentView.layoutSubtreeIfNeeded()
+        scrollView.layoutSubtreeIfNeeded()
+        documentView.layoutSubtreeIfNeeded()
+
+        assertVisible(headline, inside: contentView, context: "\(context) compact headline")
+        assertVisible(saveButton, inside: contentView, context: "\(context) compact save button")
+        guard documentView.frame.height > scrollView.contentView.bounds.height else {
+            fatalError("\(context): compact settings content does not expose a vertical scroll range")
+        }
+
+        contentView.frame = originalFrame
+        contentView.bounds = NSRect(origin: .zero, size: originalFrame.size)
+        contentView.layoutSubtreeIfNeeded()
+    }
+
+    private static func prepareBottomScrolledSettings(
+        _ contentView: NSView,
+        size: NSSize,
+        themeName: String
+    ) {
+        contentView.frame = NSRect(origin: .zero, size: size)
+        contentView.bounds = NSRect(origin: .zero, size: size)
+        contentView.layoutSubtreeIfNeeded()
+
+        let views = descendants(of: contentView)
+        guard let scrollView = views.compactMap({ $0 as? NSScrollView }).first,
+              let documentView = scrollView.documentView,
+              let bottomLabel = textField(containing: [
+                  "Direct bypasses macOS HTTP, SOCKS, PAC, and automatic proxy discovery"
+              ], in: views),
+              let saveButton = views.compactMap({ $0 as? NSButton }).first(where: {
+                  $0.title == "Save Changes"
+              }) else {
+            fatalError("\(themeName) bottom scroll: required settings controls are missing")
+        }
+
+        scrollView.layoutSubtreeIfNeeded()
+        documentView.layoutSubtreeIfNeeded()
+
+        let clipView = scrollView.contentView
+        let bottomOriginY = documentView.isFlipped
+            ? max(documentView.bounds.minY, documentView.bounds.maxY - clipView.bounds.height)
+            : documentView.bounds.minY
+        documentView.scroll(NSPoint(x: documentView.bounds.minX, y: bottomOriginY))
+        scrollView.reflectScrolledClipView(clipView)
+
+        let visibleDocumentRect = documentView.visibleRect
+        let reachedBottom = documentView.isFlipped
+            ? visibleDocumentRect.maxY >= documentView.bounds.maxY - 1
+            : visibleDocumentRect.minY <= documentView.bounds.minY + 1
+        guard reachedBottom else {
+            fatalError(
+                "\(themeName) bottom scroll: document did not reach its bottom edge "
+                + "(flipped=\(documentView.isFlipped), frame=\(documentView.frame), "
+                + "bounds=\(documentView.bounds), clip=\(clipView.bounds), visible=\(visibleDocumentRect))"
+            )
+        }
+
+        assertFullyVisible(
+            bottomLabel,
+            inside: clipView,
+            context: "\(themeName) bottom scroll final routing guidance"
+        )
+        assertFullyVisible(
+            saveButton,
+            inside: contentView,
+            context: "\(themeName) bottom scroll fixed footer"
+        )
+
+        let bottomLabelRect = bottomLabel.convert(bottomLabel.bounds, to: contentView)
+        let saveButtonRect = saveButton.convert(saveButton.bounds, to: contentView)
+        guard !bottomLabelRect.intersects(saveButtonRect) else {
+            fatalError("\(themeName) bottom scroll: content is obscured by the fixed footer")
+        }
+    }
+
+    private static func descendants(of root: NSView) -> [NSView] {
+        root.subviews.flatMap { [$0] + descendants(of: $0) }
+    }
+
+    private static func textField(containing candidates: [String], in views: [NSView]) -> NSTextField? {
+        views.compactMap { $0 as? NSTextField }.first { field in
+            candidates.contains { field.stringValue.contains($0) }
+        }
+    }
+
+    private static func assertVisible(_ view: NSView, inside container: NSView, context: String) {
+        let rect = view.convert(view.bounds, to: container)
+        guard !view.isHidden,
+              rect.width > 0,
+              rect.height > 0,
+              container.bounds.intersects(rect) else {
+            fatalError("\(context) is clipped or hidden")
+        }
+    }
+
+    private static func assertFullyVisible(_ view: NSView, inside container: NSView, context: String) {
+        let rect = view.convert(view.bounds, to: container)
+        guard !view.isHidden,
+              rect.width > 0,
+              rect.height > 0,
+              container.bounds.insetBy(dx: -1, dy: -1).contains(rect) else {
+            fatalError("\(context) is not fully visible")
         }
     }
 }

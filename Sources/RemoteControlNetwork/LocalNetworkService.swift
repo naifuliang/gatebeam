@@ -1,7 +1,16 @@
 import Foundation
 import Darwin
 
-final class LocalNetworkService {
+protocol LocalNetworkServicing {
+    func localIPv4Address() -> String?
+    func globalIPv6Address() -> String?
+    func defaultGatewayIPv4() -> String?
+    func defaultGatewayIPv6() -> String?
+    func isTCPPortListening(port: UInt16, timeout: TimeInterval) -> Bool
+    func isTCPPortOpen(host: String, port: UInt16, timeout: TimeInterval) -> Bool
+}
+
+final class LocalNetworkService: LocalNetworkServicing {
     func localIPv4Address() -> String? {
         if let interfaceName = defaultRouteInfo(family: .ipv4)?.interfaceName,
            let address = firstUsableAddress(family: AF_INET, matching: { $0 == interfaceName }) {
@@ -15,12 +24,14 @@ final class LocalNetworkService {
 
     func globalIPv6Address() -> String? {
         let routeInterface = defaultRouteInfo(family: .ipv6)?.interfaceName
-        let candidates = addressCandidates(family: AF_INET6).filter {
-            PublicIPService.isGlobalIPv6($0.address)
+        let candidates = addressCandidates(family: AF_INET6).map {
+            LocalIPv6Candidate(
+                interfaceName: $0.interfaceName,
+                address: $0.address,
+                attributes: ifconfigAttributes(interfaceName: $0.interfaceName, address: $0.address)
+            )
         }
-        return candidates.max { lhs, rhs in
-            ipv6Score(lhs, routeInterface: routeInterface) < ipv6Score(rhs, routeInterface: routeInterface)
-        }?.address
+        return Self.selectGlobalIPv6Address(candidates: candidates, routeInterface: routeInterface)
     }
 
     func defaultGatewayIPv4() -> String? {
@@ -105,26 +116,66 @@ final class LocalNetworkService {
         return candidates
     }
 
-    private func ipv6Score(_ candidate: InterfaceAddress, routeInterface: String?) -> Int {
+    static func selectGlobalIPv6Address(
+        candidates: [LocalIPv6Candidate],
+        routeInterface: String?
+    ) -> String? {
+        candidates
+            .filter {
+                PublicIPService.isGlobalIPv6($0.address)
+                    && isAllowedDDNSIPv6Interface($0.interfaceName)
+                    && !$0.attributes.contains("temporary")
+                    && !$0.attributes.contains("deprecated")
+                    && !$0.attributes.contains("detached")
+            }
+            .max { lhs, rhs in
+                ipv6Score(lhs, routeInterface: routeInterface) < ipv6Score(rhs, routeInterface: routeInterface)
+            }?
+            .address
+    }
+
+    static func isAllowedDDNSIPv6Interface(_ interfaceName: String) -> Bool {
+        let name = interfaceName.lowercased()
+        let blockedPrefixes = [
+            "utun", "tun", "tap", "ipsec", "ppp", "gif", "stf",
+            "awdl", "llw", "p2p", "lo", "vmnet", "vboxnet",
+            "docker", "tailscale", "wireguard", "wg"
+        ]
+        return !blockedPrefixes.contains { name.hasPrefix($0) }
+    }
+
+    private static func ipv6Score(_ candidate: LocalIPv6Candidate, routeInterface: String?) -> Int {
         var score = 0
         let name = candidate.interfaceName.lowercased()
-        let isTunnel = name.hasPrefix("utun") || name.hasPrefix("tun") || name.hasPrefix("tap")
-            || name.hasPrefix("ipsec") || name.hasPrefix("gif") || name.hasPrefix("stf")
 
-        if candidate.interfaceName == routeInterface { score += isTunnel ? 20 : 220 }
+        if candidate.interfaceName == routeInterface { score += 220 }
         if name.hasPrefix("en") { score += 140 }
-        if name.hasPrefix("bridge") || name.hasPrefix("ppp") { score += 80 }
-        if name.hasPrefix("awdl") || name.hasPrefix("llw") { score -= 220 }
-        if isTunnel { score -= 260 }
+        if name.hasPrefix("bridge") || name.hasPrefix("bond") || name.hasPrefix("vlan") { score += 80 }
 
-        let attributes = ifconfigAttributes(interfaceName: candidate.interfaceName, address: candidate.address)
-        if attributes.contains("secured") { score += 35 }
-        if attributes.contains("temporary") { score -= 45 }
-        if attributes.contains("deprecated") || attributes.contains("detached") { score -= 180 }
+        if candidate.attributes.contains("secured") { score += 35 }
         return score
     }
 
-    private func ifconfigAttributes(interfaceName: String, address: String) -> String {
+    static func interfaceAddressAttributes(in output: String, address: String) -> Set<String> {
+        guard let targetAddress = normalizedIPv6WithoutScope(address) else { return [] }
+
+        for line in output.components(separatedBy: .newlines) {
+            let fields = line.split(whereSeparator: \.isWhitespace).map(String.init)
+            guard fields.count >= 2, fields[0].lowercased() == "inet6",
+                  normalizedIPv6WithoutScope(fields[1]) == targetAddress else {
+                continue
+            }
+            return Set(fields.dropFirst(2).map { $0.lowercased() })
+        }
+        return []
+    }
+
+    private static func normalizedIPv6WithoutScope(_ address: String) -> String? {
+        let unscoped = address.split(separator: "%", maxSplits: 1).first.map(String.init) ?? address
+        return PublicIPService.normalizedIPv6(unscoped.lowercased())
+    }
+
+    private func ifconfigAttributes(interfaceName: String, address: String) -> Set<String> {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/sbin/ifconfig")
         process.arguments = [interfaceName]
@@ -137,11 +188,10 @@ final class LocalNetworkService {
             process.waitUntilExit()
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
             let output = String(data: data, encoding: .utf8) ?? ""
-            return output.components(separatedBy: .newlines).first {
-                $0.contains("inet6 (address) ") || $0.contains("inet6 (address)%")
-            }?.lowercased() ?? ""
+            guard process.terminationStatus == 0 else { return [] }
+            return Self.interfaceAddressAttributes(in: output, address: address)
         } catch {
-            return ""
+            return []
         }
     }
 
@@ -187,6 +237,12 @@ final class LocalNetworkService {
 private struct InterfaceAddress {
     let interfaceName: String
     let address: String
+}
+
+struct LocalIPv6Candidate {
+    let interfaceName: String
+    let address: String
+    let attributes: Set<String>
 }
 
 private enum RouteFamily {

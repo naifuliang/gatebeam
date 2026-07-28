@@ -1,4 +1,4 @@
-#!/bin/zsh
+#!/bin/zsh -f
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
@@ -11,6 +11,7 @@ swiftc \
   -swift-version 5 \
   -O \
   -module-cache-path "$MODULE_CACHE_DIR" \
+  -framework LocalAuthentication \
   -framework Security \
   "$ROOT_DIR/Sources/RemoteControlNetwork/Models.swift" \
   "$ROOT_DIR/Sources/RemoteControlNetwork/AppConfigStore.swift" \

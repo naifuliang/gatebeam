@@ -1,26 +1,23 @@
 import AppKit
-import Darwin
 
-if CommandLine.arguments.contains("--keychain-self-test") {
-    let account = "keychain-self-test-\(UUID().uuidString)"
-    let value = UUID().uuidString
-    let keychain = KeychainStore()
+if CommandLine.arguments.contains("--signing-runtime-probe") {
+    print("Gatebeam signing runtime probe ready")
+    Thread.sleep(forTimeInterval: 2)
+} else if CommandLine.arguments.contains("--signing-identity-probe") {
     do {
-        try keychain.set(value, account: account)
-        guard try keychain.get(account: account) == value else {
-            throw KeychainError.verificationFailed
+        let identity = try KeychainStore.currentSigningIdentity()
+        guard KeychainStore.validatedTrustedApplicationRequirement(identity) != nil else {
+            print("Gatebeam signing identity rejected")
+            exit(1)
         }
-        keychain.delete(account: account)
-        print("Keychain self-test passed")
-        exit(EXIT_SUCCESS)
+        print("Gatebeam signing identity accepted")
     } catch {
-        keychain.delete(account: account)
-        fputs("Keychain self-test failed: \(error.localizedDescription)\n", stderr)
-        exit(EXIT_FAILURE)
+        print("Gatebeam signing identity inspection failed: \(error.localizedDescription)")
+        exit(1)
     }
+} else {
+    let app = NSApplication.shared
+    let delegate = AppDelegate()
+    app.delegate = delegate
+    app.run()
 }
-
-let app = NSApplication.shared
-let delegate = AppDelegate()
-app.delegate = delegate
-app.run()
