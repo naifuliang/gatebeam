@@ -62,7 +62,9 @@ Gatebeam does not claim that remote access is off until every tracked router rul
 
 ## Check Interval
 
-The recurring check interval defaults to `300` seconds and accepts `60` through `86400` seconds. Missing, non-finite, zero, or negative numeric values normalize to `300`; positive values below or above the supported range normalize to the nearest limit. A non-numeric settings-field entry uses `300`. Normalized legacy values are written back; a configuration file that cannot be decoded falls back to the complete default configuration.
+The recurring check interval defaults to `300` seconds and accepts `60` through `86400` seconds. Missing, non-finite, zero, or negative numeric values normalize to `300`; positive values below or above the supported range normalize to the nearest limit. A non-numeric settings-field entry uses `300`. Normalized legacy values are written back.
+
+If the configuration file cannot be read or decoded, Gatebeam preserves the damaged file instead of replacing it with defaults. It marks configuration and mapping recovery state as unknown, blocks new router mappings and settings overwrite, and shows recovery guidance. Back up the damaged file before restoring a known-good configuration; mapping creation remains fail-closed until the configuration and recovery state can be confirmed.
 
 Even direct URLSession traffic cannot bypass a route-level VPN/TUN, firewall, or transparent network interception. During diagnosis, temporarily disable those tools or compare the displayed route and address with your router's own status page.
 

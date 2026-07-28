@@ -30,7 +30,7 @@ final class StatusPopoverViewController: NSViewController {
     private let ddnsTile = StatusTile(title: "DDNS", symbol: "globe")
     private let routerTile = StatusTile(title: "Router", symbol: "point.3.connected.trianglepath.dotted")
     private let desktopTile = StatusTile(title: "Desktop", symbol: "display")
-    private let reachabilityTile = StatusTile(title: "Reachable", symbol: "antenna.radiowaves.left.and.right")
+    private let reachabilityTile = StatusTile(title: "Local TCP", symbol: "antenna.radiowaves.left.and.right")
 
     private let publicIPLabel = ValueLabel(title: "Public IP")
     private let localIPLabel = ValueLabel(title: "Local IP")

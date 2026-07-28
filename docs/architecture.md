@@ -40,7 +40,7 @@ The app has two distinct traffic classes:
 
 `AppStatus` is the UI contract. It provides explicit component states, readable messages, technical detail, timestamps, selected IPv4/IPv6 addresses, per-family ports, and one or two connection URLs. The menu bar status popover is allowed to display those complete addresses and URLs because they are the user's connection details. Gatebeam 0.5.0 has no diagnostic export and does not persist a diagnostic log; any future implementation must redact credentials and sensitive network identifiers by default. UI views must not infer health from raw log text.
 
-`AppConfig` contains behavior such as DNS zone and record name, address-family mode, mapping preference, lease duration, check interval, proxy modes, and a custom proxy URL. The check interval defaults to 300 seconds. Non-finite and non-positive numeric values normalize to 300; positive out-of-range values clamp to 60 or 86400; normalized legacy values are written back. A configuration file that cannot be decoded falls back to the complete default configuration. Cloudflare tokens remain in Keychain and must not be copied into configuration, future logs or exports, or screenshots. A custom proxy URL should not embed credentials; use a system-managed authenticated proxy instead.
+`AppConfig` contains behavior such as DNS zone and record name, address-family mode, mapping preference, lease duration, check interval, proxy modes, and a custom proxy URL. The check interval defaults to 300 seconds. Non-finite and non-positive numeric values normalize to 300; positive out-of-range values clamp to 60 or 86400; normalized legacy values are written back. If the configuration cannot be read or decoded, the store preserves the damaged file and returns a typed load error. `NetworkAgent` then marks configuration and mapping recovery state as unknown, blocks new mapping creation and settings overwrite, and asks the user to back up the damaged file before restoring a known-good configuration. Cloudflare tokens remain in Keychain and must not be copied into configuration, future logs or exports, or screenshots. A custom proxy URL should not embed credentials; use a system-managed authenticated proxy instead.
 
 ## Protocol Strategy
 
@@ -56,6 +56,7 @@ The app has two distinct traffic classes:
 - Remote access is disabled by default and mapping creation requires explicit enablement.
 - Disabling access or changing mapping identity removes tracked rules first. A failed deletion keeps access marked enabled, persists the exact failed mappings for retry, and prevents creation of a replacement rule.
 - If a newly created rule cannot be checkpointed and compensation deletion fails, the recovery journal records it. Recovery cleanup runs before any subsequent mapping creation.
+- An unreadable or undecodable configuration is preserved for recovery. Unknown configuration or recovery state fails closed and blocks new router mappings until a known-good configuration is restored.
 - DNS records are Cloudflare DNS-only records; HTTP proxying is not used for VNC.
 - A local-origin TCP success, router mapping response, or DNS update must never be presented as proof of public reachability.
 - Non-Custom proxy modes persist an empty custom proxy URL.
