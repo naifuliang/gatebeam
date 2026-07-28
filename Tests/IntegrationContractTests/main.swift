@@ -1370,6 +1370,303 @@ func testExplicitKeychainAuthorizationClearsFailureLatch() throws {
     )
 }
 
+func testLegacyMigrationSerializesConcurrentEmptySave() throws {
+    let baseDirectory = try makeTemporaryDirectory(named: "keychain-migration-empty-save")
+    defer {
+        try? FileManager.default.removeItem(at: baseDirectory)
+    }
+
+    let currentService = "io.github.naifuliang.gatebeam.keychain-race.v3"
+    let legacyService = "io.github.naifuliang.gatebeam.keychain-race.v2"
+    let account = "cloudflare-api-token"
+    let lock = NSLock()
+    let currentCopyWritten = DispatchSemaphore(value: 0)
+    let finishMigration = DispatchSemaphore(value: 0)
+    var values = ["\(legacyService):\(account)": "legacy-race-token"]
+    var events: [String] = []
+
+    let keychain = KeychainStore(
+        service: currentService,
+        legacyServices: [legacyService],
+        operationHandlers: KeychainOperationHandlers(
+            scopedSet: { value, scopedAccount, service, _, refreshAccess in
+                lock.lock()
+                values["\(service):\(scopedAccount)"] = value
+                events.append("set:\(service):\(refreshAccess)")
+                lock.unlock()
+                if service == currentService, refreshAccess {
+                    currentCopyWritten.signal()
+                    finishMigration.wait()
+                }
+            },
+            scopedGet: { scopedAccount, service, _ in
+                lock.lock()
+                defer { lock.unlock() }
+                events.append("get:\(service)")
+                return values["\(service):\(scopedAccount)"]
+            },
+            scopedDelete: { scopedAccount, service, _ in
+                lock.lock()
+                events.append("delete:\(service)")
+                values.removeValue(forKey: "\(service):\(scopedAccount)")
+                lock.unlock()
+            }
+        )
+    )
+    let agent = NetworkAgent(
+        configStore: AppConfigStore(baseDirectory: baseDirectory),
+        keychain: keychain,
+        initialConfig: .default
+    )
+
+    var authorizationResult: Result<KeychainAuthorizationOutcome, Error>?
+    agent.authorizeSavedCloudflareToken { authorizationResult = $0 }
+    try expect(
+        currentCopyWritten.wait(timeout: .now() + 3) == .success,
+        "Migration must reach the verified current-service copy"
+    )
+
+    var saveResult: Result<AppConfig, Error>?
+    agent.persistSettingsAsync(config: .default, token: "") { saveResult = $0 }
+    Thread.sleep(forTimeInterval: 0.05)
+    lock.lock()
+    let eventsWhileMigrationIsBlocked = events
+    lock.unlock()
+    try expect(
+        !eventsWhileMigrationIsBlocked.contains("delete:\(currentService)"),
+        "An empty save submitted during migration must not touch Keychain before authorization finishes"
+    )
+    finishMigration.signal()
+
+    try expect(
+        waitUntil { authorizationResult != nil && saveResult != nil },
+        "Migration and the queued empty save must both complete"
+    )
+    _ = try authorizationResult?.get()
+    _ = try saveResult?.get()
+
+    lock.lock()
+    let finalValues = values
+    let finalEvents = events
+    lock.unlock()
+    let legacyDelete = finalEvents.firstIndex(of: "delete:\(legacyService)")
+    let currentDelete = finalEvents.lastIndex(of: "delete:\(currentService)")
+    try expect(
+        legacyDelete != nil && currentDelete != nil && legacyDelete! < currentDelete!,
+        "Legacy cleanup must finish before the queued save deletes the current item"
+    )
+    try expect(finalValues.isEmpty, "The queued empty save must leave neither legacy nor current token behind")
+    try expect(agent.cloudflareToken().isEmpty, "The UI token cache must match the serialized empty save")
+    try expect(agent.status.settingsErrorMessage == nil, "Successful migration and deletion must clear Keychain errors")
+}
+
+func testOldBackgroundReadCannotOverwriteAuthorizationSuccess() throws {
+    let baseDirectory = try makeTemporaryDirectory(named: "keychain-stale-read")
+    defer {
+        try? FileManager.default.removeItem(at: baseDirectory)
+    }
+
+    let currentService = "io.github.naifuliang.gatebeam.keychain-stale-read.v3"
+    let token = "authorized-after-stale-read"
+    let lock = NSLock()
+    let backgroundReadStarted = DispatchSemaphore(value: 0)
+    let releaseBackgroundRead = DispatchSemaphore(value: 0)
+    var firstBackgroundRead = true
+    var events: [String] = []
+
+    let keychain = KeychainStore(
+        service: currentService,
+        legacyServices: [],
+        operationHandlers: KeychainOperationHandlers(
+            scopedSet: { _, _, _, _, refreshAccess in
+                lock.lock()
+                events.append("authorize-set:\(refreshAccess)")
+                lock.unlock()
+            },
+            scopedGet: { _, _, interaction in
+                if interaction == .background {
+                    lock.lock()
+                    let shouldFail = firstBackgroundRead
+                    firstBackgroundRead = false
+                    events.append(shouldFail ? "old-read-start" : "verify-read")
+                    lock.unlock()
+                    if shouldFail {
+                        backgroundReadStarted.signal()
+                        releaseBackgroundRead.wait()
+                        lock.lock()
+                        events.append("old-read-failure")
+                        lock.unlock()
+                        throw KeychainError.status(
+                            operation: "read",
+                            code: errSecInteractionNotAllowed
+                        )
+                    }
+                    return token
+                }
+                lock.lock()
+                events.append("authorization-read")
+                lock.unlock()
+                return token
+            },
+            scopedDelete: { _, _, _ in }
+        )
+    )
+    let agent = NetworkAgent(
+        configStore: AppConfigStore(baseDirectory: baseDirectory),
+        keychain: keychain,
+        initialConfig: .default
+    )
+
+    let readFinished = DispatchSemaphore(value: 0)
+    DispatchQueue.global(qos: .userInitiated).async {
+        defer { readFinished.signal() }
+        _ = try? agent.loadCloudflareToken(
+            retryAfterFailure: false,
+            interaction: .background
+        )
+    }
+    try expect(
+        backgroundReadStarted.wait(timeout: .now() + 3) == .success,
+        "The stale background read must be in flight before authorization"
+    )
+
+    var authorizationResult: Result<KeychainAuthorizationOutcome, Error>?
+    agent.authorizeSavedCloudflareToken { authorizationResult = $0 }
+    releaseBackgroundRead.signal()
+    try expect(
+        waitUntil { authorizationResult != nil },
+        "Authorization queued behind the old read must complete"
+    )
+    try expect(
+        readFinished.wait(timeout: .now() + 3) == .success,
+        "The old background read caller must be released"
+    )
+    let successfulAuthorization = try authorizationResult?.get()
+    try expect(
+        successfulAuthorization == .authorized(token: token),
+        "Explicit authorization must succeed after the old read failure"
+    )
+
+    lock.lock()
+    let finalEvents = events
+    lock.unlock()
+    let oldFailure = finalEvents.firstIndex(of: "old-read-failure")
+    let authorizationRead = finalEvents.firstIndex(of: "authorization-read")
+    try expect(
+        oldFailure != nil && authorizationRead != nil && oldFailure! < authorizationRead!,
+        "Authorization must be ordered after the older background Keychain result"
+    )
+    try expect(agent.cloudflareToken() == token, "An older read failure must not clear the authorized token cache")
+    try expect(!agent.savedTokenNeedsAuthorization, "Authorization success must clear the failure latch")
+    try expect(agent.status.settingsErrorMessage == nil, "Authorization success must remain the visible final state")
+}
+
+func testDeleteWriteAuthorizeOrderingSurvivesBackendRestart() throws {
+    let baseDirectory = try makeTemporaryDirectory(named: "keychain-operation-order")
+    defer {
+        try? FileManager.default.removeItem(at: baseDirectory)
+    }
+
+    let service = "io.github.naifuliang.gatebeam.keychain-order.v3"
+    let lock = NSLock()
+    var storedToken: String? = "initial-token"
+    var events: [String] = []
+    let keychain = KeychainStore(
+        service: service,
+        legacyServices: [],
+        operationHandlers: KeychainOperationHandlers(
+            scopedSet: { value, _, _, interaction, refreshAccess in
+                lock.lock()
+                events.append("set:\(value):\(interaction):\(refreshAccess)")
+                storedToken = value
+                lock.unlock()
+            },
+            scopedGet: { _, _, interaction in
+                lock.lock()
+                defer { lock.unlock() }
+                events.append("get:\(interaction)")
+                return storedToken
+            },
+            scopedDelete: { _, _, interaction in
+                lock.lock()
+                events.append("delete:\(interaction)")
+                storedToken = nil
+                lock.unlock()
+            }
+        )
+    )
+    let agent = NetworkAgent(
+        configStore: AppConfigStore(baseDirectory: baseDirectory),
+        keychain: keychain,
+        initialConfig: .default
+    )
+    let initialLoad = try agent.loadCloudflareToken(interaction: .background)
+    try expect(
+        initialLoad == "initial-token",
+        "The ordering fixture must begin with a cached token"
+    )
+
+    var deleteResult: Result<AppConfig, Error>?
+    var writeResult: Result<AppConfig, Error>?
+    var authorizationResult: Result<KeychainAuthorizationOutcome, Error>?
+    agent.persistSettingsAsync(config: .default, token: "") { deleteResult = $0 }
+    agent.persistSettingsAsync(config: .default, token: "replacement-token") { writeResult = $0 }
+    agent.authorizeSavedCloudflareToken { authorizationResult = $0 }
+
+    try expect(
+        waitUntil {
+            deleteResult != nil && writeResult != nil && authorizationResult != nil
+        },
+        "Delete, write, and authorization transactions must all complete"
+    )
+    _ = try deleteResult?.get()
+    _ = try writeResult?.get()
+    let finalAuthorization = try authorizationResult?.get()
+    try expect(
+        finalAuthorization == .authorized(token: "replacement-token"),
+        "Authorization must observe the replacement written by the preceding transaction"
+    )
+
+    lock.lock()
+    let finalEvents = events
+    let finalStoredToken = storedToken
+    lock.unlock()
+    let deleteIndex = finalEvents.firstIndex(of: "delete:userInitiated")
+    let writeIndex = finalEvents.firstIndex {
+        $0.hasPrefix("set:replacement-token:userInitiated")
+    }
+    let authorizationReadIndex = finalEvents.lastIndex(of: "get:userInitiated")
+    try expect(
+        deleteIndex != nil
+            && writeIndex != nil
+            && authorizationReadIndex != nil
+            && deleteIndex! < writeIndex!
+            && writeIndex! < authorizationReadIndex!,
+        "Keychain transactions must preserve submitted delete, write, authorize order"
+    )
+    try expect(finalStoredToken == "replacement-token", "The physical Keychain state must match the final authorization")
+
+    let restartedAgent = NetworkAgent(
+        configStore: AppConfigStore(baseDirectory: baseDirectory),
+        keychain: keychain,
+        initialConfig: .default
+    )
+    let restartedToken = try restartedAgent.loadCloudflareToken(
+        retryAfterFailure: false,
+        interaction: .background
+    )
+    try expect(
+        restartedToken == "replacement-token",
+        "A restarted backend must read the same token committed before restart"
+    )
+    try expect(
+        restartedAgent.cloudflareToken() == "replacement-token",
+        "The restarted UI-facing cache must match the Keychain"
+    )
+    try expect(!restartedAgent.savedTokenNeedsAuthorization, "A clean restart must not show a stale authorization latch")
+    try expect(restartedAgent.status.settingsErrorMessage == nil, "A clean restart must not show a stale Keychain error")
+}
+
 func testConfigStoreReportsRealWriteFailure() throws {
     let unwritableURL = URL(fileURLWithPath: "/dev/null/config.json")
     let store = AppConfigStore(configURL: unwritableURL)
@@ -3119,6 +3416,9 @@ let tests: [(String, () throws -> Void)] = [
     ("Keychain current item ACL refresh", testCurrentKeychainItemAuthorizationRefreshesAccess),
     ("Keychain legacy cleanup retry", testLegacyCleanupFailureRetriesWithoutLosingSecureCopy),
     ("Keychain explicit authorization latch", testExplicitKeychainAuthorizationClearsFailureLatch),
+    ("Keychain migration and concurrent empty save", testLegacyMigrationSerializesConcurrentEmptySave),
+    ("Keychain stale read and authorization ordering", testOldBackgroundReadCannotOverwriteAuthorizationSuccess),
+    ("Keychain delete write authorize restart ordering", testDeleteWriteAuthorizeOrderingSurvivesBackendRestart),
     ("real config write failure", testConfigStoreReportsRealWriteFailure),
     ("settings transaction rollback", testSettingsTransactionRollsBackOnConfigWriteFailure),
     ("serialized concurrent state", testConcurrentStateAccessDoesNotDeadlock),

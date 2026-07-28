@@ -98,6 +98,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
     private var cloudflareZones: [CloudflareZoneSummary] = []
     private var configuredRecordName = ""
     private var isPersisting = false
+    private var isAuthorizingToken = false
     private weak var saveButton: NSButton?
     private weak var checkButton: NSButton?
     private weak var connectButton: NSButton?
@@ -741,7 +742,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         _ config: AppConfig,
         completion: ((Bool) -> Void)? = nil
     ) {
-        guard !isPersisting else { return }
+        guard !isPersisting, !isAuthorizingToken else { return }
         let normalized: AppConfig
         do {
             normalized = try SettingsProxyValidation.normalizedForPersistence(config)
@@ -784,14 +785,14 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
     }
 
     @objc private func authorizeSavedToken() {
-        guard !isPersisting else { return }
-        authorizeTokenButton?.isEnabled = false
+        guard !isPersisting, !isAuthorizingToken else { return }
+        setAuthorizationBusy(true)
         cloudflareFeedbackLabel.stringValue = "Waiting for macOS Keychain authorization..."
         cloudflareFeedbackLabel.textColor = .secondaryLabelColor
 
         agent.authorizeSavedCloudflareToken { [weak self] result in
             guard let self else { return }
-            self.authorizeTokenButton?.isEnabled = true
+            self.setAuthorizationBusy(false)
             switch result {
             case .success(.noSavedToken):
                 self.cloudflareFeedbackLabel.stringValue = "No saved token was found. Paste a new scoped token."
@@ -825,11 +826,21 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
 
     private func setPersistenceBusy(_ busy: Bool) {
         isPersisting = busy
-        saveButton?.isEnabled = !busy
-        checkButton?.isEnabled = !busy
-        connectButton?.isEnabled = !busy
-        authorizeTokenButton?.isEnabled = !busy
+        updateBusyControls()
         saveButton?.title = busy ? "Saving..." : "Save Changes"
+    }
+
+    private func setAuthorizationBusy(_ busy: Bool) {
+        isAuthorizingToken = busy
+        updateBusyControls()
+    }
+
+    private func updateBusyControls() {
+        let isBusy = isPersisting || isAuthorizingToken
+        saveButton?.isEnabled = !isBusy
+        checkButton?.isEnabled = !isBusy
+        connectButton?.isEnabled = !isBusy
+        authorizeTokenButton?.isEnabled = !isBusy
     }
 
     private func presentPersistenceError(_ error: Error) {

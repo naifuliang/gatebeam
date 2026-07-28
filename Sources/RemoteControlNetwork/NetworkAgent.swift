@@ -18,34 +18,6 @@ enum NetworkAgentError: Error, LocalizedError {
     }
 }
 
-private final class TokenLoadFlight {
-    private let group = DispatchGroup()
-    private let lock = NSLock()
-    private var result: Result<String, Error>?
-
-    init() {
-        group.enter()
-    }
-
-    func resolve(_ result: Result<String, Error>) {
-        lock.lock()
-        self.result = result
-        lock.unlock()
-        group.leave()
-    }
-
-    func wait() throws -> String {
-        group.wait()
-        lock.lock()
-        let resolved = result
-        lock.unlock()
-        guard let resolved else {
-            throw NetworkAgentError.transactionFailed("Keychain token load ended without a result")
-        }
-        return try resolved.get()
-    }
-}
-
 final class NetworkAgentScheduledTimer {
     private let lock = NSLock()
     private var cancelHandler: (() -> Void)?
@@ -276,7 +248,7 @@ final class NetworkAgent {
     private var isRunning = false
     private var cachedCloudflareToken: String?
     private var keychainReadFailure: Error?
-    private var tokenLoadFlight: TokenLoadFlight?
+    private var keychainStateGeneration: UInt64 = 0
     private var launchAgentErrorMessage: String?
     private var keychainErrorMessage: String?
     private var configPersistenceErrorMessage: String?
@@ -567,13 +539,15 @@ final class NetworkAgent {
         return try withTransaction {
             try requireKnownConfigState()
             try requireCurrentRevision(mutationRevision)
+            let tokenRequestGeneration = withState { keychainStateGeneration }
             let previousToken = try withMutationSideEffect(
                 revision: mutationRevision,
                 label: "keychain.read"
             ) {
-                try loadCloudflareToken(
+                try loadCloudflareTokenOnTransactionQueue(
                     retryAfterFailure: true,
-                    interaction: .userInitiated
+                    interaction: .userInitiated,
+                    requestGeneration: tokenRequestGeneration
                 )
             }
             var previousConfig = config
@@ -678,6 +652,9 @@ final class NetworkAgent {
 
             let committed = withState {
                 guard configRevision == mutationRevision else { return false }
+                if tokenChanged {
+                    keychainStateGeneration &+= 1
+                }
                 cachedCloudflareToken = normalizedToken
                 keychainReadFailure = nil
                 keychainErrorMessage = nil
@@ -743,59 +720,56 @@ final class NetworkAgent {
     ) throws -> String {
         guard sideEffectsEnabled else { return "" }
 
-        enum Decision {
-            case cached(String)
-            case latched(Error)
-            case wait(TokenLoadFlight)
-            case perform(TokenLoadFlight)
+        let requestGeneration = withState { keychainStateGeneration }
+        return try withTransaction {
+            try loadCloudflareTokenOnTransactionQueue(
+                retryAfterFailure: retryAfterFailure,
+                interaction: interaction,
+                requestGeneration: requestGeneration
+            )
         }
+    }
 
-        let decision: Decision = withState {
+    private func loadCloudflareTokenOnTransactionQueue(
+        retryAfterFailure: Bool,
+        interaction: KeychainInteraction,
+        requestGeneration: UInt64
+    ) throws -> String {
+        let existing: Result<String, Error>? = withState {
             if let cachedCloudflareToken {
-                return .cached(cachedCloudflareToken)
+                return .success(cachedCloudflareToken)
             }
-            if let tokenLoadFlight {
-                return .wait(tokenLoadFlight)
+            if let keychainReadFailure,
+               !retryAfterFailure || requestGeneration != keychainStateGeneration {
+                return .failure(keychainReadFailure)
             }
-            if let keychainReadFailure, !retryAfterFailure {
-                return .latched(keychainReadFailure)
-            }
-            let flight = TokenLoadFlight()
-            tokenLoadFlight = flight
-            return .perform(flight)
+            return nil
+        }
+        if let existing {
+            return try existing.get()
         }
 
-        switch decision {
-        case .cached(let token):
-            return token
-        case .latched(let error):
-            throw error
-        case .wait(let flight):
-            return try flight.wait()
-        case .perform(let flight):
-            let result = Result {
-                try keychain.get(
-                    account: "cloudflare-api-token",
-                    interaction: interaction
-                ) ?? ""
-            }
-            withState {
-                tokenLoadFlight = nil
-                switch result {
-                case .success(let token):
-                    cachedCloudflareToken = token
-                    keychainReadFailure = nil
-                    keychainErrorMessage = nil
-                case .failure(let error):
-                    cachedCloudflareToken = nil
-                    keychainReadFailure = error
-                    keychainErrorMessage = "Could not read the Cloudflare token: \(error.localizedDescription)"
-                }
-                publishCurrentSettingsErrorOnStateQueue()
-            }
-            flight.resolve(result)
-            return try result.get()
+        let result = Result {
+            try keychain.get(
+                account: "cloudflare-api-token",
+                interaction: interaction
+            ) ?? ""
         }
+        withState {
+            keychainStateGeneration &+= 1
+            switch result {
+            case .success(let token):
+                cachedCloudflareToken = token
+                keychainReadFailure = nil
+                keychainErrorMessage = nil
+            case .failure(let error):
+                cachedCloudflareToken = nil
+                keychainReadFailure = error
+                keychainErrorMessage = "Could not read the Cloudflare token: \(error.localizedDescription)"
+            }
+            publishCurrentSettingsErrorOnStateQueue()
+        }
+        return try result.get()
     }
 
     func saveCloudflareToken(_ token: String) throws {
@@ -809,14 +783,17 @@ final class NetworkAgent {
         }
 
         try withTransaction {
-            let current = try loadCloudflareToken(
+            let requestGeneration = withState { keychainStateGeneration }
+            let current = try loadCloudflareTokenOnTransactionQueue(
                 retryAfterFailure: true,
-                interaction: .userInitiated
+                interaction: .userInitiated,
+                requestGeneration: requestGeneration
             )
             guard current != normalized else { return }
             do {
                 try writeTokenToKeychain(normalized)
                 withState {
+                    keychainStateGeneration &+= 1
                     cachedCloudflareToken = normalized
                     keychainReadFailure = nil
                     keychainErrorMessage = nil
@@ -843,13 +820,14 @@ final class NetworkAgent {
             return
         }
 
-        keychainReadQueue.async {
+        transactionQueue.async {
             let result = Result {
                 try self.keychain.authorizeCurrentOrMigrateLegacy(
                     account: "cloudflare-api-token"
                 )
             }
             self.withState {
+                self.keychainStateGeneration &+= 1
                 switch result {
                 case .success(let outcome):
                     self.cachedCloudflareToken = outcome.token
