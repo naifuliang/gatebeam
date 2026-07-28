@@ -165,7 +165,13 @@ evidence records:
 ```sh
 export GATEBEAM_RELEASE_CI_RUN_ID='CI_RUN_ID'
 export GATEBEAM_RELEASE_CLEAN_MACHINE_RUN_ID='CLEAN_MACHINE_RUN_ID'
-export GATEBEAM_GITHUB_TOKEN='FINE_GRAINED_TOKEN'
+GATEBEAM_GITHUB_TOKEN_FILE="$(mktemp /private/tmp/gatebeam-token.XXXXXX)"
+chmod 600 "$GATEBEAM_GITHUB_TOKEN_FILE"
+read -r -s 'GITHUB_TOKEN?GitHub token: '
+print -rn -- "$GITHUB_TOKEN" >"$GATEBEAM_GITHUB_TOKEN_FILE"
+unset GITHUB_TOKEN
+export GATEBEAM_GITHUB_TOKEN_FILE
+trap 'rm -f -- "$GATEBEAM_GITHUB_TOKEN_FILE"' EXIT
 ```
 
 The script never accepts a repository, evidence URL, previous build number,
@@ -199,7 +205,10 @@ identifier `io.github.naifuliang.gatebeam`, the previous manifest version, and
 the fixed `/Applications` installation root. Only that component's sole
 `Payload/Gatebeam.app`, installed as `/Applications/Gatebeam.app`, is accepted;
 apps in Scripts, Resources, another component, or another payload location
-cannot satisfy rollback validation. Its version, build, Bundle ID, and
+cannot satisfy rollback validation. The expanded root, component, Payload, and
+app must remain canonical and contained; every symlink or reparse entry and
+every multiply linked or non-regular file inside the app bundle is rejected.
+Its version, build, Bundle ID, and
 signature, plus the PKG signature, must match the validated previous manifest
 and signing contract. The new `CFBundleVersion` must be greater than that
 manifest's `buildVersion`; rollback metadata is derived from the same immutable
@@ -216,13 +225,16 @@ It records `previousBuildVersion` as `0` and `rollback.available` as `false`;
 it cannot invent a historical rollback version or URL. Bootstrap is rejected
 as soon as any published release exists.
 
-`GATEBEAM_GITHUB_TOKEN` is required for every formal release. Use a fine-grained
+`GATEBEAM_GITHUB_TOKEN_FILE` is required for every formal release and must name
+a canonical, caller-owned `0600` regular file with one link. Use a fine-grained
 token scoped to the fixed `naifuliang/gatebeam` repository with at least
-Administration (read), Actions (read), and Contents (read). The script sends it
-as a Bearer credential only from a non-exported shell variable on each GitHub
-API request. It copies and unsets `GATEBEAM_GITHUB_TOKEN` before starting any
-child process, never exports the internal value, and never writes the token to
-logs, the release manifest, temporary config, or retained release output.
+Administration (read), Actions (read), and Contents (read). The environment and
+curl argv contain only file paths, never the Bearer value. Each request uses a
+private `0600` curl config that is deleted immediately after curl returns; the
+overall cleanup removes any remainder. The token is never written to logs, the
+release manifest, or retained release output. Delete the caller-owned input file
+with the trap above. This boundary does not claim to prevent the same user from
+reading process memory.
 
 ## Build and Sign
 

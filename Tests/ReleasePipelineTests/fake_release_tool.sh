@@ -142,6 +142,27 @@ case "$TOOL_NAME" in
     if [[ "$1" == "--expand-full" ]]; then
       [[ $# -eq 3 && -f "$2" && ! -e "$3" ]]
       /usr/bin/ditto -x -k "$2" "$3"
+      app="$3/Gatebeam.pkg/Payload/Gatebeam.app"
+      case "${GATEBEAM_FAKE_GITHUB_SCENARIO:-}" in
+        internal-contents-symlink)
+          mkdir -p "$3/Gatebeam.pkg/Scripts"
+          mv "$app/Contents" "$3/Gatebeam.pkg/Scripts/DecoyContents"
+          ln -s ../../Scripts/DecoyContents "$app/Contents"
+          ;;
+        nested-symlink)
+          mkdir -p "$app/Contents/Resources"
+          ln -s ../MacOS "$app/Contents/Resources/Nested"
+          ;;
+        canonical-escape)
+          mv "$3/Gatebeam.pkg/Payload" "$3/Gatebeam.pkg/EscapedPayload"
+          ln -s EscapedPayload "$3/Gatebeam.pkg/Payload"
+          ;;
+        app-hardlink)
+          mkdir -p "$app/Contents/Resources"
+          ln "$app/Contents/MacOS/Gatebeam" \
+            "$app/Contents/Resources/GatebeamHardlink"
+          ;;
+      esac
       exit
     fi
     print -r -- "Package ${@: -1}:"

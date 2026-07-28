@@ -2,8 +2,9 @@
 set -euo pipefail
 umask 077
 
-GITHUB_API_TOKEN="${GATEBEAM_GITHUB_TOKEN:-}"
-unset GATEBEAM_GITHUB_TOKEN GITHUB_TOKEN GH_TOKEN
+GITHUB_TOKEN_FILE="${GATEBEAM_GITHUB_TOKEN_FILE:-}"
+GITHUB_API_TOKEN=""
+unset GATEBEAM_GITHUB_TOKEN GATEBEAM_GITHUB_TOKEN_FILE GITHUB_TOKEN GH_TOKEN
 typeset +x GITHUB_API_TOKEN
 
 export PATH="/usr/bin:/bin:/usr/sbin:/sbin"
@@ -212,36 +213,80 @@ validate_run_id() {
 }
 
 prepare_github_auth() {
+  local token_parent
+  local token_size
+
+  [[ -n "$GITHUB_TOKEN_FILE" ]] ||
+    fail "GATEBEAM_GITHUB_TOKEN_FILE is required for a formal release"
+  [[ "$GITHUB_TOKEN_FILE" == /* ]] ||
+    fail "GATEBEAM_GITHUB_TOKEN_FILE must be an absolute path"
+  token_parent="$(
+    cd -P "${GITHUB_TOKEN_FILE:h}" 2>/dev/null && pwd -P
+  )" || fail "GATEBEAM_GITHUB_TOKEN_FILE has an invalid parent"
+  [[ "$GITHUB_TOKEN_FILE" == "$token_parent/${GITHUB_TOKEN_FILE:t}" &&
+      -f "$GITHUB_TOKEN_FILE" &&
+      ! -L "$GITHUB_TOKEN_FILE" &&
+      "$(/usr/bin/stat -f '%Lp' "$GITHUB_TOKEN_FILE")" == "600" &&
+      "$(/usr/bin/stat -f '%u' "$GITHUB_TOKEN_FILE")" == "$EUID" &&
+      "$(/usr/bin/stat -f '%l' "$GITHUB_TOKEN_FILE")" == "1" ]] ||
+    fail "GATEBEAM_GITHUB_TOKEN_FILE must be a canonical, private 0600 regular file"
+  token_size="$(/usr/bin/stat -f '%z' "$GITHUB_TOKEN_FILE")"
+  (( token_size > 0 && token_size <= 256 )) ||
+    fail "GATEBEAM_GITHUB_TOKEN_FILE contains an invalid token"
+  GITHUB_API_TOKEN="$(<"$GITHUB_TOKEN_FILE")"
   [[ ${#GITHUB_API_TOKEN} -le 255 &&
       "$GITHUB_API_TOKEN" =~ '^[A-Za-z0-9_.=-]+$' ]] ||
-    fail "GATEBEAM_GITHUB_TOKEN contains unsafe characters"
+    fail "GATEBEAM_GITHUB_TOKEN_FILE contains an invalid token"
+}
+
+github_curl() {
+  local request_kind="$1"
+  local url="$2"
+  local output_path="$3"
+  local config_path
+  local curl_status=0
+
+  config_path="$(mktemp "$TEMP_ROOT/github-curl.XXXXXX")" ||
+    fail "could not create private GitHub request config"
+  /bin/chmod 600 "$config_path" ||
+    fail "could not protect private GitHub request config"
+  {
+    print -r -- 'disable'
+    print -r -- 'silent'
+    print -r -- 'show-error'
+    print -r -- 'fail'
+    print -r -- 'noproxy = "*"'
+    print -r -- 'proto = "=https"'
+    if [[ "$request_kind" == "asset" ]]; then
+      print -r -- 'proto-redir = "=https"'
+      print -r -- 'location'
+      print -r -- 'max-redirs = 3'
+      print -r -- 'max-time = 300'
+      print -r -- 'header = "Accept: application/octet-stream"'
+    else
+      print -r -- 'max-redirs = 0'
+      print -r -- 'max-time = 30'
+      print -r -- 'header = "Accept: application/vnd.github+json"'
+    fi
+    print -r -- 'connect-timeout = 10'
+    print -r -- 'header = "X-GitHub-Api-Version: 2026-03-10"'
+    print -r -- "header = \"Authorization: Bearer $GITHUB_API_TOKEN\""
+    print -r -- "output = \"$output_path\""
+    print -r -- "url = \"$url\""
+  } >"$config_path"
+  "$CURL" --config "$config_path" || curl_status=$?
+  rm -f -- "$config_path"
+  return "$curl_status"
 }
 
 github_api_json() {
   local url="$1"
   local output_path="$2"
   local label="$3"
-  local -a curl_arguments
 
   [[ "$url" == "$GITHUB_API_ROOT/"* ]] ||
     fail "internal GitHub API endpoint escaped the fixed repository"
-  curl_arguments=(
-    --disable
-    --silent
-    --show-error
-    --fail
-    --noproxy '*'
-    --proto '=https'
-    --max-redirs 0
-    --connect-timeout 10
-    --max-time 30
-    --header 'Accept: application/vnd.github+json'
-    --header 'X-GitHub-Api-Version: 2026-03-10'
-    --header "Authorization: Bearer $GITHUB_API_TOKEN"
-  )
-  curl_arguments+=(--output "$output_path" "$url")
-
-  if ! "$CURL" "${curl_arguments[@]}"; then
+  if ! github_curl json "$url" "$output_path"; then
     rm -f -- "$output_path"
     fail "GitHub API request failed for $label"
   fi
@@ -257,31 +302,12 @@ github_asset_download() {
   local output_path="$3"
   local label="$4"
   local url="$GITHUB_API_ROOT/releases/assets/$asset_id"
-  local -a curl_arguments
 
   [[ "$asset_id" =~ '^[1-9][0-9]*$' &&
       "$expected_size" =~ '^[1-9][0-9]*$' &&
       "$expected_size" -le 1073741824 ]] ||
     fail "GitHub release asset metadata is unsafe for $label"
-  curl_arguments=(
-    --disable
-    --silent
-    --show-error
-    --fail
-    --noproxy '*'
-    --proto '=https'
-    --proto-redir '=https'
-    --location
-    --max-redirs 3
-    --connect-timeout 10
-    --max-time 300
-    --header 'Accept: application/octet-stream'
-    --header 'X-GitHub-Api-Version: 2026-03-10'
-    --header "Authorization: Bearer $GITHUB_API_TOKEN"
-  )
-  curl_arguments+=(--output "$output_path" "$url")
-
-  if ! "$CURL" "${curl_arguments[@]}"; then
+  if ! github_curl asset "$url" "$output_path"; then
     rm -f -- "$output_path"
     fail "GitHub release asset download failed for $label"
   fi
@@ -401,6 +427,7 @@ import os
 import pathlib
 import posixpath
 import re
+import stat
 import sys
 import xml.etree.ElementTree as ET
 
@@ -411,8 +438,49 @@ expected_install_root = sys.argv[4]
 expected_app_path = sys.argv[5]
 output_path = pathlib.Path(sys.argv[6])
 
+def is_reparse(entry):
+    return bool(
+        getattr(entry, "st_file_attributes", 0)
+        & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    )
+
+def safe_lstat(path):
+    entry = path.lstat()
+    if stat.S_ISLNK(entry.st_mode) or is_reparse(entry):
+        raise ValueError("linked package path")
+    return entry
+
+def safe_directory(path):
+    entry = safe_lstat(path)
+    if not stat.S_ISDIR(entry.st_mode):
+        raise ValueError("missing package directory")
+    if path.resolve(strict=True) != path.absolute():
+        raise ValueError("non-canonical package directory")
+
 def regular_file(path):
-    return path.is_file() and not path.is_symlink()
+    try:
+        entry = safe_lstat(path)
+    except (FileNotFoundError, ValueError):
+        return False
+    return stat.S_ISREG(entry.st_mode) and entry.st_nlink == 1
+
+def require_within(path, parent):
+    try:
+        path.relative_to(parent)
+    except ValueError as error:
+        raise ValueError("package path escaped its container") from error
+
+def validate_app_tree(app):
+    for directory, names, files in os.walk(app, topdown=True, followlinks=False):
+        directory_path = pathlib.Path(directory)
+        safe_directory(directory_path)
+        for name in [*names, *files]:
+            path = directory_path / name
+            entry = safe_lstat(path)
+            if stat.S_ISDIR(entry.st_mode):
+                continue
+            if not stat.S_ISREG(entry.st_mode) or entry.st_nlink != 1:
+                raise ValueError("unsafe app bundle entry")
 
 def parse_xml(path):
     if not regular_file(path) or path.stat().st_size > 1048576:
@@ -422,6 +490,7 @@ def parse_xml(path):
         raise ValueError("unsafe package metadata")
     return ET.fromstring(payload)
 
+safe_directory(root)
 package_infos = [
     path for path in root.rglob("PackageInfo")
     if regular_file(path)
@@ -480,19 +549,31 @@ if metadata.attrib.get("install-location") != expected_install_root:
 
 payload_root = package_info.parent / "Payload"
 payload_app = payload_root / "Gatebeam.app"
-if not payload_root.is_dir() or payload_root.is_symlink():
-    raise ValueError("missing component payload")
+component_root = package_info.parent
+safe_directory(component_root)
+safe_directory(payload_root)
+safe_directory(payload_app)
+root_canonical = root.resolve(strict=True)
+component_canonical = component_root.resolve(strict=True)
+payload_canonical = payload_root.resolve(strict=True)
+app_canonical = payload_app.resolve(strict=True)
+require_within(component_canonical, root_canonical)
+require_within(payload_canonical, component_canonical)
+require_within(app_canonical, payload_canonical)
+if payload_canonical.parent != component_canonical:
+    raise ValueError("payload escaped its component")
+if app_canonical.parent != payload_canonical:
+    raise ValueError("application escaped its payload")
 payload_entries = list(payload_root.iterdir())
 if (
     payload_entries != [payload_app]
-    or not payload_app.is_dir()
-    or payload_app.is_symlink()
 ):
     raise ValueError("component payload must contain one Gatebeam app")
 if posixpath.join(expected_install_root, payload_app.name) != expected_app_path:
     raise ValueError("wrong installed application path")
+validate_app_tree(payload_app)
 
-output_path.write_text(os.fspath(payload_app), encoding="utf-8")
+output_path.write_text(os.fspath(app_canonical), encoding="utf-8")
 ' \
     "$expanded_path" \
     "$EXPECTED_BUNDLE_ID" \
@@ -1058,9 +1139,6 @@ require_environment GATEBEAM_INSTALLER_SIGN_IDENTITY
 require_environment GATEBEAM_NOTARY_PROFILE
 require_environment GATEBEAM_RELEASE_CI_RUN_ID
 require_environment GATEBEAM_RELEASE_CLEAN_MACHINE_RUN_ID
-[[ -n "$GITHUB_API_TOKEN" ]] ||
-  fail "GATEBEAM_GITHUB_TOKEN is required for a formal release"
-
 GATEBEAM_RELEASE_BOOTSTRAP="${GATEBEAM_RELEASE_BOOTSTRAP:-0}"
 
 [[ "$TEST_MODE" == "0" || "$TEST_MODE" == "1" ]] ||

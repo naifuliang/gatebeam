@@ -5,6 +5,7 @@ import json
 import os
 import pathlib
 import plistlib
+import re
 import subprocess
 import sys
 import zipfile
@@ -452,22 +453,45 @@ def main():
     root = fixture_root()
     scenario = os.environ.get("GATEBEAM_FAKE_GITHUB_SCENARIO", "success")
     arguments = sys.argv[1:]
+    if len(arguments) != 2 or arguments[0] != "--config":
+        fail("fake curl accepts only a private config path in argv")
+    config_path = pathlib.Path(arguments[1])
+    config_stat = config_path.lstat()
+    if (
+        not config_path.is_file()
+        or config_path.is_symlink()
+        or config_stat.st_mode & 0o777 != 0o600
+        or config_stat.st_nlink != 1
+    ):
+        fail("fake curl config is not a private 0600 regular file")
+    config_lines = config_path.read_text(encoding="utf-8").splitlines()
     output_path = None
     url = None
     headers = []
-    for index, argument in enumerate(arguments):
-        if argument == "--header" and index + 1 < len(arguments):
-            headers.append(arguments[index + 1])
-        if argument == "--output" and index + 1 < len(arguments):
-            output_path = pathlib.Path(arguments[index + 1])
-        if argument.startswith("https://"):
-            url = argument
+    for line in config_lines:
+        match = re.fullmatch(r"([a-z-]+) = \"(.*)\"", line)
+        if match is None:
+            continue
+        option, value = match.groups()
+        if option == "header":
+            headers.append(value)
+        elif option == "output":
+            output_path = pathlib.Path(value)
+        elif option == "url":
+            url = value
     if output_path is None or url is None:
-        fail("fake curl requires an output path and fixed HTTPS URL")
-    expected_token = os.environ.get(
-        "GATEBEAM_FAKE_EXPECTED_GITHUB_TOKEN",
-        "fixture_github_token_0123456789",
+        fail("fake curl config requires an output path and fixed HTTPS URL")
+    expected_token_file = pathlib.Path(
+        os.environ["GATEBEAM_FAKE_EXPECTED_GITHUB_TOKEN_FILE"]
     )
+    expected_token = expected_token_file.read_text(encoding="utf-8").strip()
+    if any(expected_token in argument for argument in sys.argv):
+        fail("GitHub token leaked through curl argv")
+    if any(
+        expected_token in key or expected_token in value
+        for key, value in os.environ.items()
+    ):
+        fail("GitHub token leaked through the API child environment")
     expected_header = f"Authorization: Bearer {expected_token}"
     authorization_headers = [
         header for header in headers
@@ -475,8 +499,16 @@ def main():
     ]
     if authorization_headers != [expected_header]:
         fail("fake GitHub authentication failed")
-    if "GATEBEAM_GITHUB_TOKEN" in os.environ or "GITHUB_API_TOKEN" in os.environ:
+    if (
+        "GATEBEAM_GITHUB_TOKEN" in os.environ
+        or "GATEBEAM_GITHUB_TOKEN_FILE" in os.environ
+        or "GITHUB_API_TOKEN" in os.environ
+    ):
         fail("GitHub token leaked through the API child environment")
+    with open(root / "curl-argv.log", "a", encoding="utf-8") as stream:
+        stream.write(json.dumps(sys.argv, sort_keys=True) + "\n")
+    with open(root / "curl-env.log", "a", encoding="utf-8") as stream:
+        stream.write(json.dumps(dict(os.environ), sort_keys=True) + "\n")
     with open(os.environ["GATEBEAM_FAKE_CALL_LOG"], "a", encoding="utf-8") as stream:
         stream.write(f"github {url}\n")
     if scenario == "auth-failure":

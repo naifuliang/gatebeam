@@ -74,7 +74,7 @@ new_fixture() {
     -c 'Add :LSMinimumSystemVersion string 13.0' \
     "$fixture/Resources/Info.plist" >/dev/null
 
-  print -r -- $'dist/\nbuild/\ncalls.log\ntest-output.log' >"$fixture/.gitignore"
+  print -r -- $'dist/\nbuild/\ncalls.log\ntest-output.log\ngithub-token\ncurl-argv.log\ncurl-env.log' >"$fixture/.gitignore"
   /usr/bin/git -C "$fixture" init -q -b main
   /usr/bin/git -C "$fixture" config user.name "Gatebeam Release Tests"
   /usr/bin/git -C "$fixture" config user.email "release-tests@invalid"
@@ -98,6 +98,12 @@ run_release() {
   local fixture="$1"
   shift
   local tool_dir="$fixture/fake tools"
+  local token_file="$fixture/github-token"
+
+  if [[ ! -e "$token_file" ]]; then
+    print -r -- "fixture_github_token_0123456789" >"$token_file"
+    chmod 600 "$token_file"
+  fi
 
   env \
     GATEBEAM_CODE_SIGN_IDENTITY="Developer ID Application: Gatebeam Tests (ABCDE12345)" \
@@ -106,8 +112,8 @@ run_release() {
     GATEBEAM_NOTARY_PROFILE="fixture profile" \
     GATEBEAM_RELEASE_CI_RUN_ID=123456 \
     GATEBEAM_RELEASE_CLEAN_MACHINE_RUN_ID=123457 \
-    GATEBEAM_GITHUB_TOKEN=fixture_github_token_0123456789 \
-    GATEBEAM_FAKE_EXPECTED_GITHUB_TOKEN=fixture_github_token_0123456789 \
+    GATEBEAM_GITHUB_TOKEN_FILE="$token_file" \
+    GATEBEAM_FAKE_EXPECTED_GITHUB_TOKEN_FILE="$token_file" \
     GATEBEAM_RELEASE_TEST_MODE=1 \
     GATEBEAM_RELEASE_TEST_TOOL_DIR="$tool_dir" \
     GATEBEAM_FAKE_CALL_LOG="$fixture/calls.log" \
@@ -434,6 +440,10 @@ test_github_evidence_binding() {
   for scenario label in \
     scripts-decoy "rollback Scripts app decoy" \
     resources-decoy "rollback Resources app decoy" \
+    internal-contents-symlink "rollback internal Contents symlink" \
+    nested-symlink "rollback nested app symlink" \
+    canonical-escape "rollback canonical payload escape" \
+    app-hardlink "rollback app hardlink" \
     second-payload-app "rollback payload second app" \
     second-component-package "rollback second component package" \
     wrong-package-identifier "rollback package wrong identifier" \
@@ -524,11 +534,10 @@ test_github_token_not_logged() {
   local fixture
   local token="fixture_secret_github_token"
   fixture="$(new_fixture github-token-privacy)"
+  print -r -- "$token" >"$fixture/github-token"
+  chmod 600 "$fixture/github-token"
 
-  if ! run_release \
-       "$fixture" \
-       "GATEBEAM_GITHUB_TOKEN=$token" \
-       "GATEBEAM_FAKE_EXPECTED_GITHUB_TOKEN=$token" >"$fixture/test-output.log" 2>&1; then
+  if ! run_release "$fixture" >"$fixture/test-output.log" 2>&1; then
     fail_test "GitHub token privacy fixture failed"
     return
   fi
@@ -536,11 +545,25 @@ test_github_token_not_logged() {
        "$token" \
        "$fixture/test-output.log" \
        "$fixture/calls.log" \
+       "$fixture/curl-argv.log" \
+       "$fixture/curl-env.log" \
        "$fixture/dist/release-0.5.0"; then
     fail_test "GitHub token entered release logs or output"
     return
   fi
-  pass "GitHub token is absent from logs and release output"
+  if ! /usr/bin/python3 -I -E -s -c '
+import json
+import pathlib
+import sys
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    paths = [pathlib.Path(json.loads(line)[2]) for line in stream]
+raise SystemExit(0 if paths and all(not path.exists() for path in paths) else 1)
+' "$fixture/curl-argv.log"; then
+    fail_test "private curl config was not cleaned up"
+    return
+  fi
+  pass "GitHub token is absent from curl argv, environment, logs, and release output"
 }
 
 test_github_authentication() {
@@ -550,22 +573,23 @@ test_github_authentication() {
   expect_failure \
     "missing GitHub token" \
     "$fixture" \
-    "GATEBEAM_GITHUB_TOKEN is required for a formal release" \
-    GATEBEAM_GITHUB_TOKEN=
+    "GATEBEAM_GITHUB_TOKEN_FILE is required for a formal release" \
+    GATEBEAM_GITHUB_TOKEN_FILE=
 
   fixture="$(new_fixture github-token-unsafe)"
+  print -r -- "unsafe token" >"$fixture/github-token"
+  chmod 600 "$fixture/github-token"
   expect_failure \
     "unsafe GitHub token" \
     "$fixture" \
-    "GATEBEAM_GITHUB_TOKEN contains unsafe characters" \
-    "GATEBEAM_GITHUB_TOKEN=unsafe token"
+    "GATEBEAM_GITHUB_TOKEN_FILE contains an invalid token"
 
   fixture="$(new_fixture github-token-auth-failure)"
   expect_failure \
     "GitHub token authentication failure" \
     "$fixture" \
     "GitHub API request failed for immutable release policy" \
-    GATEBEAM_GITHUB_TOKEN=fixture_wrong_github_token_0123456789
+    GATEBEAM_FAKE_GITHUB_SCENARIO=auth-failure
 }
 
 test_wrong_identity() {
@@ -581,7 +605,7 @@ test_wrong_identity() {
     GATEBEAM_NOTARY_PROFILE="fixture profile" \
     GATEBEAM_RELEASE_CI_RUN_ID=123456 \
     GATEBEAM_RELEASE_CLEAN_MACHINE_RUN_ID=123457 \
-    GATEBEAM_GITHUB_TOKEN=fixture_github_token_0123456789 \
+    GATEBEAM_GITHUB_TOKEN_FILE="$fixture/github-token" \
     GATEBEAM_RELEASE_TEST_MODE=1 \
     GATEBEAM_RELEASE_TEST_TOOL_DIR="$fixture/fake tools" \
     /bin/zsh -f "$fixture/scripts/release_formal.sh" >"$output" 2>&1; then
@@ -1112,7 +1136,7 @@ test_override_restriction() {
     GATEBEAM_NOTARY_PROFILE="fixture profile" \
     GATEBEAM_RELEASE_CI_RUN_ID=123456 \
     GATEBEAM_RELEASE_CLEAN_MACHINE_RUN_ID=123457 \
-    GATEBEAM_GITHUB_TOKEN=fixture_github_token_0123456789 \
+    GATEBEAM_GITHUB_TOKEN_FILE="$TEST_ROOT/override-token" \
     GATEBEAM_RELEASE_TEST_MODE=1 \
     GATEBEAM_RELEASE_TEST_TOOL_DIR="$TEST_ROOT/not-used" \
     /bin/zsh -f "$ROOT_DIR/scripts/release_formal.sh" >"$output" 2>&1; then
