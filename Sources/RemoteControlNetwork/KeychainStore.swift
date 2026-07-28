@@ -111,6 +111,7 @@ struct KeychainOperationHandlers {
 final class KeychainStore {
     static let productionService = "io.github.naifuliang.gatebeam.cloudflare-token.v3"
     static let legacyServices = ["com.local.RemoteControlNetwork.secure-v2"]
+    static let developerTeamInfoKey = "GatebeamDeveloperTeamIdentifier"
 
     private let service: String
     private let legacyServices: [String]
@@ -414,15 +415,27 @@ final class KeychainStore {
     }
 
     private func currentApplicationAccess() throws -> SecAccess {
-        let requirement = try Self.currentDesignatedRequirement()
-        guard Self.isStrongDesignatedRequirement(requirement) else {
-            throw KeychainError.insecureCodeRequirement(requirement)
+        let identity = try Self.currentSigningIdentity()
+        guard let requirement = Self.validatedTrustedApplicationRequirement(identity) else {
+            throw KeychainError.insecureCodeRequirement(identity.requirement)
+        }
+        guard requirement == identity.requirement else {
+            throw KeychainError.insecureCodeRequirement(identity.requirement)
+        }
+
+        var trustedApplication: SecTrustedApplication?
+        let trustedStatus = SecTrustedApplicationCreateFromPath(nil, &trustedApplication)
+        guard trustedStatus == errSecSuccess, let trustedApplication else {
+            throw KeychainError.status(
+                operation: "create trusted application",
+                code: trustedStatus
+            )
         }
 
         var access: SecAccess?
         let accessStatus = SecAccessCreate(
             "Gatebeam Cloudflare API token" as CFString,
-            nil,
+            [trustedApplication] as CFArray,
             &access
         )
         guard accessStatus == errSecSuccess, let access else {
@@ -431,7 +444,19 @@ final class KeychainStore {
         return access
     }
 
-    static func currentDesignatedRequirement() throws -> String {
+    struct SigningIdentity: Equatable {
+        let requirement: String
+        let signedBundleIdentifier: String?
+        let expectedBundleIdentifier: String?
+        let signedTeamIdentifier: String?
+        let expectedTeamIdentifier: String?
+        let currentCDHashes: [String]
+        let hasHardenedRuntime: Bool
+        let hasRuntimeVersion: Bool
+        let hasSecureTimestamp: Bool
+    }
+
+    static func currentSigningIdentity() throws -> SigningIdentity {
         guard let executableURL = Bundle.main.executableURL else {
             throw KeychainError.status(
                 operation: "locate signed executable",
@@ -452,7 +477,9 @@ final class KeychainStore {
         var signingInformation: CFDictionary?
         let informationStatus = SecCodeCopySigningInformation(
             code,
-            SecCSFlags(rawValue: kSecCSSigningInformation),
+            SecCSFlags(
+                rawValue: kSecCSSigningInformation | kSecCSRequirementInformation
+            ),
             &signingInformation
         )
         guard informationStatus == errSecSuccess,
@@ -473,10 +500,47 @@ final class KeychainStore {
                 code: textStatus
             )
         }
-        return requirementText as String
+
+        let signedInfo = information[kSecCodeInfoPList as String] as? [String: Any]
+        let flags = (information[kSecCodeInfoFlags as String] as? NSNumber)?.uint32Value ?? 0
+        let runtimeVersion = information[kSecCodeInfoRuntimeVersion as String] as? NSNumber
+        let currentCDHashes = (
+            information[kSecCodeInfoCdHashes as String] as? [Data] ?? []
+        ).map { data in
+            data.map { String(format: "%02x", $0) }.joined()
+        }
+
+        return SigningIdentity(
+            requirement: requirementText as String,
+            signedBundleIdentifier: information[kSecCodeInfoIdentifier as String] as? String,
+            expectedBundleIdentifier: signedInfo?["CFBundleIdentifier"] as? String,
+            signedTeamIdentifier: information[kSecCodeInfoTeamIdentifier as String] as? String,
+            expectedTeamIdentifier: signedInfo?[developerTeamInfoKey] as? String,
+            currentCDHashes: currentCDHashes,
+            hasHardenedRuntime: flags & 0x10000 != 0,
+            hasRuntimeVersion: (runtimeVersion?.uint64Value ?? 0) != 0,
+            hasSecureTimestamp: information[kSecCodeInfoTimestamp as String] != nil
+        )
     }
 
-    static func isStrongDesignatedRequirement(_ requirement: String) -> Bool {
+    static func validatedTrustedApplicationRequirement(
+        _ identity: SigningIdentity
+    ) -> String? {
+        guard identity.hasHardenedRuntime,
+              identity.hasRuntimeVersion,
+              let expectedBundleIdentifier = identity.expectedBundleIdentifier,
+              !expectedBundleIdentifier.isEmpty,
+              identity.signedBundleIdentifier == expectedBundleIdentifier else {
+            return nil
+        }
+
+        let requirement = identity.requirement
+            .replacingOccurrences(
+                of: #"^\s*designated\s*=>\s*"#,
+                with: "",
+                options: [.regularExpression, .caseInsensitive]
+            )
+            .trimmingCharacters(in: .whitespacesAndNewlines)
         let normalized = requirement.lowercased()
         let exactBuildPattern =
             #"^\s*cdhash\s+h"[0-9a-f]{40,128}"(?:\s+or\s+cdhash\s+h"[0-9a-f]{40,128}")*\s*$"#
@@ -484,19 +548,75 @@ final class KeychainStore {
             of: exactBuildPattern,
             options: .regularExpression
         ) != nil
+
+        if identity.expectedTeamIdentifier == nil {
+            let hashExpression = try? NSRegularExpression(
+                pattern: #"cdhash\s+h"([0-9a-f]{40,128})""#,
+                options: .caseInsensitive
+            )
+            let requirementRange = NSRange(
+                normalized.startIndex..<normalized.endIndex,
+                in: normalized
+            )
+            let requirementHashes = hashExpression?.matches(
+                in: normalized,
+                range: requirementRange
+            ).compactMap { match -> String? in
+                guard let range = Range(match.range(at: 1), in: normalized) else {
+                    return nil
+                }
+                return String(normalized[range])
+            } ?? []
+            let currentHashes = Set(identity.currentCDHashes.map { $0.lowercased() })
+            guard identity.signedTeamIdentifier == nil,
+                  !identity.hasSecureTimestamp,
+                  exactBuild,
+                  !requirementHashes.isEmpty,
+                  requirementHashes.allSatisfy({ currentHashes.contains($0) }) else {
+                return nil
+            }
+            return requirement
+        }
+
+        guard let expectedTeamIdentifier = identity.expectedTeamIdentifier,
+              !expectedTeamIdentifier.isEmpty,
+              identity.signedTeamIdentifier == expectedTeamIdentifier,
+              identity.hasSecureTimestamp else {
+            return nil
+        }
+
         let hasDeveloperIDCA =
             normalized.contains("certificate 1[field.1.2.840.113635.100.6.2.6] exists")
             || normalized.contains("certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */")
         let hasDeveloperIDLeaf =
             normalized.contains("certificate leaf[field.1.2.840.113635.100.6.1.13] exists")
             || normalized.contains("certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */")
+        let escapedBundleIdentifier = NSRegularExpression.escapedPattern(
+            for: expectedBundleIdentifier.lowercased()
+        )
+        let escapedTeamIdentifier = NSRegularExpression.escapedPattern(
+            for: expectedTeamIdentifier.lowercased()
+        )
+        let identifierPattern =
+            #"(?:^|\s)identifier\s+"# + #""?"# + escapedBundleIdentifier + #""?(?:\s|$)"#
+        let teamPattern =
+            #"certificate\s+leaf\[subject\.ou\]\s*=\s*"# + #""?"#
+                + escapedTeamIdentifier + #""?(?:\s|$)"#
+        let hasExpectedIdentifier = normalized.range(
+            of: identifierPattern,
+            options: .regularExpression
+        ) != nil
+        let hasExpectedTeam = normalized.range(
+            of: teamPattern,
+            options: .regularExpression
+        ) != nil
         let developerID = normalized.contains("anchor apple generic")
-            && normalized.contains("identifier ")
+            && hasExpectedIdentifier
             && hasDeveloperIDCA
             && hasDeveloperIDLeaf
-            && normalized.contains("certificate leaf[subject.ou]")
+            && hasExpectedTeam
             && !normalized.contains(" or ")
-        return exactBuild || developerID
+        return developerID ? requirement : nil
     }
 }
 

@@ -7,7 +7,7 @@ VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$ROOT
 APP_DIR="$ROOT_DIR/dist/$APP_NAME.app"
 DMG_PATH="$ROOT_DIR/dist/Gatebeam-$VERSION.dmg"
 BUILD_DIR="$ROOT_DIR/build"
-BUNDLE_ID="com.local.RemoteControlNetwork"
+BUNDLE_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$ROOT_DIR/Resources/Info.plist")"
 EXPECTED_EXECUTABLE="Gatebeam"
 VALIDATE_ONLY=false
 

@@ -7,7 +7,8 @@ IFS=$' \t\n'
 
 readonly ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 readonly APP_NAME="Gatebeam"
-readonly BUNDLE_ID="com.local.RemoteControlNetwork"
+readonly BUNDLE_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$ROOT_DIR/Resources/Info.plist")"
+readonly LEGACY_BUNDLE_ID="com.local.RemoteControlNetwork"
 readonly STABLE_LABEL="com.local.RemoteControlNetwork.login"
 readonly TRANSITIONAL_LABEL="io.github.naifuliang.gatebeam.login"
 readonly APP_DIR="${GATEBEAM_APP_DIR:-$ROOT_DIR/dist/$APP_NAME.app}"
@@ -58,6 +59,7 @@ bundle_value() {
 is_recognized_app() {
   local app_path="$1"
   local expected_executable="$2"
+  local expected_bundle_id="$3"
   local executable_path="$app_path/Contents/MacOS/$expected_executable"
 
   [[ -d "$app_path" && ! -L "$app_path" ]] || return 1
@@ -65,7 +67,7 @@ is_recognized_app() {
   [[ -f "$app_path/Contents/Info.plist" && ! -L "$app_path/Contents/Info.plist" ]] || return 1
   [[ -d "$app_path/Contents/MacOS" && ! -L "$app_path/Contents/MacOS" ]] || return 1
   [[ -f "$executable_path" && ! -L "$executable_path" && -x "$executable_path" ]] || return 1
-  [[ "$(bundle_value "$app_path" CFBundleIdentifier || true)" == "$BUNDLE_ID" ]] || return 1
+  [[ "$(bundle_value "$app_path" CFBundleIdentifier || true)" == "$expected_bundle_id" ]] || return 1
   [[ "$(bundle_value "$app_path" CFBundleExecutable || true)" == "$expected_executable" ]]
 }
 
@@ -275,7 +277,7 @@ is_symbolic_link_free_path "$USER_HOME" "$AGENTS_DIR" || {
 if [[ ! -d "$APP_DIR" ]]; then
   "$ROOT_DIR/scripts/build_app.sh"
 fi
-is_recognized_app "$APP_DIR" "Gatebeam" || {
+is_recognized_app "$APP_DIR" "Gatebeam" "$BUNDLE_ID" || {
   fail "Refusing to install an unrecognized source application: $APP_DIR"
   exit 1
 }
@@ -285,13 +287,13 @@ has_valid_code_signature "$APP_DIR" || {
 }
 
 if path_exists "$DESTINATION"; then
-  is_recognized_app "$DESTINATION" "Gatebeam" || {
+  is_recognized_app "$DESTINATION" "Gatebeam" "$BUNDLE_ID" || {
     fail "Refusing to replace an unrecognized app: $DESTINATION"
     exit 1
   }
 fi
 if path_exists "$LEGACY_APP"; then
-  is_recognized_app "$LEGACY_APP" "RemoteControlNetwork" || {
+  is_recognized_app "$LEGACY_APP" "RemoteControlNetwork" "$LEGACY_BUNDLE_ID" || {
     fail "Refusing to migrate an unrecognized legacy app: $LEGACY_APP"
     exit 1
   }
@@ -345,7 +347,7 @@ fi
 
 COPYFILE_DISABLE=1 /usr/bin/ditto --norsrc --noextattr "$APP_DIR" "$temporary_destination" ||
   exit_with_rollback "$?"
-is_recognized_app "$temporary_destination" "Gatebeam" || {
+is_recognized_app "$temporary_destination" "Gatebeam" "$BUNDLE_ID" || {
   fail "Copied application failed validation"
   exit_with_rollback 1
 }

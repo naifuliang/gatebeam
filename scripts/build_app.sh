@@ -38,6 +38,17 @@ chmod +x "$EXECUTABLE"
 
 if command -v codesign >/dev/null 2>&1; then
   source "$SIGNING_CONTRACT"
+  if [[ "$CODE_SIGN_IDENTITY" == "-" ]]; then
+    /usr/bin/plutil -remove GatebeamDeveloperTeamIdentifier \
+      "$CONTENTS_DIR/Info.plist" 2>/dev/null || true
+  else
+    /usr/bin/plutil -replace GatebeamDeveloperTeamIdentifier \
+      -string "$DEVELOPER_TEAM_ID" \
+      "$CONTENTS_DIR/Info.plist" 2>/dev/null ||
+      /usr/bin/plutil -insert GatebeamDeveloperTeamIdentifier \
+        -string "$DEVELOPER_TEAM_ID" \
+        "$CONTENTS_DIR/Info.plist"
+  fi
   sign_arguments=(
     --force
     --sign "$CODE_SIGN_IDENTITY"

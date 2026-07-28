@@ -8,6 +8,7 @@ APP_PATH="$ROOT_DIR/dist/Gatebeam.app"
 APP_EXECUTABLE="$APP_PATH/Contents/MacOS/Gatebeam"
 INJECTION_SOURCE="$ROOT_DIR/Tests/KeychainIdentityTests/DYLDInjectionProbe.c"
 SIGNING_CONTRACT="$ROOT_DIR/scripts/signing_contract.sh"
+BUNDLE_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$ROOT_DIR/Resources/Info.plist")"
 SPOOF_APP="$BUILD_DIR/SpoofedGatebeam.bundle-fixture"
 INJECTION_DYLIB="$BUILD_DIR/libGatebeamInjectionProbe.dylib"
 INJECTION_SENTINEL="$BUILD_DIR/dyld-injection-loaded"
@@ -43,6 +44,11 @@ requirement_output="$(/usr/bin/codesign -d -r- "$APP_PATH" 2>&1)"
 requirement="${requirement_output##*designated => }"
 signing_details="$(/usr/bin/codesign -d --verbose=4 "$APP_PATH" 2>&1)"
 entitlements="$(/usr/bin/codesign -d --entitlements - "$APP_PATH" 2>/dev/null || true)"
+if /usr/bin/plutil -extract GatebeamDeveloperTeamIdentifier raw -o - \
+  "$APP_PATH/Contents/Info.plist" >/dev/null 2>&1; then
+  print -u2 "Developer Preview must not embed a Developer ID Team ID."
+  exit 1
+fi
 if ! gatebeam_validate_preview_contract \
   "$requirement" \
   "$signing_details" \
@@ -54,14 +60,14 @@ fi
 
 /bin/cp /usr/bin/true "$SPOOF_APP/Contents/MacOS/Gatebeam"
 /usr/bin/plutil -create xml1 "$SPOOF_APP/Contents/Info.plist"
-/usr/bin/plutil -insert CFBundleIdentifier -string com.local.RemoteControlNetwork "$SPOOF_APP/Contents/Info.plist"
+/usr/bin/plutil -insert CFBundleIdentifier -string "$BUNDLE_ID" "$SPOOF_APP/Contents/Info.plist"
 /usr/bin/plutil -insert CFBundleExecutable -string Gatebeam "$SPOOF_APP/Contents/Info.plist"
 /usr/bin/codesign \
   --force \
   --deep \
   --sign - \
   --options runtime \
-  --identifier com.local.RemoteControlNetwork \
+  --identifier "$BUNDLE_ID" \
   "$SPOOF_APP" >/dev/null
 
 /usr/bin/codesign --verify --deep --strict -R="$requirement" "$APP_PATH"
@@ -73,7 +79,7 @@ fi
   --verify \
   --deep \
   --strict \
-  -R='identifier "com.local.RemoteControlNetwork"' \
+  -R="identifier \"$BUNDLE_ID\"" \
   "$SPOOF_APP"
 
 if /usr/bin/grep -F -- '--requirements' "$ROOT_DIR/scripts/build_app.sh" >/dev/null; then
@@ -81,15 +87,15 @@ if /usr/bin/grep -F -- '--requirements' "$ROOT_DIR/scripts/build_app.sh" >/dev/n
   exit 1
 fi
 
-developer_id_requirement='identifier "com.local.RemoteControlNetwork" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = "TEAMID1234"'
-developer_id_details=$'Identifier=com.local.RemoteControlNetwork\nCodeDirectory v=20500 flags=0x10000(runtime)\nAuthority=Developer ID Application: Fixture (TEAMID1234)\nTeamIdentifier=TEAMID1234\nRuntime Version=15.0.0\nTimestamp=Jul 28, 2026 at 12:34:56'
+developer_id_requirement="identifier \"$BUNDLE_ID\" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = \"TEAMID1234\""
+developer_id_details="Identifier=$BUNDLE_ID"$'\nCodeDirectory v=20500 flags=0x10000(runtime)\nAuthority=Developer ID Application: Fixture (TEAMID1234)\nTeamIdentifier=TEAMID1234\nRuntime Version=15.0.0\nTimestamp=Jul 28, 2026 at 12:34:56'
 empty_entitlements=""
 
 if ! gatebeam_validate_developer_id_contract \
   "$developer_id_requirement" \
   "$developer_id_details" \
   "$empty_entitlements" \
-  "com.local.RemoteControlNetwork" \
+  "$BUNDLE_ID" \
   "TEAMID1234"; then
   print -u2 "Valid Developer ID Application fixture was rejected."
   exit 1
@@ -105,7 +111,7 @@ expect_developer_id_rejection() {
     "$fixture_requirement" \
     "$fixture_details" \
     "$fixture_entitlements" \
-    "com.local.RemoteControlNetwork" \
+    "$BUNDLE_ID" \
     "TEAMID1234" >/dev/null 2>&1; then
     print -u2 "Developer ID signing fixture was incorrectly accepted: $description"
     exit 1
@@ -114,53 +120,53 @@ expect_developer_id_rejection() {
 
 expect_developer_id_rejection \
   "Apple Development certificate chain" \
-  'identifier "com.local.RemoteControlNetwork" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.1] exists and certificate leaf[subject.CN] = "Apple Development: Fixture" and certificate leaf[subject.OU] = "TEAMID1234"' \
+  "identifier \"$BUNDLE_ID\" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.1] exists and certificate leaf[subject.CN] = \"Apple Development: Fixture\" and certificate leaf[subject.OU] = \"TEAMID1234\"" \
   "$developer_id_details" \
   "$empty_entitlements"
 expect_developer_id_rejection \
   "Developer ID Installer leaf OID" \
-  'identifier "com.local.RemoteControlNetwork" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.14] exists and certificate leaf[subject.OU] = "TEAMID1234"' \
+  "identifier \"$BUNDLE_ID\" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.14] exists and certificate leaf[subject.OU] = \"TEAMID1234\"" \
   "$developer_id_details" \
   "$empty_entitlements"
 expect_developer_id_rejection \
   "missing secure timestamp" \
   "$developer_id_requirement" \
-  $'Identifier=com.local.RemoteControlNetwork\nCodeDirectory v=20500 flags=0x10000(runtime)\nAuthority=Developer ID Application: Fixture (TEAMID1234)\nTeamIdentifier=TEAMID1234\nRuntime Version=15.0.0\nTimestamp=none' \
+  "Identifier=$BUNDLE_ID"$'\nCodeDirectory v=20500 flags=0x10000(runtime)\nAuthority=Developer ID Application: Fixture (TEAMID1234)\nTeamIdentifier=TEAMID1234\nRuntime Version=15.0.0\nTimestamp=none' \
   "$empty_entitlements"
 expect_developer_id_rejection \
   "missing hardened runtime" \
   "$developer_id_requirement" \
-  $'Identifier=com.local.RemoteControlNetwork\nCodeDirectory v=20500 flags=0x0(none)\nAuthority=Developer ID Application: Fixture (TEAMID1234)\nTeamIdentifier=TEAMID1234\nRuntime Version=15.0.0\nTimestamp=Jul 28, 2026 at 12:34:56' \
+  "Identifier=$BUNDLE_ID"$'\nCodeDirectory v=20500 flags=0x0(none)\nAuthority=Developer ID Application: Fixture (TEAMID1234)\nTeamIdentifier=TEAMID1234\nRuntime Version=15.0.0\nTimestamp=Jul 28, 2026 at 12:34:56' \
   "$empty_entitlements"
 expect_developer_id_rejection \
   "missing Runtime Version" \
   "$developer_id_requirement" \
-  $'Identifier=com.local.RemoteControlNetwork\nCodeDirectory v=20500 flags=0x10000(runtime)\nAuthority=Developer ID Application: Fixture (TEAMID1234)\nTeamIdentifier=TEAMID1234\nTimestamp=Jul 28, 2026 at 12:34:56' \
+  "Identifier=$BUNDLE_ID"$'\nCodeDirectory v=20500 flags=0x10000(runtime)\nAuthority=Developer ID Application: Fixture (TEAMID1234)\nTeamIdentifier=TEAMID1234\nTimestamp=Jul 28, 2026 at 12:34:56' \
   "$empty_entitlements"
 expect_developer_id_rejection \
   "wrong bundle identifier in requirement" \
-  'identifier "com.local.RemoteControlNetwork.spoof" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = "TEAMID1234"' \
+  "identifier \"$BUNDLE_ID.spoof\" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = \"TEAMID1234\"" \
   "$developer_id_details" \
   "$empty_entitlements"
 expect_developer_id_rejection \
   "wrong signed bundle identifier" \
   "$developer_id_requirement" \
-  $'Identifier=com.local.RemoteControlNetwork.spoof\nCodeDirectory v=20500 flags=0x10000(runtime)\nAuthority=Developer ID Application: Fixture (TEAMID1234)\nTeamIdentifier=TEAMID1234\nRuntime Version=15.0.0\nTimestamp=Jul 28, 2026 at 12:34:56' \
+  "Identifier=$BUNDLE_ID.spoof"$'\nCodeDirectory v=20500 flags=0x10000(runtime)\nAuthority=Developer ID Application: Fixture (TEAMID1234)\nTeamIdentifier=TEAMID1234\nRuntime Version=15.0.0\nTimestamp=Jul 28, 2026 at 12:34:56' \
   "$empty_entitlements"
 expect_developer_id_rejection \
   "wrong Team ID in requirement" \
-  'identifier "com.local.RemoteControlNetwork" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = "OTHERTEAM1"' \
+  "identifier \"$BUNDLE_ID\" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = \"OTHERTEAM1\"" \
   "$developer_id_details" \
   "$empty_entitlements"
 expect_developer_id_rejection \
   "wrong signed Team ID" \
   "$developer_id_requirement" \
-  $'Identifier=com.local.RemoteControlNetwork\nCodeDirectory v=20500 flags=0x10000(runtime)\nAuthority=Developer ID Application: Fixture (OTHERTEAM1)\nTeamIdentifier=OTHERTEAM1\nRuntime Version=15.0.0\nTimestamp=Jul 28, 2026 at 12:34:56' \
+  "Identifier=$BUNDLE_ID"$'\nCodeDirectory v=20500 flags=0x10000(runtime)\nAuthority=Developer ID Application: Fixture (OTHERTEAM1)\nTeamIdentifier=OTHERTEAM1\nRuntime Version=15.0.0\nTimestamp=Jul 28, 2026 at 12:34:56' \
   "$empty_entitlements"
 expect_developer_id_rejection \
   "missing Developer ID authority" \
   "$developer_id_requirement" \
-  $'Identifier=com.local.RemoteControlNetwork\nCodeDirectory v=20500 flags=0x10000(runtime)\nTeamIdentifier=TEAMID1234\nRuntime Version=15.0.0\nTimestamp=Jul 28, 2026 at 12:34:56' \
+  "Identifier=$BUNDLE_ID"$'\nCodeDirectory v=20500 flags=0x10000(runtime)\nTeamIdentifier=TEAMID1234\nRuntime Version=15.0.0\nTimestamp=Jul 28, 2026 at 12:34:56' \
   "$empty_entitlements"
 expect_developer_id_rejection \
   "unsafe DYLD entitlement" \
@@ -258,4 +264,11 @@ if [[ "$clean_probe_output" != "Gatebeam signing runtime probe ready" ]]; then
 fi
 /usr/bin/codesign --verify --deep --strict "$APP_PATH"
 
-print "Signing identity contract passed: hardened runtime, TN3127 fixtures, exact-build requirement, and injection rejection."
+identity_probe_output="$("$APP_EXECUTABLE" --signing-identity-probe)"
+if [[ "$identity_probe_output" != "Gatebeam signing identity accepted" ]]; then
+  print -u2 "Gatebeam runtime rejected its own exact-build signing identity."
+  print -u2 "$identity_probe_output"
+  exit 1
+fi
+
+print "Signing identity contract passed: runtime identity binding, hardened runtime, TN3127 fixtures, exact-build requirement, and injection rejection."

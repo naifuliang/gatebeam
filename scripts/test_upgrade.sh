@@ -316,6 +316,7 @@ assert_rollback_state() {
 
 stable_label="com.local.RemoteControlNetwork.login"
 transitional_label="io.github.naifuliang.gatebeam.login"
+current_bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$ROOT_DIR/Resources/Info.plist")"
 
 root_fixture="$fixture_root/root"
 applications="$root_fixture/Applications"
@@ -349,7 +350,7 @@ startup_home="$startup_fixture/home"
 startup_installer_apps="$startup_home/Applications"
 startup_source="$startup_fixture/source/Gatebeam.app"
 mkdir -p "$startup_home"
-make_app "$startup_source" "com.local.RemoteControlNetwork" "Gatebeam" true
+make_app "$startup_source" "$current_bundle_id" "Gatebeam" true
 ZDOTDIR="$startup_fixture/zdotdir" \
 GATEBEAM_APP_DIR="$startup_source" \
 GATEBEAM_INSTALL_DIR="$startup_installer_apps" \
@@ -433,7 +434,7 @@ developer_legacy="$developer_apps/Remote Control Network.app"
 stable_plist="$developer_agents/$stable_label.plist"
 transitional_plist="$developer_agents/$transitional_label.plist"
 mkdir -p "$developer_apps" "$developer_agents"
-make_app "$source_app" "com.local.RemoteControlNetwork" "Gatebeam" true
+make_app "$source_app" "$current_bundle_id" "Gatebeam" true
 make_app "$developer_legacy" "com.local.RemoteControlNetwork" "RemoteControlNetwork" true
 make_agent "$transitional_plist" "$transitional_label" "$developer_legacy"
 
@@ -460,8 +461,8 @@ signature_destination="$signature_apps/Gatebeam.app"
 signature_stable="$signature_agents/$stable_label.plist"
 signature_before="$signature_root/before.manifest"
 mkdir -p "$signature_apps" "$signature_agents"
-make_app "$signature_source" "com.local.RemoteControlNetwork" "Gatebeam" true
-make_app "$signature_destination" "com.local.RemoteControlNetwork" "Gatebeam"
+make_app "$signature_source" "$current_bundle_id" "Gatebeam" true
+make_app "$signature_destination" "$current_bundle_id" "Gatebeam"
 print -r -- "previous-install" > "$signature_destination/old-marker"
 make_agent "$signature_stable" "$stable_label" "$signature_destination"
 snapshot_tree "$signature_home" "$signature_before"
@@ -493,8 +494,8 @@ legacy_signature_stable="$legacy_signature_agents/$stable_label.plist"
 legacy_signature_log="$legacy_signature_root/install.log"
 legacy_signature_before="$legacy_signature_root/before.manifest"
 mkdir -p "$legacy_signature_apps" "$legacy_signature_agents"
-make_app "$legacy_signature_source" "com.local.RemoteControlNetwork" "Gatebeam" true
-make_app "$legacy_signature_destination" "com.local.RemoteControlNetwork" "Gatebeam" true
+make_app "$legacy_signature_source" "$current_bundle_id" "Gatebeam" true
+make_app "$legacy_signature_destination" "$current_bundle_id" "Gatebeam" true
 make_app "$legacy_signature_app" "com.local.RemoteControlNetwork" "RemoteControlNetwork"
 print -r -- "preserve-unsigned-legacy" > "$legacy_signature_app/legacy-marker"
 make_agent "$legacy_signature_stable" "$stable_label" "$legacy_signature_app"
@@ -548,8 +549,8 @@ rollback_legacy="$rollback_apps/Remote Control Network.app"
 rollback_stable="$rollback_agents/$stable_label.plist"
 rollback_transitional="$rollback_agents/$transitional_label.plist"
 mkdir -p "$rollback_apps" "$rollback_agents"
-make_app "$rollback_source" "com.local.RemoteControlNetwork" "Gatebeam" true
-make_app "$rollback_destination" "com.local.RemoteControlNetwork" "Gatebeam"
+make_app "$rollback_source" "$current_bundle_id" "Gatebeam" true
+make_app "$rollback_destination" "$current_bundle_id" "Gatebeam"
 make_app "$rollback_legacy" "com.local.RemoteControlNetwork" "RemoteControlNetwork" true
 print "old-destination" > "$rollback_destination/old-marker"
 mkdir -p "$rollback_legacy/Contents/Resources"
@@ -665,8 +666,8 @@ restore_failure_source="$restore_failure_root/source/Gatebeam.app"
 restore_failure_destination="$restore_failure_apps/Gatebeam.app"
 restore_failure_log="$restore_failure_root/install.log"
 mkdir -p "$restore_failure_apps"
-make_app "$restore_failure_source" "com.local.RemoteControlNetwork" "Gatebeam" true
-make_app "$restore_failure_destination" "com.local.RemoteControlNetwork" "Gatebeam"
+make_app "$restore_failure_source" "$current_bundle_id" "Gatebeam" true
+make_app "$restore_failure_destination" "$current_bundle_id" "Gatebeam"
 print "recoverable-previous-app" > "$restore_failure_destination/old-marker"
 
 set +e
@@ -721,7 +722,7 @@ symlink_home="$fixture_root/developer-symlink/home"
 symlink_outside="$fixture_root/developer-symlink/outside-applications"
 symlink_source="$fixture_root/developer-symlink/source/Gatebeam.app"
 mkdir -p "$symlink_home" "$symlink_outside"
-make_app "$symlink_source" "com.local.RemoteControlNetwork" "Gatebeam" true
+make_app "$symlink_source" "$current_bundle_id" "Gatebeam" true
 make_app "$symlink_outside/Gatebeam.app" "com.example.Unrelated" "Gatebeam"
 ln -s "$symlink_outside" "$symlink_home/Applications"
 if GATEBEAM_APP_DIR="$symlink_source" \
@@ -740,7 +741,7 @@ fake_apps="$fake_home/Applications"
 fake_source="$fake_root/source/Gatebeam.app"
 fake_legacy="$fake_apps/Remote Control Network.app"
 mkdir -p "$fake_apps" "$fake_home/Library/LaunchAgents"
-make_app "$fake_source" "com.local.RemoteControlNetwork" "Gatebeam" true
+make_app "$fake_source" "$current_bundle_id" "Gatebeam" true
 make_app "$fake_legacy" "com.local.RemoteControlNetwork" "Gatebeam"
 if GATEBEAM_APP_DIR="$fake_source" \
   GATEBEAM_INSTALL_DIR="$fake_apps" \

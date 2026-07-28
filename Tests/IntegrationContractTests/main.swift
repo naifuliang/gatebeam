@@ -1230,59 +1230,154 @@ func testKeychainLegacyMigrationRequiresExplicitAuthorization() throws {
 }
 
 func testKeychainRequirementClassificationRejectsWeakAlternatives() throws {
+    let bundleIdentifier = "io.github.naifuliang.gatebeam"
+    let teamIdentifier = "TEAMID1234"
+    let preview = { (requirement: String) in
+        KeychainStore.SigningIdentity(
+            requirement: requirement,
+            signedBundleIdentifier: bundleIdentifier,
+            expectedBundleIdentifier: bundleIdentifier,
+            signedTeamIdentifier: nil,
+            expectedTeamIdentifier: nil,
+            currentCDHashes: [
+                "1111111111111111111111111111111111111111",
+                "2222222222222222222222222222222222222222"
+            ],
+            hasHardenedRuntime: true,
+            hasRuntimeVersion: true,
+            hasSecureTimestamp: false
+        )
+    }
+    func developerID(
+        _ requirement: String,
+        signedBundleIdentifier: String? = nil,
+        expectedBundleIdentifier: String? = nil,
+        signedTeamIdentifier: String? = nil,
+        expectedTeamIdentifier: String? = nil,
+        hasHardenedRuntime: Bool = true,
+        hasRuntimeVersion: Bool = true,
+        hasSecureTimestamp: Bool = true
+    ) -> KeychainStore.SigningIdentity {
+        KeychainStore.SigningIdentity(
+            requirement: requirement,
+            signedBundleIdentifier: signedBundleIdentifier ?? bundleIdentifier,
+            expectedBundleIdentifier: expectedBundleIdentifier ?? bundleIdentifier,
+            signedTeamIdentifier: signedTeamIdentifier ?? teamIdentifier,
+            expectedTeamIdentifier: expectedTeamIdentifier ?? teamIdentifier,
+            currentCDHashes: [],
+            hasHardenedRuntime: hasHardenedRuntime,
+            hasRuntimeVersion: hasRuntimeVersion,
+            hasSecureTimestamp: hasSecureTimestamp
+        )
+    }
+    let validDeveloperID =
+        #"identifier "io.github.naifuliang.gatebeam" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = TEAMID1234"#
+
     try expect(
-        KeychainStore.isStrongDesignatedRequirement(
+        KeychainStore.validatedTrustedApplicationRequirement(preview(
             #"cdhash H"1111111111111111111111111111111111111111" or cdhash H"2222222222222222222222222222222222222222""#
-        ),
+        )) != nil,
         "A pure exact-build cdhash set must be accepted for Developer Preview"
     )
     try expect(
-        !KeychainStore.isStrongDesignatedRequirement(
-            #"identifier "com.local.RemoteControlNetwork""#
-        ),
+        KeychainStore.validatedTrustedApplicationRequirement(preview(
+            #"cdhash H"3333333333333333333333333333333333333333""#
+        )) == nil,
+        "A different build cdhash must be rejected"
+    )
+    try expect(
+        KeychainStore.validatedTrustedApplicationRequirement(preview(
+            #"identifier "io.github.naifuliang.gatebeam""#
+        )) == nil,
         "An identifier-only requirement must be rejected"
     )
     try expect(
-        !KeychainStore.isStrongDesignatedRequirement(
-            #"identifier "com.local.RemoteControlNetwork" or cdhash H"1111111111111111111111111111111111111111""#
-        ),
+        KeychainStore.validatedTrustedApplicationRequirement(preview(
+            #"identifier "io.github.naifuliang.gatebeam" or cdhash H"1111111111111111111111111111111111111111""#
+        )) == nil,
         "A cdhash requirement with a weak identifier alternative must be rejected"
     )
     try expect(
-        !KeychainStore.isStrongDesignatedRequirement(
+        KeychainStore.validatedTrustedApplicationRequirement(preview(
             #"true or cdhash H"1111111111111111111111111111111111111111""#
-        ),
+        )) == nil,
         "A cdhash requirement with a permissive alternative must be rejected"
     )
     try expect(
-        KeychainStore.isStrongDesignatedRequirement(
-            #"identifier "com.local.RemoteControlNetwork" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = TEAMID1234"#
-        ),
+        KeychainStore.validatedTrustedApplicationRequirement(
+            developerID(validDeveloperID)
+        ) != nil,
         "A canonical TN3127 Developer ID Application requirement must be accepted"
     )
     try expect(
-        !KeychainStore.isStrongDesignatedRequirement(
-            #"identifier "com.local.RemoteControlNetwork" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.1] exists and certificate leaf[subject.OU] = "TEAMID1234""#
-        ),
+        KeychainStore.validatedTrustedApplicationRequirement(developerID(
+            #"identifier "io.github.naifuliang.gatebeam" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.1] exists and certificate leaf[subject.OU] = "TEAMID1234""#
+        )) == nil,
         "An Apple Development-like requirement must be rejected"
     )
     try expect(
-        !KeychainStore.isStrongDesignatedRequirement(
-            #"identifier "com.local.RemoteControlNetwork" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.14] exists and certificate leaf[subject.OU] = "TEAMID1234""#
-        ),
+        KeychainStore.validatedTrustedApplicationRequirement(developerID(
+            #"identifier "io.github.naifuliang.gatebeam" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.14] exists and certificate leaf[subject.OU] = "TEAMID1234""#
+        )) == nil,
         "A Developer ID Installer-like requirement must be rejected"
     )
     try expect(
-        !KeychainStore.isStrongDesignatedRequirement(
-            #"identifier "com.local.RemoteControlNetwork" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] and certificate leaf[field.1.2.840.113635.100.6.1.13] and certificate leaf[subject.OU] = "TEAMID1234""#
-        ),
+        KeychainStore.validatedTrustedApplicationRequirement(developerID(
+            #"identifier "io.github.naifuliang.gatebeam" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] and certificate leaf[field.1.2.840.113635.100.6.1.13] and certificate leaf[subject.OU] = "TEAMID1234""#
+        )) == nil,
         "Certificate OID fields without existence constraints must be rejected"
     )
     try expect(
-        !KeychainStore.isStrongDesignatedRequirement(
-            #"identifier "com.local.RemoteControlNetwork" or (anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = "TEAMID1234")"#
-        ),
+        KeychainStore.validatedTrustedApplicationRequirement(developerID(
+            #"identifier "io.github.naifuliang.gatebeam" or (anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = "TEAMID1234")"#
+        )) == nil,
         "A Developer ID requirement with a weak OR alternative must be rejected"
+    )
+    try expect(
+        KeychainStore.validatedTrustedApplicationRequirement(developerID(
+            validDeveloperID,
+            signedBundleIdentifier: "io.github.naifuliang.gatebeam.spoof"
+        )) == nil,
+        "A signed Bundle ID mismatch must be rejected"
+    )
+    try expect(
+        KeychainStore.validatedTrustedApplicationRequirement(developerID(
+            validDeveloperID.replacingOccurrences(
+                of: bundleIdentifier,
+                with: "io.github.naifuliang.gatebeam.spoof"
+            )
+        )) == nil,
+        "A requirement with the wrong Bundle ID must be rejected"
+    )
+    try expect(
+        KeychainStore.validatedTrustedApplicationRequirement(developerID(
+            validDeveloperID,
+            signedTeamIdentifier: "OTHERTEAM1"
+        )) == nil,
+        "A signed Team ID mismatch must be rejected"
+    )
+    try expect(
+        KeychainStore.validatedTrustedApplicationRequirement(developerID(
+            validDeveloperID.replacingOccurrences(
+                of: teamIdentifier,
+                with: "OTHERTEAM1"
+            )
+        )) == nil,
+        "A requirement with the wrong Team ID must be rejected"
+    )
+    try expect(
+        KeychainStore.validatedTrustedApplicationRequirement(developerID(
+            validDeveloperID,
+            hasHardenedRuntime: false
+        )) == nil,
+        "A build without hardened runtime must be rejected"
+    )
+    try expect(
+        KeychainStore.validatedTrustedApplicationRequirement(developerID(
+            validDeveloperID,
+            hasSecureTimestamp: false
+        )) == nil,
+        "A Developer ID build without a secure timestamp must be rejected"
     )
 }
 
