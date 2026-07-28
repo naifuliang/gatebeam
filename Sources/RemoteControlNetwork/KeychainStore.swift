@@ -7,6 +7,23 @@ enum KeychainInteraction: Equatable {
     case userInitiated
 }
 
+enum KeychainQueryOperation: Equatable {
+    case read
+    case write
+    case delete
+}
+
+struct KeychainQueryPolicy: Equatable {
+    let interactionNotAllowed: Bool
+    let failsAuthenticationUI: Bool
+}
+
+typealias KeychainQueryObserver = (
+    _ operation: KeychainQueryOperation,
+    _ interaction: KeychainInteraction,
+    _ query: [String: Any]
+) -> Void
+
 enum KeychainAuthorizationOutcome: Equatable {
     case noSavedToken
     case authorized(token: String)
@@ -117,15 +134,18 @@ final class KeychainStore {
     private let legacyServices: [String]
     private let useDataProtectionKeychain: Bool
     private let operationHandlers: KeychainOperationHandlers?
+    private let queryObserver: KeychainQueryObserver?
 
     init(
         useDataProtectionKeychain: Bool = false,
         service: String? = nil,
         legacyServices: [String]? = nil,
-        operationHandlers: KeychainOperationHandlers? = nil
+        operationHandlers: KeychainOperationHandlers? = nil,
+        queryObserver: KeychainQueryObserver? = nil
     ) {
         self.useDataProtectionKeychain = useDataProtectionKeychain
         self.operationHandlers = operationHandlers
+        self.queryObserver = queryObserver
         self.service = service ?? (useDataProtectionKeychain
             ? "io.github.naifuliang.gatebeam.data-protection.v1"
             : Self.productionService)
@@ -290,6 +310,12 @@ final class KeychainStore {
         interaction: KeychainInteraction,
         refreshAccess: Bool
     ) throws {
+        let query = baseQuery(
+            operation: .write,
+            account: account,
+            service: service,
+            interaction: interaction
+        )
         if let operationHandlers {
             try operationHandlers.set(
                 value,
@@ -302,12 +328,6 @@ final class KeychainStore {
         }
 
         let data = Data(value.utf8)
-        let query = baseQuery(
-            account: account,
-            service: service,
-            interaction: interaction
-        )
-
         var attributes: [String: Any] = [kSecValueData as String: data]
         if useDataProtectionKeychain {
             attributes[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
@@ -341,6 +361,12 @@ final class KeychainStore {
         service: String,
         interaction: KeychainInteraction
     ) throws -> String? {
+        var query = baseQuery(
+            operation: .read,
+            account: account,
+            service: service,
+            interaction: interaction
+        )
         if let operationHandlers {
             return try operationHandlers.get(
                 account: account,
@@ -349,11 +375,6 @@ final class KeychainStore {
             )
         }
 
-        var query = baseQuery(
-            account: account,
-            service: service,
-            interaction: interaction
-        )
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
 
@@ -374,6 +395,12 @@ final class KeychainStore {
         service: String,
         interaction: KeychainInteraction
     ) throws {
+        let query = baseQuery(
+            operation: .delete,
+            account: account,
+            service: service,
+            interaction: interaction
+        )
         if let operationHandlers {
             try operationHandlers.delete(
                 account: account,
@@ -383,11 +410,6 @@ final class KeychainStore {
             return
         }
 
-        let query = baseQuery(
-            account: account,
-            service: service,
-            interaction: interaction
-        )
         let status = SecItemDelete(query as CFDictionary)
         if status == errSecSuccess || status == errSecItemNotFound {
             return
@@ -396,18 +418,56 @@ final class KeychainStore {
     }
 
     private func baseQuery(
+        operation: KeychainQueryOperation,
         account: String,
         service: String,
         interaction: KeychainInteraction
     ) -> [String: Any] {
+        let policy = Self.queryPolicy(for: interaction)
+        let authenticationContext = LAContext()
+        authenticationContext.interactionNotAllowed = policy.interactionNotAllowed
+        let query = Self.makeQueryDictionary(
+            account: account,
+            service: service,
+            policy: policy,
+            authenticationContext: authenticationContext,
+            useDataProtectionKeychain: useDataProtectionKeychain
+        )
+        queryObserver?(operation, interaction, query)
+        return query
+    }
+
+    static func queryPolicy(for interaction: KeychainInteraction) -> KeychainQueryPolicy {
+        switch interaction {
+        case .background:
+            return KeychainQueryPolicy(
+                interactionNotAllowed: true,
+                failsAuthenticationUI: true
+            )
+        case .userInitiated:
+            return KeychainQueryPolicy(
+                interactionNotAllowed: false,
+                failsAuthenticationUI: false
+            )
+        }
+    }
+
+    static func makeQueryDictionary(
+        account: String,
+        service: String,
+        policy: KeychainQueryPolicy,
+        authenticationContext: LAContext,
+        useDataProtectionKeychain: Bool
+    ) -> [String: Any] {
         var query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
-            kSecAttrAccount as String: account
+            kSecAttrAccount as String: account,
+            kSecUseAuthenticationContext as String: authenticationContext
         ]
-        let authenticationContext = LAContext()
-        authenticationContext.interactionNotAllowed = interaction == .background
-        query[kSecUseAuthenticationContext as String] = authenticationContext
+        if policy.failsAuthenticationUI {
+            query[kSecUseAuthenticationUI as String] = kSecUseAuthenticationUIFail
+        }
         if useDataProtectionKeychain {
             query[kSecUseDataProtectionKeychain as String] = true
         }

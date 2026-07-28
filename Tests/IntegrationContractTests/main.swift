@@ -1,5 +1,7 @@
 import Foundation
 import Darwin
+import LocalAuthentication
+import Security
 
 struct IntegrationContractFailure: Error, CustomStringConvertible {
     let description: String
@@ -33,6 +35,44 @@ final class LockedCounter {
     var current: Int {
         lock.lock()
         let result = value
+        lock.unlock()
+        return result
+    }
+}
+
+struct KeychainQueryRecord {
+    let operation: KeychainQueryOperation
+    let interaction: KeychainInteraction
+    let hasAuthenticationContext: Bool
+    let authenticationUIValue: String?
+}
+
+final class LockedKeychainQueryAudit {
+    private let lock = NSLock()
+    private var records: [KeychainQueryRecord] = []
+
+    func observe(
+        operation: KeychainQueryOperation,
+        interaction: KeychainInteraction,
+        query: [String: Any]
+    ) {
+        let context = query[kSecUseAuthenticationContext as String] as? LAContext
+        let authenticationUIValue = query[kSecUseAuthenticationUI as String] as? String
+        lock.lock()
+        records.append(
+            KeychainQueryRecord(
+                operation: operation,
+                interaction: interaction,
+                hasAuthenticationContext: context != nil,
+                authenticationUIValue: authenticationUIValue
+            )
+        )
+        lock.unlock()
+    }
+
+    var snapshot: [KeychainQueryRecord] {
+        lock.lock()
+        let result = records
         lock.unlock()
         return result
     }
@@ -366,6 +406,141 @@ func inMemoryKeychain() -> KeychainStore {
             get: { _ in token },
             delete: { _ in token = nil }
         )
+    )
+}
+
+func testKeychainQueryInteractionPolicy() throws {
+    let audit = LockedKeychainQueryAudit()
+    let keychain = KeychainStore(
+        service: "io.github.naifuliang.gatebeam.query-policy",
+        legacyServices: [],
+        operationHandlers: KeychainOperationHandlers(
+            scopedSet: { _, _, _, _, _ in },
+            scopedGet: { _, _, _ in nil },
+            scopedDelete: { _, _, _ in }
+        ),
+        queryObserver: audit.observe
+    )
+    let account = "cloudflare-api-token"
+
+    _ = try keychain.get(account: account, interaction: .background)
+    try keychain.set(
+        "background-fixture",
+        account: account,
+        interaction: .background,
+        refreshAccess: false
+    )
+    try keychain.deleteChecked(account: account, interaction: .background)
+    _ = try keychain.get(account: account, interaction: .userInitiated)
+    try keychain.set("explicit-fixture", account: account, interaction: .userInitiated)
+    try keychain.deleteChecked(account: account, interaction: .userInitiated)
+
+    let records = audit.snapshot
+    try expect(records.count == 6, "Every injected Keychain operation must expose its query policy")
+    let backgroundPolicy = KeychainStore.queryPolicy(for: .background)
+    let explicitPolicy = KeychainStore.queryPolicy(for: .userInitiated)
+    try expect(
+        backgroundPolicy.interactionNotAllowed && backgroundPolicy.failsAuthenticationUI,
+        "The pure background policy must independently disable LAContext and SecurityAgent UI"
+    )
+    try expect(
+        !explicitPolicy.interactionNotAllowed && !explicitPolicy.failsAuthenticationUI,
+        "The pure user-initiated policy must preserve interactive authorization"
+    )
+    let background = Array(records.prefix(3))
+    try expect(
+        background.map(\.operation) == [.read, .write, .delete],
+        "Background read, write, and delete must share the audited query builder"
+    )
+    try expect(
+        background.allSatisfy { $0.interaction == .background && $0.hasAuthenticationContext },
+        "Every background Keychain query must contain the policy-configured LAContext"
+    )
+    try expect(
+        background.allSatisfy {
+            $0.authenticationUIValue == kSecUseAuthenticationUIFail as String
+        },
+        "Every background Keychain query must independently fail SecurityAgent UI"
+    )
+
+    let explicit = Array(records.suffix(3))
+    try expect(
+        explicit.map(\.operation) == [.read, .write, .delete],
+        "Explicit read, write, and delete must share the audited query builder"
+    )
+    try expect(
+        explicit.allSatisfy { $0.interaction == .userInitiated && $0.hasAuthenticationContext },
+        "User-initiated Keychain queries must contain their interactive LAContext"
+    )
+    try expect(
+        explicit.allSatisfy { $0.authenticationUIValue == nil },
+        "User-initiated Keychain queries must not carry the background UI-fail policy"
+    )
+}
+
+func testScheduledChecksUseBackgroundKeychainPolicy() throws {
+    let baseDirectory = try makeTemporaryDirectory(named: "scheduled-keychain-policy")
+    defer { try? FileManager.default.removeItem(at: baseDirectory) }
+
+    let audit = LockedKeychainQueryAudit()
+    let checkExecutions = LockedCounter()
+    let keychain = KeychainStore(
+        service: "io.github.naifuliang.gatebeam.scheduled-query-policy",
+        legacyServices: [],
+        operationHandlers: KeychainOperationHandlers(
+            scopedSet: { _, _, _, _, _ in },
+            scopedGet: { _, _, interaction in
+                try expect(
+                    interaction == .background,
+                    "Startup and scheduled checks must never initiate interactive Keychain access"
+                )
+                throw KeychainError.status(
+                    operation: "read",
+                    code: errSecInteractionNotAllowed
+                )
+            },
+            scopedDelete: { _, _, _ in }
+        ),
+        queryObserver: audit.observe
+    )
+    var config = AppConfig.default
+    config.remoteAccessEnabled = true
+    config.cloudflareZoneID = "zone-fixture"
+    config.dnsRecordName = "host.example.test"
+    config.checkIntervalSeconds = AppConfig.maximumCheckIntervalSeconds
+    let agent = NetworkAgent(
+        configStore: AppConfigStore(baseDirectory: baseDirectory),
+        keychain: keychain,
+        initialConfig: config,
+        checkExecutionObserver: { checkExecutions.increment() },
+        localNetworkService: MockLocalNetworkService(),
+        routerMappingService: MockRouterMappingService()
+    )
+
+    agent.start()
+    try expect(
+        waitUntil { checkExecutions.current == 1 && audit.snapshot.count == 1 },
+        "Startup must complete one non-interactive Keychain-backed check"
+    )
+    agent.runCheck()
+    try expect(
+        waitUntil { checkExecutions.current == 2 && audit.snapshot.count == 2 },
+        "A later scheduled check must repeat the non-interactive Keychain policy"
+    )
+    agent.stop()
+
+    let records = audit.snapshot
+    let backgroundPolicy = KeychainStore.queryPolicy(for: .background)
+    try expect(
+        records.allSatisfy {
+            $0.operation == .read
+                && $0.interaction == .background
+                && $0.hasAuthenticationContext
+                && $0.authenticationUIValue == kSecUseAuthenticationUIFail as String
+        }
+            && backgroundPolicy.interactionNotAllowed
+            && backgroundPolicy.failsAuthenticationUI,
+        "Startup and periodic checks must carry both independent background UI prohibitions"
     )
 }
 
@@ -3812,6 +3987,8 @@ let tests: [(String, () throws -> Void)] = [
     ("Keychain read error propagation", testKeychainReadFailurePropagates),
     ("Keychain delete rollback", testKeychainDeleteFailurePreservesTokenAndBlocksConfig),
     ("Keychain single-flight and failure latch", testKeychainSingleFlightAndFailureLatch),
+    ("Keychain background query policy", testKeychainQueryInteractionPolicy),
+    ("scheduled checks use background Keychain policy", testScheduledChecksUseBackgroundKeychainPolicy),
     ("Keychain explicit legacy migration", testKeychainLegacyMigrationRequiresExplicitAuthorization),
     ("Keychain signing requirement classification", testKeychainRequirementClassificationRejectsWeakAlternatives),
     ("Keychain current item ACL refresh", testCurrentKeychainItemAuthorizationRefreshesAccess),
