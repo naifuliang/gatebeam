@@ -1233,7 +1233,15 @@ PY
   then
     fail "could not write release manifest"
   fi
-  /usr/bin/plutil -p "$output_path" >/dev/null ||
+  /usr/bin/python3 -I -E -s -c '
+import json
+import sys
+
+with open(sys.argv[1], "rb") as stream:
+    manifest = json.load(stream)
+if not isinstance(manifest, dict):
+    raise SystemExit(1)
+' "$output_path" ||
     fail "release manifest is not valid JSON"
 }
 

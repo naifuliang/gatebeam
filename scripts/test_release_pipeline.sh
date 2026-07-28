@@ -1754,6 +1754,16 @@ test_legacy_notary_tool_is_absent() {
   fi
 }
 
+test_manifest_validation_is_portable() {
+  if /usr/bin/grep -Fq \
+    "/usr/bin/plutil -p" \
+    "$ROOT_DIR/scripts/release_formal.sh"; then
+    fail_test "release manifest validation still depends on host plutil JSON behavior"
+  else
+    pass "release manifest validation is independent of host plutil JSON behavior"
+  fi
+}
+
 test_missing_environment
 test_dirty_worktree
 test_git_environment_cannot_hide_dirty_state
@@ -1799,6 +1809,7 @@ test_path_with_spaces
 test_signal_cleanup_and_exit_status
 test_override_restriction
 test_legacy_notary_tool_is_absent
+test_manifest_validation_is_portable
 
 print -r -- "Release pipeline tests: $PASSED passed, $FAILED failed"
 [[ "$FAILED" -eq 0 ]]
