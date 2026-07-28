@@ -5,18 +5,11 @@ All notable changes to Gatebeam are documented in this file.
 The format follows Keep a Changelog 1.1.0, and Gatebeam intends to follow
 Semantic Versioning 2.0.0 once formal releases begin.
 
-## Unreleased
+## [Unreleased]
 
-### Changed
-
-- Repository release and contribution guidance now distinguishes developer
-  previews from formal, signed, notarized releases.
-
-## [0.5.0] - Unreleased Developer Preview
-
-This version is a completed developer-preview candidate. It is not a formal
-release, and none of the checks below prove that a particular Mac is reachable
-from the public internet.
+These entries describe an unreleased developer-preview candidate. They do not
+claim a published version, tag, or release date, and none of the checks below
+prove that a particular Mac is reachable from the public internet.
 
 ### Added
 
@@ -36,6 +29,20 @@ from the public internet.
   identities.
 - A native AppKit menu-bar interface with light and dark appearances, aligned
   settings layouts, status reporting, and network diagnostics.
+- Backend, proxy-policy, integration-contract, Keychain/signing,
+  upgrade/rollback, build-asset, UI-isolation, and privacy gates.
+- A dedicated Thread Sanitizer (`TSan`) release gate.
+- Canonical Aqua and Dark Aqua snapshots for every supported settings and
+  menu-bar state, including bottom-scroll states.
+- Packaging checks for DMG integrity, PKG contents, permissions, metadata, and
+  atomic replacement.
+
+### Changed
+
+- Repository release and contribution guidance now distinguishes developer
+  previews from formal, signed, notarized releases.
+- A saved token is intentionally authorized for one exact preview build and may
+  require explicit reauthorization after an update.
 
 ### Security
 
@@ -46,23 +53,8 @@ from the public internet.
   validation.
 - Privacy checks reject committed credentials, private hostnames, public
   addresses, and other environment-specific material.
-
-### Testing
-
-- Added backend, proxy-policy, integration-contract, Thread Sanitizer,
-  Keychain/signing, upgrade/rollback, build-asset, UI-isolation, and privacy
-  gates.
-- Added canonical Aqua and Dark Aqua snapshots for every supported settings and
-  menu-bar state, including bottom-scroll states.
-- Added packaging checks for DMG integrity, PKG contents, permissions, metadata,
-  and atomic replacement.
-
-### Developer Preview Limitations
-
 - The app is ad-hoc signed. The installer package is unsigned.
 - The app, installer package, and disk image are not notarized or stapled.
-- A saved token is intentionally authorized for one exact preview build and may
-  require explicit reauthorization after an update.
 - Router interoperability varies by vendor, firmware, topology, firewall,
   carrier network, and ISP policy.
 - Local TCP checks, DNS updates, router responses, and automated fixtures do not
@@ -70,5 +62,3 @@ from the public internet.
 - Formal distribution requires Apple Developer credentials, Developer ID
   Application and Developer ID Installer certificates, secure timestamps,
   notarization, stapling, and release-host verification.
-
-[0.5.0]: https://github.com/naifuliang/gatebeam/commit/9720a81bc40e18e010b87cb0c3a74bb5241ffb6e

@@ -11,7 +11,7 @@ body:
         addresses, router serial numbers, MAC addresses, Keychain content, and
         other identifying data. Never attach a router backup or configuration
         export. For a vulnerability or possible remote-desktop exposure, follow
-        SECURITY.md instead of opening a public issue.
+        [SECURITY.md](../../SECURITY.md) instead of opening a public issue.
   - type: textarea
     id: summary
     attributes:

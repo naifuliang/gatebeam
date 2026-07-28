@@ -93,6 +93,23 @@ Only an explicit user action may use an interactive query. Legacy discovery and
 migration are confined to **Authorize Token**; startup and periodic checks do not
 enumerate legacy services.
 
+For an existing `cloudflare-token.v3` item, the current
+`authorizeCurrentOrMigrateLegacy` implementation uses this order:
+
+1. Read `v3` interactively.
+2. Rewrite the same bytes to `v3` with `refreshAccess: true`. This creates a fresh
+   `SecAccess` from the validated current application requirement: an exact
+   `cdhash` ACL for Preview, or the current Team-qualified Developer ID requirement
+   for a formal build.
+3. Read `v3` again with the background, no-UI query and require the exact value.
+4. Only after that verification, inspect and remove an older service.
+
+When `v3` is absent, the same implementation interactively reads an older service,
+writes those bytes to `v3` with `refreshAccess: true`, background-verifies `v3`,
+and only then removes the older item. A write or verification failure throws
+before legacy deletion. The caller latches the failure, so startup and timers
+cannot retry interactively; a later retry requires another explicit user action.
+
 `KeychainStore(useDataProtectionKeychain: true)` is an unshipped prototype hook.
 It sets `kSecUseDataProtectionKeychain`, uses
 `io.github.naifuliang.gatebeam.data-protection.v1`, and adds
@@ -284,10 +301,14 @@ pass. On an explicit **Authorize Token** or **Save** action, the coordinator app
 this source order:
 
 1. Read and fully validate an existing `data-protection.v2` destination.
-2. Read `cloudflare-token.v3` from the file store interactively.
-3. If `v3` is absent, read `secure-v2` interactively. When it exists, first create
-   and background-verify a `v3` rollback mirror with the current formal ACL. Do not
-   delete `secure-v2` yet.
+2. Read `cloudflare-token.v3` from the file store interactively. After that read
+   succeeds, rewrite the same bytes to `v3` with the current formal,
+   Team-qualified `SecAccess` and `refreshAccess: true`, then read `v3` with the
+   background, no-UI query and compare the exact bytes. Do not prepare the
+   destination before this source rebind and verification succeed.
+3. If `v3` is absent, read `secure-v2` interactively. When it exists, create `v3`
+   with the same current formal `SecAccess` and `refreshAccess: true`, then
+   background-verify the exact bytes. Do not delete `secure-v2` yet.
 4. Add `data-protection.v2` with the exact target implementation, service, account,
    access group, accessibility, and synchronization attributes.
 5. Read it back using the background, no-UI destination query and compare the exact
@@ -297,8 +318,28 @@ this source order:
 7. Delete `secure-v2` only after `dual-active` is committed; report and retry a
    cleanup failure without deleting either verified copy.
 
-If any destination step fails, leave the source untouched, remove a partially
-created destination when possible, and report that migration did not complete. A
+This ordering deliberately matches the current `KeychainStore`: interactive read,
+`refreshAccess: true` rewrite, background verification, then legacy cleanup. The
+formal coordinator inserts destination preparation only after the verified `v3`
+step.
+
+The two authorization models do not cross that boundary. Preview's exact-`cdhash`
+`SecAccess` protects only its file-Keychain item and is never copied into or
+treated as authority for a formal migration. Formal `v3` uses the validated
+Team-qualified `SecAccess` only as the rollback mirror's file-Keychain ACL. The
+Data Protection destination does not use `SecAccess` or `refreshAccess`; every
+operation selects the exact profile-authorized signed application-ID group with
+`kSecAttrAccessGroup`.
+
+If the `v3` rebind or its no-UI verification fails, stop before destination
+creation and retain every pre-existing source item. If a later destination step
+fails, remove any partially created destination when possible and roll back to the
+verified `v3` source; never delete the source as part of that rollback. If the
+coordinator cannot prove a verified source after a partial operation, enter
+`reconciliation-required`, pause DDNS, and preserve all remaining copies rather
+than claim success. In every failure case, latch the result: background work may
+report the paused state but must not retry, request UI, or start a prompt loop.
+Only a new explicit credential action may make one new interactive attempt. A
 failed cleanup must not be reported as success.
 
 An existing destination is never blindly updated. The coordinator validates its
