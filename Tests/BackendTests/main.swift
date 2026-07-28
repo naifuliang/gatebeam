@@ -348,6 +348,8 @@ func testUPnPRemovalStaysBoundToOriginalRouter() throws {
                   <NewInternalClient>192.0.2.20</NewInternalClient>
                   <NewInternalPort>5900</NewInternalPort>
                   <NewEnabled>1</NewEnabled>
+                  <NewPortMappingDescription>Gatebeam</NewPortMappingDescription>
+                  <NewLeaseDuration>3600</NewLeaseDuration>
                 </response>
                 """)
             case "GetExternalIPAddress":
@@ -864,6 +866,471 @@ func testIPv6PinholeRenewalPreservesOldIDUnlessExplicitlyMissing() throws {
     try expect(replacement.activeMapping.pinholeID == 88, "Replacement mapping identity must contain only the new ID")
 }
 
+func testTemporaryAccessCapsEveryRouterLease() throws {
+    let now = Date(timeIntervalSince1970: 2_000_000_000)
+    let remainingSeconds: UInt32 = 1800
+    var base = AppConfig.default
+    base.remoteAccessEnabled = true
+    base.preferredAddressFamily = .ipv4
+    base.internalPort = 5900
+    base.externalPort = 45900
+    base.mappingLeaseSeconds = 86_400
+    base.accessExpiresAt = now.addingTimeInterval(TimeInterval(remainingSeconds))
+    base.pcpNonce = Data(repeating: 21, count: 12).base64EncodedString()
+
+    func uint32(_ data: Data, at offset: Int) -> UInt32 {
+        data[offset..<(offset + 4)].reduce(UInt32(0)) {
+            ($0 << 8) | UInt32($1)
+        }
+    }
+
+    var pcpLease: UInt32?
+    var pcpConfig = base
+    pcpConfig.mappingProtocolPreference = .pcp
+    let pcp = RouterMappingService(
+        udpRequestHandler: { payload, _, _, _ in
+            pcpLease = uint32(payload, at: 4)
+            var reply = payload
+            reply[1] = 0x81
+            reply[3] = 0
+            return reply
+        },
+        nowProvider: { now }
+    )
+    let pcpResult = try pcp.ensureMapping(
+        config: pcpConfig,
+        localAddress: "192.0.2.20",
+        gatewayAddress: "192.0.2.1"
+    )
+    try expect(pcpLease == remainingSeconds, "PCP lease must not exceed temporary access")
+    try expect(
+        pcpResult.activeMapping.leaseExpiresAt == base.accessExpiresAt,
+        "PCP tracking must use the bounded lease deadline"
+    )
+
+    var natLease: UInt32?
+    var natConfig = base
+    natConfig.mappingProtocolPreference = .natpmp
+    let natpmp = RouterMappingService(
+        udpRequestHandler: { payload, _, _, _ in
+            if payload.count == 2 {
+                return Data([0, 128, 0, 0, 0, 0, 0, 1, 192, 0, 0, 9])
+            }
+            natLease = uint32(payload, at: 8)
+            var reply = Data([0, 130, 0, 0, 0, 0, 0, 1])
+            reply.append(UInt8(natConfig.internalPort >> 8))
+            reply.append(UInt8(natConfig.internalPort & 0xff))
+            reply.append(UInt8(natConfig.externalPort >> 8))
+            reply.append(UInt8(natConfig.externalPort & 0xff))
+            for shift in [24, 16, 8, 0] {
+                reply.append(UInt8((remainingSeconds >> UInt32(shift)) & 0xff))
+            }
+            return reply
+        },
+        nowProvider: { now }
+    )
+    let natResult = try natpmp.ensureMapping(
+        config: natConfig,
+        localAddress: "192.0.2.20",
+        gatewayAddress: "192.0.2.1"
+    )
+    try expect(natLease == remainingSeconds, "NAT-PMP lease must not exceed temporary access")
+    try expect(
+        natResult.activeMapping.leaseExpiresAt == base.accessExpiresAt,
+        "NAT-PMP tracking must use the bounded lease deadline"
+    )
+
+    let ipv4Service = UPnPService(
+        serviceType: "urn:schemas-upnp-org:service:WANIPConnection:1",
+        controlURL: URL(string: "http://192.0.2.1:5000/upnp/control/WANIPConn1")!,
+        gatewayIdentity: "192.0.2.1",
+        descriptionURL: URL(string: "http://192.0.2.1:5000/rootDesc.xml")!,
+        deviceIdentity: "uuid:lease-router"
+    )
+    var upnpIPv4Lease: UInt32?
+    var upnp4Config = base
+    upnp4Config.mappingProtocolPreference = .upnp
+    let upnp4 = RouterMappingService(
+        upnpDiscoveryHandler: { [ipv4Service] },
+        soapRequestHandler: { _, _, action, body in
+            switch action {
+            case "AddPortMapping":
+                try expect(
+                    body.contains("<NewLeaseDuration>\(remainingSeconds)</NewLeaseDuration>"),
+                    "UPnP IPv4 request must use the temporary-access remainder"
+                )
+                upnpIPv4Lease = remainingSeconds
+                return response("")
+            case "GetSpecificPortMappingEntry":
+                return response("""
+                <response>
+                  <NewInternalClient>192.0.2.20</NewInternalClient>
+                  <NewInternalPort>5900</NewInternalPort>
+                  <NewEnabled>1</NewEnabled>
+                  <NewPortMappingDescription>Gatebeam</NewPortMappingDescription>
+                  <NewLeaseDuration>\(remainingSeconds)</NewLeaseDuration>
+                </response>
+                """)
+            case "GetExternalIPAddress":
+                return response("<response><NewExternalIPAddress>192.0.0.9</NewExternalIPAddress></response>")
+            default:
+                throw TestFailure("Unexpected bounded UPnP IPv4 action \(action)")
+            }
+        },
+        nowProvider: { now }
+    )
+    let upnp4Result = try upnp4.ensureMapping(
+        config: upnp4Config,
+        localAddress: "192.0.2.20",
+        gatewayAddress: "192.0.2.1"
+    )
+    try expect(upnpIPv4Lease == remainingSeconds, "UPnP IPv4 lease must be finite and bounded")
+    try expect(
+        upnp4Result.activeMapping.leaseExpiresAt == base.accessExpiresAt,
+        "UPnP IPv4 tracking must use the bounded lease deadline"
+    )
+
+    let ipv6Service = UPnPService(
+        serviceType: "urn:schemas-upnp-org:service:WANIPv6FirewallControl:1",
+        controlURL: URL(string: "http://192.0.2.1:5000/upnp/control/IPv6Firewall1")!,
+        gatewayIdentity: "192.0.2.1",
+        descriptionURL: URL(string: "http://192.0.2.1:5000/rootDesc.xml")!,
+        deviceIdentity: "uuid:lease-router"
+    )
+    var upnpIPv6Lease: UInt32?
+    var upnp6Config = base
+    upnp6Config.preferredAddressFamily = .ipv6
+    upnp6Config.mappingProtocolPreference = .upnp
+    let upnp6 = RouterMappingService(
+        upnpDiscoveryHandler: { [ipv6Service] },
+        soapRequestHandler: { _, _, action, body in
+            switch action {
+            case "GetFirewallStatus":
+                return response("""
+                <response>
+                  <FirewallEnabled>1</FirewallEnabled>
+                  <InboundPinholeAllowed>1</InboundPinholeAllowed>
+                </response>
+                """)
+            case "AddPinhole":
+                try expect(
+                    body.contains("<LeaseTime>\(remainingSeconds)</LeaseTime>"),
+                    "UPnP IPv6 request must use the temporary-access remainder"
+                )
+                upnpIPv6Lease = remainingSeconds
+                return response("<response><UniqueID>91</UniqueID></response>")
+            default:
+                throw TestFailure("Unexpected bounded UPnP IPv6 action \(action)")
+            }
+        },
+        nowProvider: { now }
+    )
+    let upnp6Result = try upnp6.ensureIPv6Pinhole(
+        config: upnp6Config,
+        localAddress: "2606:4700:4700::20",
+        gatewayAddress: "192.0.2.1"
+    )
+    try expect(upnpIPv6Lease == remainingSeconds, "UPnP IPv6 lease must be finite and bounded")
+    try expect(
+        upnp6Result.activeMapping.leaseExpiresAt == base.accessExpiresAt,
+        "UPnP IPv6 tracking must use the bounded lease deadline"
+    )
+}
+
+func testLegacyUPnPReconciliationRequiresExactRuleIdentity() throws {
+    let gateway = "192.0.2.1"
+    let serviceType = "urn:schemas-upnp-org:service:WANIPConnection:1"
+    let controlURL = URL(string: "http://192.0.2.1:5000/upnp/control/WANIPConn1")!
+    let descriptionURL = URL(string: "http://192.0.2.1:5000/rootDesc.xml")!
+    let deviceIdentity = "uuid:legacy-router"
+    let service = UPnPService(
+        serviceType: serviceType,
+        controlURL: controlURL,
+        gatewayIdentity: gateway,
+        descriptionURL: descriptionURL,
+        deviceIdentity: deviceIdentity
+    )
+    var config = AppConfig.default
+    config.remoteAccessEnabled = true
+    config.preferredAddressFamily = .ipv4
+    config.mappingProtocolPreference = .automatic
+    config.internalPort = 5900
+    config.externalPort = 45900
+
+    var actions: [String] = []
+    let reconciler = RouterMappingService(
+        upnpDiscoveryHandler: { [service] },
+        upnpDescriptionHandler: { requestedURL in
+            try expect(requestedURL == descriptionURL, "Legacy deletion must verify the reconciled IGD")
+            return Data("""
+            <root>
+              <device>
+                <UDN>\(deviceIdentity)</UDN>
+                <serviceList>
+                  <service>
+                    <serviceType>\(serviceType)</serviceType>
+                    <controlURL>\(controlURL.absoluteString)</controlURL>
+                  </service>
+                </serviceList>
+              </device>
+            </root>
+            """.utf8)
+        },
+        soapRequestHandler: { _, _, action, _ in
+            actions.append(action)
+            switch action {
+            case "GetSpecificPortMappingEntry":
+                return response("""
+                <response>
+                  <NewInternalClient>192.0.2.20</NewInternalClient>
+                  <NewInternalPort>5900</NewInternalPort>
+                  <NewEnabled>1</NewEnabled>
+                  <NewPortMappingDescription>Gatebeam</NewPortMappingDescription>
+                  <NewLeaseDuration>600</NewLeaseDuration>
+                </response>
+                """)
+            case "DeletePortMapping":
+                return response("")
+            default:
+                throw TestFailure("Unexpected legacy reconciliation action \(action)")
+            }
+        }
+    )
+    let candidates = try reconciler.legacyRemovalCandidates(
+        config: config,
+        localIPv4: "192.0.2.20",
+        gatewayIPv4: gateway,
+        localIPv6: nil,
+        gatewayIPv6: nil
+    )
+    let upnpCandidates = candidates.filter { $0.transport == .upnp }
+    try expect(upnpCandidates.count == 1, "A verified legacy UPnP rule must yield one deletion candidate")
+    try expect(
+        upnpCandidates[0].pcpNonce?.hasPrefix("gatebeam-upnp-v1:") == true,
+        "A legacy UPnP candidate must contain bound IGD metadata"
+    )
+    try expect(
+        reconciler.removeMappings(upnpCandidates).allSucceeded,
+        "A strictly reconciled legacy UPnP rule must be removable from the same IGD"
+    )
+    try expect(
+        actions == ["GetSpecificPortMappingEntry", "DeletePortMapping"],
+        "Legacy reconciliation must query before it deletes"
+    )
+
+    let mismatch = RouterMappingService(
+        upnpDiscoveryHandler: { [service] },
+        soapRequestHandler: { _, _, _, _ in
+            response("""
+            <response>
+              <NewInternalClient>192.0.2.99</NewInternalClient>
+              <NewInternalPort>5900</NewInternalPort>
+              <NewEnabled>1</NewEnabled>
+              <NewPortMappingDescription>Other App</NewPortMappingDescription>
+            </response>
+            """)
+        }
+    )
+    do {
+        _ = try mismatch.legacyRemovalCandidates(
+            config: config,
+            localIPv4: "192.0.2.20",
+            gatewayIPv4: gateway,
+            localIPv6: nil,
+            gatewayIPv6: nil
+        )
+        throw TestFailure("A mismatched legacy UPnP rule must fail closed")
+    } catch let error as RouterMappingError {
+        try expect(
+            error.localizedDescription.contains("Refusing to delete"),
+            "Legacy mismatch must explain the fail-closed decision"
+        )
+    }
+}
+
+func testUPnPAddResponseLossPreservesFiniteRecoveryState() throws {
+    var now = Date(timeIntervalSince1970: 2_000_100_000)
+    let gateway = "192.0.2.1"
+    let ipv4Service = UPnPService(
+        serviceType: "urn:schemas-upnp-org:service:WANIPConnection:1",
+        controlURL: URL(string: "http://192.0.2.1:5000/upnp/control/WANIPConn1")!,
+        gatewayIdentity: gateway,
+        descriptionURL: URL(string: "http://192.0.2.1:5000/rootDesc.xml")!,
+        deviceIdentity: "uuid:response-loss-router"
+    )
+    var config = AppConfig.default
+    config.remoteAccessEnabled = true
+    config.mappingProtocolPreference = .upnp
+    config.preferredAddressFamily = .ipv4
+    config.mappingLeaseSeconds = 3600
+    config.accessExpiresAt = now.addingTimeInterval(900)
+
+    let ipv4Mapper = RouterMappingService(
+        upnpDiscoveryHandler: { [ipv4Service] },
+        soapRequestHandler: { _, _, action, _ in
+            try expect(action == "AddPortMapping", "Response-loss fixture must stop after AddPortMapping")
+            throw RouterMappingError.timeout("Injected AddPortMapping response loss")
+        },
+        nowProvider: { now }
+    )
+    do {
+        _ = try ipv4Mapper.ensureMapping(
+            config: config,
+            localAddress: "192.0.2.20",
+            gatewayAddress: gateway
+        )
+        throw TestFailure("AddPortMapping response loss must require recovery")
+    } catch let recovery as RouterMappingRecoveryRequiredError {
+        try expect(recovery.mapping.addressFamily == .ipv4, "IPv4 response loss must retain family")
+        try expect(recovery.mapping.externalPort == config.externalPort, "IPv4 response loss must retain exact port")
+        try expect(
+            recovery.mapping.pcpNonce?.hasPrefix("gatebeam-upnp-v1:") == true,
+            "IPv4 response loss must retain exact IGD identity"
+        )
+        try expect(
+            recovery.mapping.leaseExpiresAt == config.accessExpiresAt,
+            "IPv4 uncertain exposure must remain bounded by temporary access"
+        )
+    }
+
+    let ipv6Service = UPnPService(
+        serviceType: "urn:schemas-upnp-org:service:WANIPv6FirewallControl:1",
+        controlURL: URL(string: "http://192.0.2.1:5000/upnp/control/IPv6Firewall1")!,
+        gatewayIdentity: gateway,
+        descriptionURL: URL(string: "http://192.0.2.1:5000/rootDesc.xml")!,
+        deviceIdentity: "uuid:response-loss-router"
+    )
+    var ipv6Config = config
+    ipv6Config.preferredAddressFamily = .ipv6
+    let ipv6Mapper = RouterMappingService(
+        upnpDiscoveryHandler: { [ipv6Service] },
+        soapRequestHandler: { _, _, action, _ in
+            switch action {
+            case "GetFirewallStatus":
+                return response("""
+                <response>
+                  <FirewallEnabled>1</FirewallEnabled>
+                  <InboundPinholeAllowed>1</InboundPinholeAllowed>
+                </response>
+                """)
+            case "AddPinhole":
+                return response("<response></response>")
+            default:
+                throw TestFailure("Unexpected IPv6 response-loss action \(action)")
+            }
+        },
+        nowProvider: { now }
+    )
+    let unknownExposure: ActiveRouterMapping
+    do {
+        _ = try ipv6Mapper.ensureIPv6Pinhole(
+            config: ipv6Config,
+            localAddress: "2606:4700:4700::20",
+            gatewayAddress: gateway
+        )
+        throw TestFailure("Missing AddPinhole UniqueID must require recovery")
+    } catch let recovery as RouterMappingRecoveryRequiredError {
+        unknownExposure = recovery.mapping
+        try expect(unknownExposure.pinholeID == nil, "Unknown IPv6 exposure must not invent a pinhole ID")
+        try expect(
+            unknownExposure.leaseExpiresAt == ipv6Config.accessExpiresAt,
+            "Unknown IPv6 exposure must retain its finite lease deadline"
+        )
+    }
+    try expect(
+        !ipv6Mapper.removeMappings([unknownExposure]).allSucceeded,
+        "Unknown IPv6 exposure must block cleanup completion before its lease expires"
+    )
+    now = unknownExposure.leaseExpiresAt.addingTimeInterval(1)
+    try expect(
+        ipv6Mapper.removeMappings([unknownExposure]).allSucceeded,
+        "Unknown IPv6 exposure must clear idempotently after its finite lease expires"
+    )
+}
+
+func testIPv6ScopedSSDPAllowsSameUDNDualStackControlURL() throws {
+    let gateway = "fe80::1%en0"
+    let descriptionURL = URL(string: "http://192.0.2.1:5000/rootDesc.xml")!
+    let controlURL = URL(string: "http://192.0.2.1:5000/upnp/control/IPv6Firewall1")!
+    let deviceIdentity = "uuid:dual-stack-igd"
+    let serviceType = "urn:schemas-upnp-org:service:WANIPv6FirewallControl:1"
+    let description = Data("""
+    <root>
+      <device>
+        <UDN>\(deviceIdentity)</UDN>
+        <serviceList>
+          <service>
+            <serviceType>\(serviceType)</serviceType>
+            <controlURL>\(controlURL.absoluteString)</controlURL>
+          </service>
+        </serviceList>
+      </device>
+    </root>
+    """.utf8)
+    var searches: [UPnPDiscoveryRequest] = []
+    var actions: [String] = []
+    let mapper = RouterMappingService(
+        upnpDescriptionHandler: { requestedURL in
+            try expect(requestedURL == descriptionURL, "IPv6 SSDP must use the advertised LOCATION")
+            return description
+        },
+        soapRequestHandler: { requestedURL, _, action, _ in
+            try expect(requestedURL == controlURL, "Same-UDN dual-stack control must use the advertised IPv4 URL")
+            actions.append(action)
+            switch action {
+            case "GetFirewallStatus":
+                return response("""
+                <response>
+                  <FirewallEnabled>1</FirewallEnabled>
+                  <InboundPinholeAllowed>1</InboundPinholeAllowed>
+                </response>
+                """)
+            case "AddPinhole":
+                return response("<response><UniqueID>77</UniqueID></response>")
+            case "DeletePinhole":
+                return response("")
+            default:
+                throw TestFailure("Unexpected IPv6 SSDP action \(action)")
+            }
+        },
+        ssdpSearchHandler: { request in
+            searches.append(request)
+            return [Data("""
+            HTTP/1.1 200 OK\r
+            LOCATION: \(descriptionURL.absoluteString)\r
+            USN: \(deviceIdentity)::urn:schemas-upnp-org:device:InternetGatewayDevice:2\r
+            ST: \(serviceType)\r
+            \r
+            """.utf8)]
+        }
+    )
+    var config = AppConfig.default
+    config.mappingProtocolPreference = .upnp
+    config.preferredAddressFamily = .ipv6
+    config.mappingLeaseSeconds = 600
+    let result = try mapper.ensureIPv6Pinhole(
+        config: config,
+        localAddress: "2606:4700:4700::20",
+        gatewayAddress: gateway
+    )
+    try expect(searches.count == 1, "IPv6 pinhole creation must perform one scoped SSDP search")
+    try expect(searches[0].addressFamily == .ipv6, "IPv6 firewall discovery must use an IPv6 socket")
+    try expect(searches[0].host.lowercased() == "ff02::c", "IPv6 SSDP must target FF02::C")
+    try expect(searches[0].interfaceName == "en0", "IPv6 SSDP must bind the default gateway scope")
+    try expect(
+        searches[0].payloads.allSatisfy {
+            String(data: $0, encoding: .utf8)?.contains("HOST: [FF02::C]:1900") == true
+        },
+        "Every IPv6 SSDP request must carry the scoped multicast Host header"
+    )
+    try expect(
+        mapper.removeMappings([result.activeMapping]).allSucceeded,
+        "A same-UDN dual-stack control URL must remain bound for exact deletion"
+    )
+    try expect(searches.count == 1, "Deletion must use persisted IGD identity without rediscovery")
+    try expect(actions == ["GetFirewallStatus", "AddPinhole", "DeletePinhole"], "IPv6 lifecycle actions must stay ordered")
+}
+
 func testPCPMapCodec() throws {
     let nonce = Data(0..<12)
     let request = try PCPMessageCodec.makeMapRequest(
@@ -1150,6 +1617,10 @@ let tests: [(String, () throws -> Void)] = [
     ("preserves recovery identity in automatic mode", testAutomaticMappingPreservesRecoveryIdentity),
     ("stops automatic fallback after uncertain UDP creation", testAutomaticStopsAfterUncertainPCPOrNATPMPRequest),
     ("preserves IPv6 pinhole ID on uncertain renewal", testIPv6PinholeRenewalPreservesOldIDUnlessExplicitlyMissing),
+    ("caps every router lease to temporary access", testTemporaryAccessCapsEveryRouterLease),
+    ("reconciles legacy UPnP only after exact identity match", testLegacyUPnPReconciliationRequiresExactRuleIdentity),
+    ("preserves finite recovery state after UPnP add response loss", testUPnPAddResponseLossPreservesFiniteRecoveryState),
+    ("discovers IPv6 firewall service with scoped SSDP", testIPv6ScopedSSDPAllowsSameUDNDualStackControlURL),
     ("encodes and decodes PCP MAP", testPCPMapCodec),
     ("selects physical IPv6 from anonymous fixtures", testLocalIPv6SelectionUsesAnonymousFixtures),
     ("prefers default physical IPv6 route", testLocalIPv6SelectionPrefersDefaultPhysicalRoute),

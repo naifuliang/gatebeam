@@ -18,6 +18,20 @@ struct RouterCapabilityResult {
     var ipv6FirewallAvailable: Bool = false
 }
 
+enum UPnPDiscoveryAddressFamily: Equatable {
+    case ipv4
+    case ipv6
+}
+
+struct UPnPDiscoveryRequest {
+    let addressFamily: UPnPDiscoveryAddressFamily
+    let host: String
+    let port: UInt16
+    let interfaceName: String?
+    let payloads: [Data]
+    let timeoutSeconds: Int
+}
+
 struct RouterMappingRemovalAttempt {
     let mapping: ActiveRouterMapping
     let errorDescription: String?
@@ -62,7 +76,7 @@ protocol RouterMappingServicing {
         gatewayIPv4: String?,
         localIPv6: String?,
         gatewayIPv6: String?
-    ) -> [ActiveRouterMapping]
+    ) throws -> [ActiveRouterMapping]
 }
 
 final class RouterMappingService: RouterMappingServicing {
@@ -73,20 +87,26 @@ final class RouterMappingService: RouterMappingServicing {
     private let upnpDescriptionHandler: ((URL) throws -> Data)?
     private let soapRequestHandler: ((URL, String, String, String) throws -> HTTPResponse)?
     private let udpRequestHandler: ((Data, String, UInt16, Int) throws -> Data)?
+    private let ssdpSearchHandler: ((UPnPDiscoveryRequest) throws -> [Data])?
     private let removalHandler: ((ActiveRouterMapping) throws -> Void)?
+    private let nowProvider: () -> Date
 
     init(
         upnpDiscoveryHandler: (() throws -> [UPnPService])? = nil,
         upnpDescriptionHandler: ((URL) throws -> Data)? = nil,
         soapRequestHandler: ((URL, String, String, String) throws -> HTTPResponse)? = nil,
         udpRequestHandler: ((Data, String, UInt16, Int) throws -> Data)? = nil,
-        removalHandler: ((ActiveRouterMapping) throws -> Void)? = nil
+        ssdpSearchHandler: ((UPnPDiscoveryRequest) throws -> [Data])? = nil,
+        removalHandler: ((ActiveRouterMapping) throws -> Void)? = nil,
+        nowProvider: @escaping () -> Date = Date.init
     ) {
         self.upnpDiscoveryHandler = upnpDiscoveryHandler
         self.upnpDescriptionHandler = upnpDescriptionHandler
         self.soapRequestHandler = soapRequestHandler
         self.udpRequestHandler = udpRequestHandler
+        self.ssdpSearchHandler = ssdpSearchHandler
         self.removalHandler = removalHandler
+        self.nowProvider = nowProvider
     }
 
     static func renewableUPnPLeaseSeconds(requested: UInt32, minimum: UInt32 = 60) -> UInt32 {
@@ -242,18 +262,18 @@ final class RouterMappingService: RouterMappingServicing {
         gatewayIPv4: String?,
         localIPv6: String?,
         gatewayIPv6: String?
-    ) -> [ActiveRouterMapping] {
+    ) throws -> [ActiveRouterMapping] {
         var candidates: [ActiveRouterMapping] = []
         let transports: [RouterMappingTransport]
         switch config.mappingProtocolPreference {
         case .automatic:
-            transports = [.pcp, .natpmp, .upnp]
+            transports = [.pcp, .natpmp]
         case .pcp:
             transports = [.pcp]
         case .natpmp:
             transports = [.natpmp]
         case .upnp:
-            transports = [.upnp]
+            transports = []
         case .disabled:
             transports = []
         }
@@ -269,6 +289,16 @@ final class RouterMappingService: RouterMappingServicing {
                     localAddress: localIPv4,
                     gatewayAddress: gatewayIPv4
                 )
+            }
+            if config.mappingProtocolPreference == .automatic
+                || config.mappingProtocolPreference == .upnp {
+                if let reconciled = try reconcileLegacyUPnPIPv4Mapping(
+                    config: config,
+                    localAddress: localIPv4,
+                    gatewayAddress: gatewayIPv4
+                ) {
+                    candidates.append(reconciled)
+                }
             }
         }
         if config.preferredAddressFamily.usesIPv6,
@@ -287,8 +317,58 @@ final class RouterMappingService: RouterMappingServicing {
                     gatewayAddress: gatewayIPv6
                 )
             }
+            if (config.mappingProtocolPreference == .automatic
+                    || config.mappingProtocolPreference == .upnp),
+               config.ipv6PinholeID != nil {
+                throw RouterMappingError.protocolFailure(
+                    "The legacy UPnP IPv6 pinhole has no verifiable IGD identity. "
+                        + "Wait for its router lease to expire or remove it in the original router before continuing."
+                )
+            }
         }
         return candidates
+    }
+
+    private func reconcileLegacyUPnPIPv4Mapping(
+        config: AppConfig,
+        localAddress: String,
+        gatewayAddress: String
+    ) throws -> ActiveRouterMapping? {
+        let service = try discoverUPnPService(gatewayAddress: gatewayAddress)
+        let values: [String: String]
+        do {
+            values = try querySpecificUPnPMapping(
+                externalPort: config.externalPort,
+                service: service
+            )
+        } catch let error as RouterMappingError where error.isMissingIPv4UPnPMapping {
+            return nil
+        }
+
+        guard values["NewInternalClient"] == localAddress,
+              values["NewInternalPort"] == String(config.internalPort),
+              values["NewEnabled"] != "0",
+              values["NewPortMappingDescription"] == "Gatebeam" else {
+            throw RouterMappingError.protocolFailure(
+                "A UPnP rule exists on the original gateway, but its client, port, enabled state, "
+                    + "or description does not exactly match Gatebeam. Refusing to delete it automatically."
+            )
+        }
+
+        let binding = try UPnPControlBinding(
+            service: service,
+            gatewayAddress: gatewayAddress
+        ).encoded()
+        return activeMapping(
+            config: config,
+            transport: .upnp,
+            family: .ipv4,
+            localAddress: localAddress,
+            gatewayAddress: gatewayAddress,
+            externalPort: config.externalPort,
+            lifetime: 1,
+            protocolState: binding
+        )
     }
 
     private func removeMapping(_ mapping: ActiveRouterMapping) throws {
@@ -321,6 +401,9 @@ final class RouterMappingService: RouterMappingServicing {
             try deleteUPnPMapping(externalPort: mapping.externalPort, service: service)
         case (.ipv6, .upnp):
             guard let pinholeID = mapping.pinholeID else {
+                if nowProvider() >= mapping.leaseExpiresAt {
+                    return
+                }
                 throw RouterMappingError.protocolFailure("The tracked UPnP IPv6 pinhole has no ID")
             }
             let service = try boundUPnPService(for: mapping, expectedService: .ipv6Firewall)
@@ -364,7 +447,7 @@ final class RouterMappingService: RouterMappingServicing {
         pinholeID: UInt16? = nil,
         protocolState: String? = nil
     ) -> ActiveRouterMapping {
-        let now = Date()
+        let now = nowProvider()
         let effectiveLifetime = max(1, lifetime)
         let expiresAt = now.addingTimeInterval(TimeInterval(effectiveLifetime))
         let renewalLead = min(
@@ -385,6 +468,26 @@ final class RouterMappingService: RouterMappingServicing {
         )
     }
 
+    private func effectiveLeaseSeconds(
+        config: AppConfig,
+        protocolName: String,
+        minimum: UInt32 = 1
+    ) throws -> UInt32 {
+        let requested = min(max(config.mappingLeaseSeconds, minimum), 86_400)
+        guard let expiresAt = config.accessExpiresAt else {
+            return requested
+        }
+
+        let remaining = floor(expiresAt.timeIntervalSince(nowProvider()))
+        guard remaining >= TimeInterval(minimum) else {
+            throw RouterMappingError.protocolFailure(
+                "\(protocolName) cannot create a lease because temporary access has less than "
+                    + "\(minimum) second(s) remaining"
+            )
+        }
+        return min(requested, UInt32(min(remaining, TimeInterval(UInt32.max))))
+    }
+
     private func addPCPMapping(
         config: AppConfig,
         localAddress: String,
@@ -393,13 +496,17 @@ final class RouterMappingService: RouterMappingServicing {
     ) throws -> PortMappingResult {
         let nonce = pcpNonce(config: config)
         let family: RouterMappingAddressFamily = familyName == "IPv6" ? .ipv6 : .ipv4
+        let requestedLease = try effectiveLeaseSeconds(
+            config: config,
+            protocolName: "PCP"
+        )
         let response: PCPMappingResponse
         do {
             response = try sendPCPMapping(
                 config: config,
                 localAddress: localAddress,
                 gatewayAddress: gatewayAddress,
-                lifetime: config.mappingLeaseSeconds,
+                lifetime: requestedLease,
                 nonce: nonce
             )
         } catch {
@@ -411,13 +518,31 @@ final class RouterMappingService: RouterMappingServicing {
                 localAddress: localAddress,
                 gatewayAddress: gatewayAddress,
                 externalPort: config.externalPort,
-                lifetime: config.mappingLeaseSeconds
+                lifetime: requestedLease
             )
             candidate.pcpNonce = nonce.base64EncodedString()
             throw RouterMappingRecoveryRequiredError(
                 mapping: candidate,
                 operationDescription: "PCP mapping request was sent, but its result is uncertain.",
                 cleanupDescription: error.localizedDescription
+            )
+        }
+        guard response.lifetimeSeconds <= requestedLease else {
+            var candidate = activeMapping(
+                config: config,
+                transport: .pcp,
+                family: family,
+                localAddress: localAddress,
+                gatewayAddress: gatewayAddress,
+                externalPort: response.externalPort,
+                lifetime: response.lifetimeSeconds
+            )
+            candidate.pcpNonce = nonce.base64EncodedString()
+            throw RouterMappingRecoveryRequiredError(
+                mapping: candidate,
+                operationDescription:
+                    "PCP returned a \(response.lifetimeSeconds)s lease after Gatebeam requested at most \(requestedLease)s.",
+                cleanupDescription: "The overlong lease must be removed before temporary access can be trusted."
             )
         }
         var mapping = activeMapping(
@@ -469,12 +594,16 @@ final class RouterMappingService: RouterMappingServicing {
         localAddress: String,
         gatewayAddress: String
     ) throws -> PortMappingResult {
+        let requestedLease = try effectiveLeaseSeconds(
+            config: config,
+            protocolName: "NAT-PMP"
+        )
         let response: NATPMPMappingResponse
         do {
             response = try sendNATPMPMapping(
                 config: config,
                 gatewayAddress: gatewayAddress,
-                lifetime: config.mappingLeaseSeconds
+                lifetime: requestedLease
             )
         } catch {
             guard Self.isUncertainCreationError(error) else { throw error }
@@ -485,12 +614,29 @@ final class RouterMappingService: RouterMappingServicing {
                 localAddress: localAddress,
                 gatewayAddress: gatewayAddress,
                 externalPort: config.externalPort,
-                lifetime: config.mappingLeaseSeconds
+                lifetime: requestedLease
             )
             throw RouterMappingRecoveryRequiredError(
                 mapping: candidate,
                 operationDescription: "NAT-PMP mapping request was sent, but its result is uncertain.",
                 cleanupDescription: error.localizedDescription
+            )
+        }
+        guard response.lifetimeSeconds <= requestedLease else {
+            let candidate = activeMapping(
+                config: config,
+                transport: .natpmp,
+                family: .ipv4,
+                localAddress: localAddress,
+                gatewayAddress: gatewayAddress,
+                externalPort: response.externalPort,
+                lifetime: response.lifetimeSeconds
+            )
+            throw RouterMappingRecoveryRequiredError(
+                mapping: candidate,
+                operationDescription:
+                    "NAT-PMP returned a \(response.lifetimeSeconds)s lease after Gatebeam requested at most \(requestedLease)s.",
+                cleanupDescription: "The overlong lease must be removed before temporary access can be trusted."
             )
         }
         let routerExternalAddress = try? queryNATPMPExternalAddress(gatewayAddress: gatewayAddress)
@@ -565,9 +711,10 @@ final class RouterMappingService: RouterMappingServicing {
     ) throws -> PortMappingResult {
         let service = try discoverUPnPService(gatewayAddress: gatewayAddress)
         let binding = try UPnPControlBinding(service: service, gatewayAddress: gatewayAddress).encoded()
-        let lease = Self.renewableUPnPLeaseSeconds(requested: config.mappingLeaseSeconds)
-        try addUPnPMapping(config: config, localAddress: localAddress, service: service, lease: lease)
-
+        let lease = try effectiveLeaseSeconds(
+            config: config,
+            protocolName: "UPnP IPv4"
+        )
         let mapping = activeMapping(
             config: config,
             transport: .upnp,
@@ -579,7 +726,31 @@ final class RouterMappingService: RouterMappingServicing {
             protocolState: binding
         )
         do {
-            try verifyUPnPMapping(config: config, localAddress: localAddress, service: service)
+            try addUPnPMapping(
+                config: config,
+                localAddress: localAddress,
+                service: service,
+                lease: lease
+            )
+        } catch {
+            if let mappingError = error as? RouterMappingError,
+               mappingError.isConclusiveUPnPAddRejection {
+                throw error
+            }
+            throw RouterMappingRecoveryRequiredError(
+                mapping: mapping,
+                operationDescription:
+                    "The UPnP AddPortMapping request may have reached the original IGD, but no conclusive response was received.",
+                cleanupDescription: error.localizedDescription
+            )
+        }
+        do {
+            try verifyUPnPMapping(
+                config: config,
+                localAddress: localAddress,
+                maximumLease: lease,
+                service: service
+            )
         } catch {
             do {
                 try deleteUPnPMapping(externalPort: config.externalPort, service: service)
@@ -628,14 +799,40 @@ final class RouterMappingService: RouterMappingServicing {
         _ = try soapRequest(controlURL: service.controlURL, serviceType: service.serviceType, action: "AddPortMapping", body: body)
     }
 
-    private func verifyUPnPMapping(config: AppConfig, localAddress: String, service: UPnPService) throws {
+    private func verifyUPnPMapping(
+        config: AppConfig,
+        localAddress: String,
+        maximumLease: UInt32,
+        service: UPnPService
+    ) throws {
+        let values = try querySpecificUPnPMapping(
+            externalPort: config.externalPort,
+            service: service
+        )
+        guard values["NewInternalClient"] == localAddress,
+              values["NewInternalPort"] == String(config.internalPort),
+              values["NewEnabled"] != "0",
+              values["NewPortMappingDescription"] == "Gatebeam",
+              let confirmedLease = values["NewLeaseDuration"].flatMap(UInt32.init),
+              confirmedLease > 0,
+              confirmedLease <= maximumLease else {
+            throw RouterMappingError.invalidResponse(
+                "UPnP mapping could not be confirmed with the requested client, port, description, and finite lease"
+            )
+        }
+    }
+
+    private func querySpecificUPnPMapping(
+        externalPort: UInt16,
+        service: UPnPService
+    ) throws -> [String: String] {
         let body = """
         <?xml version="1.0"?>
         <s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">
           <s:Body>
             <u:GetSpecificPortMappingEntry xmlns:u="\(service.serviceType)">
               <NewRemoteHost></NewRemoteHost>
-              <NewExternalPort>\(config.externalPort)</NewExternalPort>
+              <NewExternalPort>\(externalPort)</NewExternalPort>
               <NewProtocol>TCP</NewProtocol>
             </u:GetSpecificPortMappingEntry>
           </s:Body>
@@ -647,12 +844,7 @@ final class RouterMappingService: RouterMappingServicing {
             action: "GetSpecificPortMappingEntry",
             body: body
         )
-        let values = Self.xmlValues(in: response.data)
-        guard values["NewInternalClient"] == localAddress,
-              values["NewInternalPort"] == String(config.internalPort),
-              values["NewEnabled"] != "0" else {
-            throw RouterMappingError.invalidResponse("UPnP mapping could not be confirmed after creation")
-        }
+        return Self.xmlValues(in: response.data)
     }
 
     private func queryUPnPExternalAddress(service: UPnPService) throws -> String {
@@ -717,9 +909,9 @@ final class RouterMappingService: RouterMappingServicing {
             throw RouterMappingError.protocolFailure("The router reports that inbound IPv6 pinholes are disabled")
         }
 
-        let lease = Self.renewableUPnPLeaseSeconds(
-            requested: config.mappingLeaseSeconds,
-            minimum: 3600
+        let lease = try effectiveLeaseSeconds(
+            config: config,
+            protocolName: "UPnP IPv6"
         )
         var pinholeID = config.ipv6PinholeID
         if let existingID = pinholeID {
@@ -749,12 +941,39 @@ final class RouterMappingService: RouterMappingServicing {
             }
         }
         if pinholeID == nil {
-            pinholeID = try createUPnPIPv6Pinhole(
-                service: service,
-                localAddress: localAddress,
-                internalPort: config.internalPort,
-                lease: lease
-            )
+            do {
+                pinholeID = try createUPnPIPv6Pinhole(
+                    service: service,
+                    localAddress: localAddress,
+                    internalPort: config.internalPort,
+                    lease: lease
+                )
+            } catch {
+                if let mappingError = error as? RouterMappingError,
+                   mappingError.isConclusiveUPnPAddRejection {
+                    throw error
+                }
+                let unknownExposure = activeMapping(
+                    config: config,
+                    transport: .upnp,
+                    family: .ipv6,
+                    localAddress: localAddress,
+                    gatewayAddress: gatewayAddress,
+                    externalPort: config.internalPort,
+                    lifetime: lease,
+                    pinholeID: nil,
+                    protocolState: binding
+                )
+                throw RouterMappingRecoveryRequiredError(
+                    mapping: unknownExposure,
+                    operationDescription:
+                        "The UPnP AddPinhole request may have created an IPv6 exposure, "
+                            + "but Gatebeam did not receive a usable UniqueID.",
+                    cleanupDescription:
+                        "\(error.localizedDescription) New mappings are blocked until the finite "
+                            + "lease expires at \(unknownExposure.leaseExpiresAt)."
+                )
+            }
         }
 
         return PortMappingResult(
@@ -912,7 +1131,8 @@ final class RouterMappingService: RouterMappingServicing {
             controlURL: controlURL,
             gatewayIdentity: binding.gatewayIdentity,
             descriptionURL: descriptionURL,
-            deviceIdentity: binding.deviceIdentity
+            deviceIdentity: binding.deviceIdentity,
+            allowsCrossFamilyControl: binding.allowsCrossFamilyControl
         )
         guard service.isBound(to: mapping.gatewayAddress) else {
             throw RouterMappingError.protocolFailure(
@@ -936,7 +1156,12 @@ final class RouterMappingService: RouterMappingServicing {
                 "The tracked UPnP mapping predates IGD device identity metadata"
             )
         }
-        let currentServices = try parseUPnPDescription(location: descriptionURL)
+        let currentServices = try parseUPnPDescription(
+            location: descriptionURL,
+            fallbackDeviceIdentity: expectedIdentity,
+            gatewayIdentityOverride: service.gatewayIdentity,
+            allowsCrossFamilyControl: service.allowsCrossFamilyControl
+        )
         guard currentServices.contains(where: {
             normalizedUPnPDeviceIdentity($0.deviceIdentity ?? "") == normalizedUPnPDeviceIdentity(expectedIdentity)
                 && $0.serviceType == service.serviceType
@@ -950,7 +1175,10 @@ final class RouterMappingService: RouterMappingServicing {
     }
 
     private func discoverUPnPService(gatewayAddress: String) throws -> UPnPService {
-        let services = try discoverUPnPServices()
+        let services = try discoverUPnPServices(
+            gatewayAddress: gatewayAddress,
+            addressFamily: .ipv4
+        )
         let candidates = services.filter {
             ($0.serviceType.contains("WANIPConnection") || $0.serviceType.contains("WANPPPConnection"))
                 && $0.isBound(to: gatewayAddress)
@@ -969,7 +1197,10 @@ final class RouterMappingService: RouterMappingServicing {
     }
 
     private func discoverUPnPIPv6FirewallService(gatewayAddress: String) throws -> UPnPService {
-        guard let service = try discoverUPnPServices().first(where: {
+        guard let service = try discoverUPnPServices(
+            gatewayAddress: gatewayAddress,
+            addressFamily: .ipv6
+        ).first(where: {
             $0.serviceType.contains("WANIPv6FirewallControl") && $0.isBound(to: gatewayAddress)
         }) else {
             throw RouterMappingError.protocolFailure(
@@ -979,7 +1210,10 @@ final class RouterMappingService: RouterMappingServicing {
         return service
     }
 
-    private func discoverUPnPServices() throws -> [UPnPService] {
+    private func discoverUPnPServices(
+        gatewayAddress: String,
+        addressFamily: UPnPDiscoveryAddressFamily
+    ) throws -> [UPnPService] {
         if let upnpDiscoveryHandler {
             return try upnpDiscoveryHandler()
         }
@@ -991,17 +1225,53 @@ final class RouterMappingService: RouterMappingServicing {
             "urn:schemas-upnp-org:service:WANPPPConnection:1",
             "urn:schemas-upnp-org:service:WANIPv6FirewallControl:1"
         ]
+        let host: String
+        let hostHeader: String
+        let interfaceName: String?
+        switch addressFamily {
+        case .ipv4:
+            host = "239.255.255.250"
+            hostHeader = "239.255.255.250:1900"
+            interfaceName = nil
+        case .ipv6:
+            guard let scopedInterface = Self.ipv6ScopeInterface(in: gatewayAddress) else {
+                throw RouterMappingError.protocolFailure(
+                    "The IPv6 default gateway has no interface scope for link-local SSDP discovery"
+                )
+            }
+            host = "ff02::c"
+            hostHeader = "[FF02::C]:1900"
+            interfaceName = scopedInterface
+        }
         let payloads = targets.map { target in
             Data("""
             M-SEARCH * HTTP/1.1\r
-            HOST: 239.255.255.250:1900\r
+            HOST: \(hostHeader)\r
             MAN: "ssdp:discover"\r
             MX: 2\r
             ST: \(target)\r
             \r
             """.utf8)
         }
-        let responses = try udpMulticastSearch(payloads: payloads, host: "239.255.255.250", port: 1900, timeoutSeconds: 4)
+        let request = UPnPDiscoveryRequest(
+            addressFamily: addressFamily,
+            host: host,
+            port: 1900,
+            interfaceName: interfaceName,
+            payloads: payloads,
+            timeoutSeconds: 4
+        )
+        let responses: [Data]
+        if let ssdpSearchHandler {
+            responses = try ssdpSearchHandler(request)
+        } else {
+            switch addressFamily {
+            case .ipv4:
+                responses = try udpMulticastSearchIPv4(request)
+            case .ipv6:
+                responses = try udpMulticastSearchIPv6(request)
+            }
+        }
         let endpoints = responses.compactMap { response -> (URL, String?)? in
             let text = String(data: response, encoding: .utf8) ?? ""
             guard let location = Self.headerValue("location", in: text).flatMap(URL.init(string:)) else {
@@ -1018,7 +1288,9 @@ final class RouterMappingService: RouterMappingServicing {
                 services.append(
                     contentsOf: try parseUPnPDescription(
                         location: location,
-                        fallbackDeviceIdentity: deviceIdentity
+                        fallbackDeviceIdentity: deviceIdentity,
+                        gatewayIdentityOverride: addressFamily == .ipv6 ? gatewayAddress : nil,
+                        allowsCrossFamilyControl: addressFamily == .ipv6
                     )
                 )
             } catch {
@@ -1037,7 +1309,9 @@ final class RouterMappingService: RouterMappingServicing {
 
     private func parseUPnPDescription(
         location: URL,
-        fallbackDeviceIdentity: String? = nil
+        fallbackDeviceIdentity: String? = nil,
+        gatewayIdentityOverride: String? = nil,
+        allowsCrossFamilyControl: Bool = false
     ) throws -> [UPnPService] {
         let data: Data
         if let upnpDescriptionHandler {
@@ -1051,6 +1325,14 @@ final class RouterMappingService: RouterMappingServicing {
         }
         let description = UPnPDescriptionParser.parse(data)
         let baseURL = description.urlBase.flatMap(URL.init(string:)) ?? location
+        if let parsedIdentity = description.deviceIdentity,
+           let fallbackDeviceIdentity,
+           normalizedUPnPDeviceIdentity(parsedIdentity)
+                != normalizedUPnPDeviceIdentity(fallbackDeviceIdentity) {
+            throw RouterMappingError.protocolFailure(
+                "The UPnP description UDN did not match the SSDP responder identity"
+            )
+        }
         let deviceIdentity = description.deviceIdentity ?? fallbackDeviceIdentity
         let services = description.services.compactMap { candidate -> UPnPService? in
             guard candidate.serviceType.contains("WANIPConnection")
@@ -1062,9 +1344,12 @@ final class RouterMappingService: RouterMappingServicing {
             return UPnPService(
                 serviceType: candidate.serviceType,
                 controlURL: controlURL,
-                gatewayIdentity: normalizedGatewayIdentity(controlURL.host ?? location.host ?? ""),
+                gatewayIdentity: normalizedGatewayIdentity(
+                    gatewayIdentityOverride ?? controlURL.host ?? location.host ?? ""
+                ),
                 descriptionURL: location,
-                deviceIdentity: deviceIdentity
+                deviceIdentity: deviceIdentity,
+                allowsCrossFamilyControl: allowsCrossFamilyControl
             )
         }
         guard !services.isEmpty else {
@@ -1102,7 +1387,7 @@ final class RouterMappingService: RouterMappingServicing {
         return response
     }
 
-    private func udpMulticastSearch(payloads: [Data], host: String, port: UInt16, timeoutSeconds: Int) throws -> [Data] {
+    private func udpMulticastSearchIPv4(_ request: UPnPDiscoveryRequest) throws -> [Data] {
         let socketFD = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
         guard socketFD >= 0 else { throw RouterMappingError.socket("socket() failed") }
         defer { close(socketFD) }
@@ -1110,27 +1395,120 @@ final class RouterMappingService: RouterMappingServicing {
         var yes: Int32 = 1
         setsockopt(socketFD, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
 
-        var timeout = timeval(tv_sec: timeoutSeconds, tv_usec: 0)
+        var timeout = timeval(tv_sec: request.timeoutSeconds, tv_usec: 0)
         setsockopt(socketFD, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
 
         var destination = sockaddr_in()
         destination.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
         destination.sin_family = sa_family_t(AF_INET)
-        destination.sin_port = port.bigEndian
-        inet_pton(AF_INET, host, &destination.sin_addr)
+        destination.sin_port = request.port.bigEndian
+        inet_pton(AF_INET, request.host, &destination.sin_addr)
 
+        try sendSSDPPayloads(
+            request.payloads,
+            socketFD: socketFD,
+            destination: &destination
+        )
+        return receiveSSDPResponses(socketFD: socketFD, timeoutSeconds: request.timeoutSeconds)
+    }
+
+    private func udpMulticastSearchIPv6(_ request: UPnPDiscoveryRequest) throws -> [Data] {
+        guard let interfaceName = request.interfaceName else {
+            throw RouterMappingError.protocolFailure(
+                "IPv6 SSDP discovery requires the default route interface"
+            )
+        }
+        let interfaceIndex = if_nametoindex(interfaceName)
+        guard interfaceIndex != 0 else {
+            throw RouterMappingError.socket(
+                "Could not resolve IPv6 SSDP interface \(interfaceName)"
+            )
+        }
+
+        let socketFD = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP)
+        guard socketFD >= 0 else {
+            throw RouterMappingError.socket("IPv6 SSDP socket() failed")
+        }
+        defer { close(socketFD) }
+
+        var yes: Int32 = 1
+        setsockopt(
+            socketFD,
+            SOL_SOCKET,
+            SO_REUSEADDR,
+            &yes,
+            socklen_t(MemoryLayout<Int32>.size)
+        )
+        var multicastInterface = interfaceIndex
+        guard setsockopt(
+            socketFD,
+            IPPROTO_IPV6,
+            IPV6_MULTICAST_IF,
+            &multicastInterface,
+            socklen_t(MemoryLayout<UInt32>.size)
+        ) == 0 else {
+            throw RouterMappingError.socket(
+                "Could not bind IPv6 SSDP to interface \(interfaceName)"
+            )
+        }
+
+        var timeout = timeval(tv_sec: request.timeoutSeconds, tv_usec: 0)
+        setsockopt(
+            socketFD,
+            SOL_SOCKET,
+            SO_RCVTIMEO,
+            &timeout,
+            socklen_t(MemoryLayout<timeval>.size)
+        )
+
+        var destination = sockaddr_in6()
+        destination.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
+        destination.sin6_family = sa_family_t(AF_INET6)
+        destination.sin6_port = request.port.bigEndian
+        destination.sin6_scope_id = interfaceIndex
+        guard inet_pton(AF_INET6, request.host, &destination.sin6_addr) == 1 else {
+            throw RouterMappingError.socket(
+                "Invalid IPv6 SSDP multicast destination \(request.host)"
+            )
+        }
+
+        try sendSSDPPayloads(
+            request.payloads,
+            socketFD: socketFD,
+            destination: &destination
+        )
+        return receiveSSDPResponses(socketFD: socketFD, timeoutSeconds: request.timeoutSeconds)
+    }
+
+    private func sendSSDPPayloads<Address>(
+        _ payloads: [Data],
+        socketFD: Int32,
+        destination: inout Address
+    ) throws {
         for payload in payloads {
             let sent = payload.withUnsafeBytes { bytes -> ssize_t in
                 guard let base = bytes.baseAddress else { return -1 }
                 return withUnsafePointer(to: &destination) {
                     $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                        sendto(socketFD, base, payload.count, 0, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+                        sendto(
+                            socketFD,
+                            base,
+                            payload.count,
+                            0,
+                            $0,
+                            socklen_t(MemoryLayout<Address>.size)
+                        )
                     }
                 }
             }
             guard sent > 0 else { throw RouterMappingError.socket("sendto() failed") }
         }
+    }
 
+    private func receiveSSDPResponses(
+        socketFD: Int32,
+        timeoutSeconds: Int
+    ) -> [Data] {
         var responses: [Data] = []
         let started = Date()
         while Date().timeIntervalSince(started) < Double(timeoutSeconds) {
@@ -1143,6 +1521,13 @@ final class RouterMappingService: RouterMappingServicing {
             }
         }
         return responses
+    }
+
+    private static func ipv6ScopeInterface(in address: String) -> String? {
+        guard let separator = address.firstIndex(of: "%") else { return nil }
+        let interfaceName = address[address.index(after: separator)...]
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return interfaceName.isEmpty ? nil : interfaceName
     }
 
     private func udpRequest(payload: Data, host: String, port: UInt16, timeoutSeconds: Int) throws -> Data {
@@ -1362,14 +1747,20 @@ struct UPnPService {
     let gatewayIdentity: String
     var descriptionURL: URL? = nil
     var deviceIdentity: String? = nil
+    var allowsCrossFamilyControl: Bool = false
 
     func isBound(to gatewayAddress: String) -> Bool {
         let expected = normalizedGatewayIdentity(gatewayAddress)
         guard !expected.isEmpty,
-              normalizedGatewayIdentity(gatewayIdentity) == expected,
-              let controlHost = controlURL.host else {
+              normalizedGatewayIdentity(gatewayIdentity) == expected else {
             return false
         }
+        if allowsCrossFamilyControl {
+            return deviceIdentity.map {
+                !normalizedUPnPDeviceIdentity($0).isEmpty
+            } ?? false
+        }
+        guard let controlHost = controlURL.host else { return false }
         guard normalizedGatewayIdentity(controlHost) == expected else {
             return false
         }
@@ -1406,6 +1797,16 @@ private struct UPnPControlBinding: Codable {
     let gatewayIdentity: String
     let descriptionURL: String
     let deviceIdentity: String
+    let allowsCrossFamilyControl: Bool
+
+    private enum CodingKeys: String, CodingKey {
+        case serviceType
+        case controlURL
+        case gatewayIdentity
+        case descriptionURL
+        case deviceIdentity
+        case allowsCrossFamilyControl
+    }
 
     init(service: UPnPService, gatewayAddress: String) throws {
         guard service.isBound(to: gatewayAddress),
@@ -1421,6 +1822,20 @@ private struct UPnPControlBinding: Codable {
         gatewayIdentity = normalizedGatewayIdentity(gatewayAddress)
         self.descriptionURL = descriptionURL.absoluteString
         self.deviceIdentity = normalizedUPnPDeviceIdentity(deviceIdentity)
+        self.allowsCrossFamilyControl = service.allowsCrossFamilyControl
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        serviceType = try container.decode(String.self, forKey: .serviceType)
+        controlURL = try container.decode(String.self, forKey: .controlURL)
+        gatewayIdentity = try container.decode(String.self, forKey: .gatewayIdentity)
+        descriptionURL = try container.decode(String.self, forKey: .descriptionURL)
+        deviceIdentity = try container.decode(String.self, forKey: .deviceIdentity)
+        allowsCrossFamilyControl = try container.decodeIfPresent(
+            Bool.self,
+            forKey: .allowsCrossFamilyControl
+        ) ?? false
     }
 
     func encoded() throws -> String {
@@ -1609,6 +2024,12 @@ enum RouterMappingError: Error, LocalizedError {
     }
 
     var isIdempotentIPv4UPnPDeletionMiss: Bool {
+        guard isMissingIPv4UPnPMapping else { return false }
+        guard case .upnpFault(let action, _, _, _, _) = self else { return false }
+        return action == "DeletePortMapping"
+    }
+
+    var isMissingIPv4UPnPMapping: Bool {
         guard case .upnpFault(
             let action,
             let serviceType,
@@ -1616,7 +2037,7 @@ enum RouterMappingError: Error, LocalizedError {
             let errorCode,
             let description
         ) = self,
-              action == "DeletePortMapping",
+              action == "DeletePortMapping" || action == "GetSpecificPortMappingEntry",
               serviceType.contains("WANIPConnection")
                 || serviceType.contains("WANPPPConnection") else {
             return false
@@ -1625,6 +2046,11 @@ enum RouterMappingError: Error, LocalizedError {
             return errorCode == 714
         }
         return Self.isNoSuchEntryDescription(description)
+    }
+
+    var isConclusiveUPnPAddRejection: Bool {
+        guard case .upnpFault(let action, _, _, _, _) = self else { return false }
+        return action == "AddPortMapping" || action == "AddPinhole"
     }
 
     var isIdempotentIPv6UPnPDeletionMiss: Bool {

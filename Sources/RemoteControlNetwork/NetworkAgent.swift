@@ -46,6 +46,27 @@ private final class TokenLoadFlight {
     }
 }
 
+final class NetworkAgentScheduledTimer {
+    private let lock = NSLock()
+    private var cancelHandler: (() -> Void)?
+
+    init(cancel: @escaping () -> Void) {
+        cancelHandler = cancel
+    }
+
+    func cancel() {
+        lock.lock()
+        let handler = cancelHandler
+        cancelHandler = nil
+        lock.unlock()
+        handler?()
+    }
+
+    deinit {
+        cancel()
+    }
+}
+
 final class EmergencyMappingJournal {
     typealias DataWriter = (Data, URL) throws -> Void
     typealias DataReader = (URL) throws -> Data
@@ -246,7 +267,13 @@ final class NetworkAgent {
     private let sideEffectsEnabled: Bool
     private let checkExecutionObserver: (() -> Void)?
     private let sideEffectWillStartObserver: ((String) -> Void)?
+    private let nowProvider: () -> Date
+    private let expirationTimerScheduler:
+        (Date, @escaping () -> Void) -> NetworkAgentScheduledTimer
     private var timer: DispatchSourceTimer?
+    private var expirationTimer: NetworkAgentScheduledTimer?
+    private var expirationRetryNotBefore: Date?
+    private var isRunning = false
     private var cachedCloudflareToken: String?
     private var keychainReadFailure: Error?
     private var tokenLoadFlight: TokenLoadFlight?
@@ -297,7 +324,10 @@ final class NetworkAgent {
         routerMappingService: RouterMappingServicing = RouterMappingService(),
         publicIPServiceFactory: ((AppConfig) throws -> PublicIPServicing)? = nil,
         emergencyMappingJournal: EmergencyMappingJournal? = nil,
-        fallbackMappingJournal: EmergencyMappingJournal? = nil
+        fallbackMappingJournal: EmergencyMappingJournal? = nil,
+        nowProvider: @escaping () -> Date = Date.init,
+        expirationTimerScheduler:
+            ((Date, @escaping () -> Void) -> NetworkAgentScheduledTimer)? = nil
     ) {
         let effectiveConfigStore = sideEffectsEnabled ? configStore : AppConfigStore.isolatedTemporary()
         let effectiveEmergencyJournal = emergencyMappingJournal
@@ -309,6 +339,9 @@ final class NetworkAgent {
         self.sideEffectsEnabled = sideEffectsEnabled
         self.checkExecutionObserver = checkExecutionObserver
         self.sideEffectWillStartObserver = sideEffectWillStartObserver
+        self.nowProvider = nowProvider
+        self.expirationTimerScheduler = expirationTimerScheduler
+            ?? Self.scheduleSystemExpirationTimer
         self.localNetworkService = localNetworkService
         self.routerMappingService = routerMappingService
         self.injectedPublicIPServiceFactory = publicIPServiceFactory
@@ -412,7 +445,9 @@ final class NetworkAgent {
         guard sideEffectsEnabled else { return }
         scheduleCheck(retryKeychainAfterFailure: false)
         withState {
+            isRunning = true
             restartTimerOnStateQueue()
+            restartExpirationTimerOnStateQueue()
         }
     }
 
@@ -421,6 +456,10 @@ final class NetworkAgent {
             withState {
                 timer?.cancel()
                 timer = nil
+                expirationTimer?.cancel()
+                expirationTimer = nil
+                expirationRetryNotBefore = nil
+                isRunning = false
                 configRevision &+= 1
                 activeConfigMutationRevision = nil
                 checkPending = false
@@ -686,7 +725,7 @@ final class NetworkAgent {
     func setTemporaryAccess(minutes: Int) {
         var next = config
         next.remoteAccessEnabled = true
-        next.accessExpiresAt = Date().addingTimeInterval(TimeInterval(minutes * 60))
+        next.accessExpiresAt = nowProvider().addingTimeInterval(TimeInterval(minutes * 60))
         saveConfig(next)
     }
 
@@ -931,6 +970,7 @@ final class NetworkAgent {
         }
         withState {
             mappingRecoveryMappings = recovered
+            restartExpirationTimerOnStateQueue()
         }
         return recovered
     }
@@ -1052,6 +1092,7 @@ final class NetworkAgent {
                 withState {
                     mappingRecoveryMappings = report.remainingMappings
                     configPersistenceErrorMessage = nil
+                    restartExpirationTimerOnStateQueue()
                 }
                 let removedIDs = Set(report.succeededMappings.map(\.identifier))
                 workingConfig.activeRouterMappings.removeAll {
@@ -1099,7 +1140,7 @@ final class NetworkAgent {
             }
         }
 
-        if let expiresAt = workingConfig.accessExpiresAt, expiresAt <= Date() {
+        if let expiresAt = workingConfig.accessExpiresAt, expiresAt <= nowProvider() {
             do {
                 workingConfig = try withTransaction {
                     try self.requireCurrentRevision(revision)
@@ -1238,6 +1279,7 @@ final class NetworkAgent {
                     try configStore.saveMappingRecoveryJournal(uncheckpointedMappings)
                     withState {
                         mappingRecoveryMappings = uncheckpointedMappings
+                        restartExpirationTimerOnStateQueue()
                     }
                 }
             next.routerStatus = mapping.status
@@ -1549,7 +1591,7 @@ final class NetworkAgent {
         var ipv4Port: UInt16?
         var ipv6Port: UInt16?
         var activeMappings = config.activeRouterMappings
-        let now = Date()
+        let now = nowProvider()
 
         func removeTrackedMappings(
             _ mappings: [ActiveRouterMapping],
@@ -1593,6 +1635,7 @@ final class NetworkAgent {
                 }) {
                     mappingRecoveryMappings.append(recovery.mapping)
                 }
+                restartExpirationTimerOnStateQueue()
             }
         }
 
@@ -1787,6 +1830,7 @@ final class NetworkAgent {
             }) {
                 mappingRecoveryMappings.append(recovery.mapping)
             }
+            restartExpirationTimerOnStateQueue()
             return mappingRecoveryMappings
         }
 
@@ -1808,6 +1852,7 @@ final class NetworkAgent {
                     mappingRecoveryMappings.removeAll {
                         $0.identifier == recovery.mapping.identifier
                     }
+                    restartExpirationTimerOnStateQueue()
                     return mappingRecoveryMappings
                 }
                 try? configStore.saveMappingRecoveryJournal(remaining)
@@ -2081,6 +2126,7 @@ final class NetworkAgent {
             .joined(separator: "\n")
         withState {
             mappingRecoveryMappings = report.remainingMappings
+            restartExpirationTimerOnStateQueue()
             routerMappingErrorMessage = [recoveryMessage, journalDetail]
                 .filter { !$0.isEmpty }
                 .joined(separator: "\n")
@@ -2094,12 +2140,18 @@ final class NetworkAgent {
         guard previous.remoteAccessEnabled || !previous.activeRouterMappings.isEmpty else {
             return false
         }
+        let temporaryDeadlineRequiresShorterLease = requested.accessExpiresAt.map { deadline in
+            previous.activeRouterMappings.contains {
+                $0.leaseExpiresAt > deadline
+            }
+        } ?? false
         return !requested.remoteAccessEnabled
             || previous.mappingProtocolPreference != requested.mappingProtocolPreference
             || previous.preferredAddressFamily != requested.preferredAddressFamily
             || previous.internalPort != requested.internalPort
             || previous.externalPort != requested.externalPort
             || previous.mappingLeaseSeconds != requested.mappingLeaseSeconds
+            || temporaryDeadlineRequiresShorterLease
     }
 
     private func revokeMappingsBeforeConfigChange(
@@ -2118,7 +2170,7 @@ final class NetworkAgent {
                 revision: expectedRevision,
                 label: "router.mapping.legacy-discovery"
             ) {
-                routerMappingService.legacyRemovalCandidates(
+                try routerMappingService.legacyRemovalCandidates(
                     config: previous,
                     localIPv4: localIPv4,
                     gatewayIPv4: gatewayIPv4,
@@ -2450,6 +2502,137 @@ final class NetworkAgent {
         timer.resume()
     }
 
+    private func restartExpirationTimerOnStateQueue() {
+        expirationTimer?.cancel()
+        expirationTimer = nil
+        guard sideEffectsEnabled, isRunning else { return }
+
+        var deadlines: [Date] = []
+        if storedConfig.remoteAccessEnabled, let accessExpiresAt = storedConfig.accessExpiresAt {
+            deadlines.append(accessExpiresAt)
+        }
+        let recoveryCandidates = storedConfig.activeRouterMappings + mappingRecoveryMappings
+        deadlines.append(
+            contentsOf: recoveryCandidates.compactMap { mapping in
+                guard mapping.addressFamily == .ipv6,
+                      mapping.transport == .upnp,
+                      mapping.pinholeID == nil else {
+                    return nil
+                }
+                return mapping.leaseExpiresAt
+            }
+        )
+        guard let safetyDeadline = deadlines.min() else {
+            expirationRetryNotBefore = nil
+            return
+        }
+
+        let now = nowProvider()
+        let scheduledDeadline: Date
+        if safetyDeadline > now {
+            expirationRetryNotBefore = nil
+            scheduledDeadline = safetyDeadline
+        } else if let expirationRetryNotBefore, expirationRetryNotBefore > now {
+            scheduledDeadline = expirationRetryNotBefore
+        } else {
+            scheduledDeadline = now.addingTimeInterval(0.05)
+        }
+        expirationTimer = expirationTimerScheduler(scheduledDeadline) { [weak self] in
+            self?.handleExpirationTimerFired()
+        }
+    }
+
+    private func handleExpirationTimerFired() {
+        transactionQueue.async {
+            guard self.sideEffectsEnabled else { return }
+            let now = self.nowProvider()
+            self.withState {
+                self.expirationRetryNotBefore = now.addingTimeInterval(30)
+            }
+            let snapshot = self.config
+            if snapshot.remoteAccessEnabled,
+               let expiresAt = snapshot.accessExpiresAt,
+               expiresAt <= now {
+                self.expireTemporaryAccessOnTransactionQueue(
+                    expectedExpiration: expiresAt,
+                    now: now
+                )
+            } else {
+                self.scheduleCheck(retryKeychainAfterFailure: false)
+            }
+            self.withState {
+                self.restartExpirationTimerOnStateQueue()
+            }
+        }
+    }
+
+    private func expireTemporaryAccessOnTransactionQueue(
+        expectedExpiration: Date,
+        now: Date
+    ) {
+        let mutationRevision = beginConfigMutation()
+        defer { endConfigMutation(mutationRevision) }
+        var previousConfig = config
+        guard previousConfig.remoteAccessEnabled,
+              let currentExpiration = previousConfig.accessExpiresAt,
+              currentExpiration == expectedExpiration,
+              currentExpiration <= now else {
+            return
+        }
+
+        var expiredConfig = previousConfig
+        do {
+            if mappingLifecycleChanged(from: previousConfig, to: {
+                var disabled = previousConfig
+                disabled.remoteAccessEnabled = false
+                disabled.accessExpiresAt = nil
+                return disabled
+            }()) {
+                previousConfig = try revokeMappingsBeforeConfigChange(
+                    previousConfig,
+                    expectedRevision: mutationRevision
+                )
+            }
+            expiredConfig = previousConfig
+            expiredConfig.remoteAccessEnabled = false
+            expiredConfig.accessExpiresAt = nil
+            expiredConfig.activeRouterMappings = []
+            expiredConfig.ipv6PinholeID = nil
+            try persistConfigOnly(
+                expiredConfig,
+                previousConfig: previousConfig,
+                expectedRevision: mutationRevision
+            )
+            try finishConfigCommit(
+                expiredConfig,
+                previousConfig: previousConfig,
+                expectedRevision: mutationRevision
+            )
+        } catch {
+            guard !isSuperseded(error) else { return }
+            publishPersistenceFailure(error, rollbackConfig: previousConfig)
+        }
+    }
+
+    private static func scheduleSystemExpirationTimer(
+        deadline: Date,
+        handler: @escaping () -> Void
+    ) -> NetworkAgentScheduledTimer {
+        let source = DispatchSource.makeTimerSource(
+            queue: DispatchQueue.global(qos: .utility)
+        )
+        source.schedule(
+            deadline: .now() + max(0, deadline.timeIntervalSinceNow),
+            leeway: .milliseconds(100)
+        )
+        source.setEventHandler(handler: handler)
+        source.resume()
+        return NetworkAgentScheduledTimer {
+            source.setEventHandler {}
+            source.cancel()
+        }
+    }
+
     private func persistConfigOnly(
         _ newConfig: AppConfig,
         previousConfig: AppConfig,
@@ -2554,6 +2737,7 @@ final class NetworkAgent {
             configRevision &+= 1
         }
         notifyConfigChangedOnStateQueue(normalized)
+        restartExpirationTimerOnStateQueue()
     }
 
     private func applyMappingCheckpointOnStateQueue(_ checkpoint: AppConfig) {
@@ -2561,6 +2745,7 @@ final class NetworkAgent {
         storedConfig.ipv6PinholeID = checkpoint.ipv6PinholeID
         storedConfig.pcpNonce = checkpoint.pcpNonce
         notifyConfigChangedOnStateQueue(storedConfig)
+        restartExpirationTimerOnStateQueue()
     }
 
     private func notifyConfigChangedOnStateQueue(_ config: AppConfig) {

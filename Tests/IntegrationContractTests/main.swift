@@ -38,6 +38,28 @@ final class LockedCounter {
     }
 }
 
+final class LockedClock {
+    private let lock = NSLock()
+    private var value: Date
+
+    init(_ value: Date) {
+        self.value = value
+    }
+
+    func now() -> Date {
+        lock.lock()
+        let result = value
+        lock.unlock()
+        return result
+    }
+
+    func set(_ value: Date) {
+        lock.lock()
+        self.value = value
+        lock.unlock()
+    }
+}
+
 struct SimulatedRouterFailure: Error, LocalizedError {
     let operation: String
 
@@ -1848,6 +1870,156 @@ func testTemporaryAccessExpiryDoesNotHideCleanupFailure() throws {
     agent.stop()
 }
 
+func testTemporaryAccessUsesIndependentExpirationTimer() throws {
+    let baseDirectory = try makeTemporaryDirectory(named: "independent-expiration")
+    defer { try? FileManager.default.removeItem(at: baseDirectory) }
+
+    let clock = LockedClock(Date(timeIntervalSince1970: 2_000_200_000))
+    let expiresAt = clock.now().addingTimeInterval(30 * 60)
+    let mapping = activeMappingFixture(
+        transport: .pcp,
+        family: .ipv4,
+        renewAfter: clock.now().addingTimeInterval(15 * 60),
+        leaseExpiresAt: expiresAt
+    )
+    var config = AppConfig.default
+    config.remoteAccessEnabled = true
+    config.dnsProvider = .disabled
+    config.preferredAddressFamily = .ipv4
+    config.mappingProtocolPreference = .pcp
+    config.externalPort = mapping.externalPort
+    config.pcpNonce = mapping.pcpNonce
+    config.activeRouterMappings = [mapping]
+    config.accessExpiresAt = expiresAt
+    config.checkIntervalSeconds = 86_400
+
+    let scheduleLock = NSLock()
+    var scheduledDeadlines: [Date] = []
+    var scheduledHandlers: [() -> Void] = []
+    let router = MockRouterMappingService()
+    let agent = NetworkAgent(
+        configStore: AppConfigStore(baseDirectory: baseDirectory),
+        keychain: inMemoryKeychain(),
+        initialConfig: config,
+        localNetworkService: MockLocalNetworkService(),
+        routerMappingService: router,
+        nowProvider: { clock.now() },
+        expirationTimerScheduler: { deadline, handler in
+            scheduleLock.lock()
+            scheduledDeadlines.append(deadline)
+            scheduledHandlers.append(handler)
+            scheduleLock.unlock()
+            return NetworkAgentScheduledTimer {}
+        }
+    )
+
+    agent.start()
+    try expect(
+        waitUntil { agent.status.lastCheckedAt != nil },
+        "The initial check must complete before the independent expiration fires"
+    )
+    scheduleLock.lock()
+    let initialDeadline = scheduledDeadlines.last
+    let expirationHandler = scheduledHandlers.last
+    scheduleLock.unlock()
+    try expect(
+        initialDeadline == expiresAt,
+        "A 24-hour check interval must still arm the exact 30-minute access deadline"
+    )
+    guard let expirationHandler else {
+        throw IntegrationContractFailure("The independent expiration handler was not scheduled")
+    }
+
+    clock.set(expiresAt)
+    expirationHandler()
+    try expect(
+        waitUntil {
+            !agent.config.remoteAccessEnabled
+                && agent.config.accessExpiresAt == nil
+                && agent.config.activeRouterMappings.isEmpty
+        },
+        "The independent timer must revoke the mapping and disable access at 30 minutes"
+    )
+    try expect(
+        router.removalCalls == [mapping],
+        "The expiration timer must remove the tracked router mapping exactly once"
+    )
+    try expect(
+        agent.config.checkIntervalSeconds == 86_400,
+        "Expiration must not depend on or rewrite the periodic check interval"
+    )
+    agent.stop()
+}
+
+func testTemporaryAccessRevokesAnExistingOverlongLease() throws {
+    let baseDirectory = try makeTemporaryDirectory(named: "temporary-lease-shortening")
+    defer { try? FileManager.default.removeItem(at: baseDirectory) }
+
+    let now = Date()
+    let overlong = activeMappingFixture(
+        transport: .pcp,
+        family: .ipv4,
+        renewAfter: now.addingTimeInterval(3600),
+        leaseExpiresAt: now.addingTimeInterval(7200)
+    )
+    var config = AppConfig.default
+    config.remoteAccessEnabled = true
+    config.dnsProvider = .disabled
+    config.preferredAddressFamily = .ipv4
+    config.mappingProtocolPreference = .pcp
+    config.externalPort = overlong.externalPort
+    config.pcpNonce = overlong.pcpNonce
+    config.activeRouterMappings = [overlong]
+
+    let router = MockRouterMappingService()
+    let eventLock = NSLock()
+    var events: [String] = []
+    let agent = NetworkAgent(
+        configStore: AppConfigStore(baseDirectory: baseDirectory),
+        keychain: inMemoryKeychain(),
+        initialConfig: config,
+        sideEffectWillStartObserver: { label in
+            eventLock.lock()
+            events.append(label)
+            eventLock.unlock()
+        },
+        localNetworkService: MockLocalNetworkService(),
+        routerMappingService: router
+    )
+    agent.start()
+    try expect(
+        waitUntil { agent.status.lastCheckedAt != nil },
+        "The baseline mapping check must finish before temporary access is requested"
+    )
+    eventLock.lock()
+    events.removeAll()
+    eventLock.unlock()
+
+    agent.setTemporaryAccess(minutes: 30)
+    try expect(
+        waitUntil {
+            router.removalCalls.contains(overlong)
+                && agent.config.accessExpiresAt != nil
+                && router.ensureCalls.contains(.ipv4)
+        },
+        "Switching to temporary access must delete the overlong lease before creating its bounded replacement"
+    )
+    eventLock.lock()
+    let observedEvents = events
+    eventLock.unlock()
+    guard let deleteIndex = observedEvents.firstIndex(of: "router.mapping.config-delete"),
+          let createIndex = observedEvents.firstIndex(of: "router.mapping.create") else {
+        throw IntegrationContractFailure(
+            "Expected config-delete and bounded replacement creation events"
+        )
+    }
+    try expect(
+        deleteIndex < createIndex,
+        "The old overlong lease must be revoked before a temporary replacement is created"
+    )
+    agent.stop()
+}
+
 func testMappingRenewalWindowAndAddressChangeReconciliation() throws {
     func runCheck(with mapping: ActiveRouterMapping, router: MockRouterMappingService) throws -> NetworkAgent {
         let baseDirectory = try makeTemporaryDirectory(named: "mapping-renewal-\(UUID().uuidString)")
@@ -2546,6 +2718,8 @@ let tests: [(String, () throws -> Void)] = [
     ("mapping identity transaction", testMappingIdentityChangeMustDeleteOldRuleFirst),
     ("post-cleanup persistence truth", testPostCleanupPersistenceFailureKeepsTruthfulMappingState),
     ("temporary access cleanup retry", testTemporaryAccessExpiryDoesNotHideCleanupFailure),
+    ("independent temporary access expiration", testTemporaryAccessUsesIndependentExpirationTimer),
+    ("temporary access shortens existing router lease", testTemporaryAccessRevokesAnExistingOverlongLease),
     ("mapping renewal and address reconciliation", testMappingRenewalWindowAndAddressChangeReconciliation),
     ("mapping checkpoint compensation", testMappingCreationIsCompensatedWhenCheckpointWriteFails),
     ("mapping recovery journal", testFailedMappingCompensationPersistsAndRecoversJournal),
