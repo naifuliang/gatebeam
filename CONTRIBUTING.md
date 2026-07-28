@@ -34,10 +34,12 @@ Run the complete suite before requesting final review:
 ./scripts/test_backend.sh
 ./scripts/test_proxy_policy.sh
 ./scripts/test_integration_contract.sh
+./scripts/test_integration_tsan.sh
 ./scripts/test_keychain_identity.sh
 ./scripts/test_upgrade.sh
 ./scripts/test_ui_validation.sh
 ./scripts/test_build_assets.sh
+./scripts/test_release_pipeline.sh
 ./scripts/test_privacy.sh
 ./scripts/build_app.sh
 codesign --verify --deep --strict ./dist/Gatebeam.app

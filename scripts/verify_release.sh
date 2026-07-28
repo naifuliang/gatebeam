@@ -14,7 +14,7 @@ fail() {
 
 usage() {
   print -u2 -- \
-    "Usage: $(basename "$0") <app-signature|app-stapled|pkg-signature|pkg-stapled|dmg-signature|dmg-stapled> <path> <version> <bundle-id> <team-id>"
+    "Usage: $(basename "$0") <app-signature|app-stapled|pkg-signature|pkg-stapled|dmg-signature|dmg-stapled> <path> <version> <build-version> <bundle-id> <team-id>"
   exit 64
 }
 
@@ -48,16 +48,19 @@ tool_path() {
   print -r -- "$candidate"
 }
 
-[[ $# -eq 5 ]] || usage
+[[ $# -eq 6 ]] || usage
 
 MODE="$1"
 ARTIFACT_PATH="$2"
 EXPECTED_VERSION="$3"
-EXPECTED_BUNDLE_ID="$4"
-EXPECTED_TEAM_ID="$5"
+EXPECTED_BUILD_VERSION="$4"
+EXPECTED_BUNDLE_ID="$5"
+EXPECTED_TEAM_ID="$6"
 
 [[ "$EXPECTED_VERSION" =~ '^[0-9]+([.][0-9]+){2}([-.][A-Za-z0-9.]+)?$' ]] ||
   fail "invalid expected version"
+[[ "$EXPECTED_BUILD_VERSION" =~ '^[1-9][0-9]*$' ]] ||
+  fail "invalid expected build version"
 [[ "$EXPECTED_BUNDLE_ID" == "io.github.naifuliang.gatebeam" ]] ||
   fail "unexpected Gatebeam bundle identifier"
 [[ "$EXPECTED_TEAM_ID" =~ '^[A-Z0-9]{10}$' ]] ||
@@ -79,6 +82,7 @@ verify_app_signature() {
   local executable_name
   local actual_bundle_id
   local actual_version
+  local actual_build_version
   local actual_team_id
   local designated_requirement
   local signing_details
@@ -98,6 +102,9 @@ verify_app_signature() {
   actual_version="$(
     /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist_path"
   )" || fail "could not read application version"
+  actual_build_version="$(
+    /usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$plist_path"
+  )" || fail "could not read application build version"
   actual_team_id="$(
     /usr/libexec/PlistBuddy -c 'Print :GatebeamDeveloperTeamIdentifier' "$plist_path"
   )" || fail "application does not record its release Team ID"
@@ -109,6 +116,9 @@ verify_app_signature() {
     fail "application bundle identifier does not match the release contract"
   [[ "$actual_version" == "$EXPECTED_VERSION" ]] ||
     fail "application version does not match the release contract"
+  [[ "$actual_build_version" =~ '^[1-9][0-9]*$' &&
+      "$actual_build_version" == "$EXPECTED_BUILD_VERSION" ]] ||
+    fail "application build version does not match the release contract"
   [[ "$actual_team_id" == "$EXPECTED_TEAM_ID" ]] ||
     fail "application Team ID does not match the release contract"
   [[ "$executable_name" == "Gatebeam" ]] ||

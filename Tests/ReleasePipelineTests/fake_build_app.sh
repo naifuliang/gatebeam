@@ -12,6 +12,11 @@ if [[ -n "${GATEBEAM_FAKE_APP_VERSION:-}" ]]; then
     -c "Set :CFBundleShortVersionString $GATEBEAM_FAKE_APP_VERSION" \
     "$PLIST_PATH"
 fi
+if [[ -n "${GATEBEAM_FAKE_APP_BUILD_VERSION:-}" ]]; then
+  /usr/libexec/PlistBuddy \
+    -c "Set :CFBundleVersion $GATEBEAM_FAKE_APP_BUILD_VERSION" \
+    "$PLIST_PATH"
+fi
 if [[ -n "${GATEBEAM_FAKE_APP_BUNDLE_ID:-}" ]]; then
   /usr/libexec/PlistBuddy \
     -c "Set :CFBundleIdentifier $GATEBEAM_FAKE_APP_BUNDLE_ID" \

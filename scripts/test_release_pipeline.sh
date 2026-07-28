@@ -50,7 +50,7 @@ new_fixture() {
     "$tool_dir/.gatebeam-release-test-fixture"
   chmod +x "$fixture/scripts/"*.sh "$tool_dir/release-tool"
 
-  for tool in codesign ditto hdiutil pkgutil productsign spctl xcrun; do
+  for tool in codesign ditto hdiutil lipo pkgutil productsign spctl xcrun; do
     cp "$tool_dir/release-tool" "$tool_dir/$tool"
   done
 
@@ -64,16 +64,31 @@ new_fixture() {
     -c 'Add :CFBundleShortVersionString string 0.5.0' \
     "$fixture/Resources/Info.plist" >/dev/null
   /usr/libexec/PlistBuddy \
+    -c 'Add :CFBundleVersion string 5' \
+    "$fixture/Resources/Info.plist" >/dev/null
+  /usr/libexec/PlistBuddy \
     -c 'Add :CFBundleExecutable string Gatebeam' \
+    "$fixture/Resources/Info.plist" >/dev/null
+  /usr/libexec/PlistBuddy \
+    -c 'Add :LSMinimumSystemVersion string 13.0' \
     "$fixture/Resources/Info.plist" >/dev/null
 
   print -r -- $'dist/\nbuild/\ncalls.log\ntest-output.log' >"$fixture/.gitignore"
-  /usr/bin/git -C "$fixture" init -q
+  /usr/bin/git -C "$fixture" init -q -b main
   /usr/bin/git -C "$fixture" config user.name "Gatebeam Release Tests"
   /usr/bin/git -C "$fixture" config user.email "release-tests@invalid"
   /usr/bin/git -C "$fixture" add .
   /usr/bin/git -C "$fixture" commit -qm "fixture"
-  /usr/bin/git -C "$fixture" tag v0.5.0
+  /usr/bin/git -C "$fixture" checkout -qb release-parent
+  print -r -- "release parent" >"$fixture/.fixture-release-parent"
+  /usr/bin/git -C "$fixture" add .fixture-release-parent
+  /usr/bin/git -C "$fixture" commit -qm "release parent"
+  /usr/bin/git -C "$fixture" checkout -q main
+  print -r -- "main parent" >"$fixture/.fixture-main-parent"
+  /usr/bin/git -C "$fixture" add .fixture-main-parent
+  /usr/bin/git -C "$fixture" commit -qm "main parent"
+  /usr/bin/git -C "$fixture" merge -q --no-ff release-parent -m "merge release"
+  /usr/bin/git -C "$fixture" tag -a v0.5.0 -m "Gatebeam 0.5.0"
 
   print -r -- "$fixture"
 }
@@ -88,6 +103,11 @@ run_release() {
     GATEBEAM_DEVELOPER_TEAM_ID="ABCDE12345" \
     GATEBEAM_INSTALLER_SIGN_IDENTITY="Developer ID Installer: Gatebeam Tests (ABCDE12345)" \
     GATEBEAM_NOTARY_PROFILE="fixture profile" \
+    GATEBEAM_PREVIOUS_PUBLIC_BUILD_VERSION=4 \
+    GATEBEAM_RELEASE_TEST_EVIDENCE_URL="https://github.com/gatebeam-tests/gatebeam/actions/runs/123456" \
+    GATEBEAM_RELEASE_CLEAN_MACHINE_EVIDENCE_URL="https://github.com/gatebeam-tests/gatebeam/actions/runs/123457" \
+    GATEBEAM_RELEASE_ROLLBACK_VERSION=0.4.0 \
+    GATEBEAM_RELEASE_ROLLBACK_URL="https://github.com/gatebeam-tests/gatebeam/releases/tag/v0.4.0" \
     GATEBEAM_RELEASE_TEST_MODE=1 \
     GATEBEAM_RELEASE_TEST_TOOL_DIR="$tool_dir" \
     GATEBEAM_FAKE_CALL_LOG="$fixture/calls.log" \
@@ -182,6 +202,150 @@ test_tag_mismatch() {
     "v0.5.0 does not point exactly to HEAD"
 }
 
+test_annotated_tag_required() {
+  local fixture
+  fixture="$(new_fixture lightweight-tag)"
+  /usr/bin/git -C "$fixture" tag -d v0.5.0 >/dev/null
+  /usr/bin/git -C "$fixture" tag v0.5.0
+  expect_failure \
+    "lightweight release tag" \
+    "$fixture" \
+    "v0.5.0 must be an annotated tag"
+}
+
+test_two_parent_merge_required() {
+  local fixture
+
+  fixture="$(new_fixture non-merge-head)"
+  print -r -- "ordinary commit" >"$fixture/ordinary-commit"
+  /usr/bin/git -C "$fixture" add ordinary-commit
+  /usr/bin/git -C "$fixture" commit -qm "ordinary commit"
+  /usr/bin/git -C "$fixture" tag -fa v0.5.0 -m "retag fixture"
+  expect_failure \
+    "non-merge release HEAD" \
+    "$fixture" \
+    "formal release HEAD must be a standard merge commit with exactly two parents"
+
+  fixture="$(new_fixture octopus-merge-head)"
+  /usr/bin/git -C "$fixture" checkout -qb octopus-one
+  print -r -- "one" >"$fixture/octopus-one"
+  /usr/bin/git -C "$fixture" add octopus-one
+  /usr/bin/git -C "$fixture" commit -qm "octopus one"
+  /usr/bin/git -C "$fixture" checkout -q main
+  /usr/bin/git -C "$fixture" checkout -qb octopus-two
+  print -r -- "two" >"$fixture/octopus-two"
+  /usr/bin/git -C "$fixture" add octopus-two
+  /usr/bin/git -C "$fixture" commit -qm "octopus two"
+  /usr/bin/git -C "$fixture" checkout -q main
+  /usr/bin/git -C "$fixture" merge -q --no-ff octopus-one octopus-two \
+    -m "octopus release"
+  /usr/bin/git -C "$fixture" tag -fa v0.5.0 -m "retag fixture"
+  expect_failure \
+    "octopus release HEAD" \
+    "$fixture" \
+    "formal release HEAD must be a standard merge commit with exactly two parents"
+}
+
+test_release_metadata_inputs() {
+  local fixture
+
+  fixture="$(new_fixture missing-previous-build)"
+  expect_failure \
+    "missing previous public build" \
+    "$fixture" \
+    "GATEBEAM_PREVIOUS_PUBLIC_BUILD_VERSION is required" \
+    GATEBEAM_PREVIOUS_PUBLIC_BUILD_VERSION=
+
+  fixture="$(new_fixture unsafe-previous-build)"
+  expect_failure \
+    "unsafe previous public build" \
+    "$fixture" \
+    "must be a positive decimal integer without leading zeroes" \
+    GATEBEAM_PREVIOUS_PUBLIC_BUILD_VERSION=04
+
+  fixture="$(new_fixture missing-test-evidence)"
+  expect_failure \
+    "missing release test evidence" \
+    "$fixture" \
+    "GATEBEAM_RELEASE_TEST_EVIDENCE_URL is required" \
+    GATEBEAM_RELEASE_TEST_EVIDENCE_URL=
+
+  fixture="$(new_fixture unsafe-test-evidence)"
+  expect_failure \
+    "unsafe release test evidence" \
+    "$fixture" \
+    "must be an immutable GitHub Actions run URL" \
+    GATEBEAM_RELEASE_TEST_EVIDENCE_URL="https://user:secret""@github.com/gatebeam-tests/gatebeam/actions/runs/1"
+
+  fixture="$(new_fixture missing-clean-machine-evidence)"
+  expect_failure \
+    "missing clean-machine evidence" \
+    "$fixture" \
+    "GATEBEAM_RELEASE_CLEAN_MACHINE_EVIDENCE_URL is required" \
+    GATEBEAM_RELEASE_CLEAN_MACHINE_EVIDENCE_URL=
+
+  fixture="$(new_fixture unsafe-clean-machine-evidence)"
+  expect_failure \
+    "unsafe clean-machine evidence" \
+    "$fixture" \
+    "GATEBEAM_RELEASE_CLEAN_MACHINE_EVIDENCE_URL must be an immutable GitHub Actions run URL" \
+    GATEBEAM_RELEASE_CLEAN_MACHINE_EVIDENCE_URL="https://github.com/gatebeam-tests/gatebeam/actions/runs/latest"
+
+  fixture="$(new_fixture missing-rollback-version)"
+  expect_failure \
+    "missing rollback version" \
+    "$fixture" \
+    "GATEBEAM_RELEASE_ROLLBACK_VERSION is required" \
+    GATEBEAM_RELEASE_ROLLBACK_VERSION=
+
+  fixture="$(new_fixture unsafe-rollback-version)"
+  expect_failure \
+    "unsafe rollback version" \
+    "$fixture" \
+    "must be a safe version different from the release" \
+    GATEBEAM_RELEASE_ROLLBACK_VERSION=0.5.0 \
+    GATEBEAM_RELEASE_ROLLBACK_URL="https://github.com/gatebeam-tests/gatebeam/releases/tag/v0.5.0"
+
+  fixture="$(new_fixture missing-rollback-url)"
+  expect_failure \
+    "missing rollback URL" \
+    "$fixture" \
+    "GATEBEAM_RELEASE_ROLLBACK_URL is required" \
+    GATEBEAM_RELEASE_ROLLBACK_URL=
+
+  fixture="$(new_fixture unsafe-rollback-url)"
+  expect_failure \
+    "unsafe rollback URL" \
+    "$fixture" \
+    "must be an immutable GitHub release tag URL" \
+    GATEBEAM_RELEASE_ROLLBACK_URL="https://github.com/gatebeam-tests/gatebeam/releases/latest?token=secret"
+
+  fixture="$(new_fixture unsafe-notary-profile)"
+  expect_failure \
+    "unsafe notary profile" \
+    "$fixture" \
+    "GATEBEAM_NOTARY_PROFILE is invalid" \
+    GATEBEAM_NOTARY_PROFILE="--fixture-profile"
+}
+
+test_build_version_contract() {
+  local fixture
+
+  fixture="$(new_fixture non-increasing-build)"
+  expect_failure \
+    "non-increasing application build version" \
+    "$fixture" \
+    "must be greater than GATEBEAM_PREVIOUS_PUBLIC_BUILD_VERSION" \
+    GATEBEAM_PREVIOUS_PUBLIC_BUILD_VERSION=5
+
+  fixture="$(new_fixture unsafe-built-build-version)"
+  expect_failure \
+    "unsafe built application build version" \
+    "$fixture" \
+    "built application CFBundleVersion must be a positive decimal integer without leading zeroes" \
+    GATEBEAM_FAKE_APP_BUILD_VERSION=05
+}
+
 test_wrong_identity() {
   local fixture
   local output
@@ -193,6 +357,11 @@ test_wrong_identity() {
     GATEBEAM_DEVELOPER_TEAM_ID="ABCDE12345" \
     GATEBEAM_INSTALLER_SIGN_IDENTITY="Developer ID Installer: Gatebeam Tests (ABCDE12345)" \
     GATEBEAM_NOTARY_PROFILE="fixture profile" \
+    GATEBEAM_PREVIOUS_PUBLIC_BUILD_VERSION=4 \
+    GATEBEAM_RELEASE_TEST_EVIDENCE_URL="https://github.com/gatebeam-tests/gatebeam/actions/runs/123456" \
+    GATEBEAM_RELEASE_CLEAN_MACHINE_EVIDENCE_URL="https://github.com/gatebeam-tests/gatebeam/actions/runs/123457" \
+    GATEBEAM_RELEASE_ROLLBACK_VERSION=0.4.0 \
+    GATEBEAM_RELEASE_ROLLBACK_URL="https://github.com/gatebeam-tests/gatebeam/releases/tag/v0.4.0" \
     GATEBEAM_RELEASE_TEST_MODE=1 \
     GATEBEAM_RELEASE_TEST_TOOL_DIR="$fixture/fake tools" \
     /bin/zsh -f "$fixture/scripts/release_formal.sh" >"$output" 2>&1; then
@@ -326,6 +495,42 @@ test_staple_failure() {
     "$fixture" \
     "could not staple the application" \
     GATEBEAM_FAKE_FAIL_STAPLE=app
+}
+
+test_stapler_state_validation() {
+  local fixture
+  local fake_xcrun
+  local unstapled_pkg
+
+  fixture="$(new_fixture stapler-wrong-path)"
+  fake_xcrun="$fixture/fake tools/xcrun"
+  if env \
+       GATEBEAM_FAKE_CALL_LOG="$fixture/calls.log" \
+       "$fake_xcrun" stapler validate "$fixture/dist/missing.pkg" \
+       >"$fixture/test-output.log" 2>&1; then
+    fail_test "fake stapler accepted a missing validation path"
+  else
+    pass "fake stapler rejects a missing validation path"
+  fi
+
+  fixture="$(new_fixture stapler-unstapled)"
+  unstapled_pkg="$fixture/unstapled.pkg"
+  print -r -- "not stapled" >"$unstapled_pkg"
+  if env \
+       GATEBEAM_FAKE_CALL_LOG="$fixture/calls.log" \
+       "$fixture/fake tools/xcrun" stapler validate "$unstapled_pkg" \
+       >"$fixture/test-output.log" 2>&1; then
+    fail_test "fake stapler accepted an unstapled artifact"
+  else
+    pass "fake stapler rejects an unstapled artifact"
+  fi
+
+  fixture="$(new_fixture stapler-missing-state)"
+  expect_failure \
+    "release rejects missing staple state" \
+    "$fixture" \
+    "application notarization ticket validation failed" \
+    GATEBEAM_FAKE_STAPLE_WITHOUT_STATE=app
 }
 
 test_gatekeeper_failure() {
@@ -500,6 +705,9 @@ test_success_and_order() {
   local actual_order
   local expected_order
   local manifest_app_submission_key="notarization"".app"".submissionId"
+  local manifest_app_status_key="notarization"".app"".status"
+  local manifest_pkg_status_key="notarization"".pkg"".status"
+  local manifest_dmg_status_key="notarization"".dmg"".status"
   fixture="$(new_fixture success-order)"
   release_dir="$fixture/dist/release-0.5.0"
 
@@ -557,10 +765,48 @@ test_success_and_order() {
 
   manifest="$release_dir/release-manifest.json"
   [[ "$(/usr/bin/plutil -extract version raw -o - "$manifest")" == "0.5.0" &&
+      "$(/usr/bin/plutil -extract buildVersion raw -o - "$manifest")" == "5" &&
+      "$(/usr/bin/plutil -extract previousPublicBuildVersion raw -o - "$manifest")" == "4" &&
       "$(/usr/bin/plutil -extract bundleIdentifier raw -o - "$manifest")" == "io.github.naifuliang.gatebeam" &&
       "$(/usr/bin/plutil -extract teamIdentifier raw -o - "$manifest")" == "ABCDE12345" &&
-      "$(/usr/bin/plutil -extract "$manifest_app_submission_key" raw -o - "$manifest")" == "11111111-1111-1111-1111-111111111111" ]] || {
+      "$(/usr/bin/plutil -extract "$manifest_app_submission_key" raw -o - "$manifest")" == "11111111-1111-1111-1111-111111111111" &&
+      "$(/usr/bin/plutil -extract "$manifest_app_status_key" raw -o - "$manifest")" == "Accepted" &&
+      "$(/usr/bin/plutil -extract "$manifest_pkg_status_key" raw -o - "$manifest")" == "Accepted" &&
+      "$(/usr/bin/plutil -extract "$manifest_dmg_status_key" raw -o - "$manifest")" == "Accepted" &&
+      "$(/usr/bin/plutil -extract testing.evidenceURL raw -o - "$manifest")" == "https://github.com/gatebeam-tests/gatebeam/actions/runs/123456" &&
+      "$(/usr/bin/plutil -extract testing.cleanMachineEvidenceURL raw -o - "$manifest")" == "https://github.com/gatebeam-tests/gatebeam/actions/runs/123457" &&
+      "$(/usr/bin/plutil -extract rollback.version raw -o - "$manifest")" == "0.4.0" &&
+      "$(/usr/bin/plutil -extract rollback.releaseURL raw -o - "$manifest")" == "https://github.com/gatebeam-tests/gatebeam/releases/tag/v0.4.0" &&
+      "$(/usr/bin/plutil -extract platform.name raw -o - "$manifest")" == "macOS" &&
+      "$(/usr/bin/plutil -extract platform.supportedMacOSVersionRange raw -o - "$manifest")" == "13.0 or later" &&
+      "$(/usr/bin/plutil -extract testing.status raw -o - "$manifest")" == "Passed" &&
+      "$(/usr/bin/plutil -extract testing.cleanMachineStatus raw -o - "$manifest")" == "Passed" &&
+      -n "$(/usr/bin/plutil -extract toolchain.xcodeVersion raw -o - "$manifest")" &&
+      -n "$(/usr/bin/plutil -extract toolchain.swiftVersion raw -o - "$manifest")" ]] || {
     fail_test "successful release manifest is incomplete"
+    return
+  }
+  [[ "$(/usr/bin/plutil -extract platform.supportedArchitectures.0 raw -o - "$manifest")" == "arm64" ]] || {
+    fail_test "successful release manifest omitted built application architectures"
+    return
+  }
+  local manifest_parent_one
+  local manifest_parent_two
+  manifest_parent_one="$(
+    /usr/bin/plutil -extract source.mergeParents.0 raw -o - "$manifest"
+  )"
+  manifest_parent_two="$(
+    /usr/bin/plutil -extract source.mergeParents.1 raw -o - "$manifest"
+  )"
+  [[ "$manifest_parent_one" =~ '^[0-9a-f]{40,64}$' &&
+      "$manifest_parent_two" =~ '^[0-9a-f]{40,64}$' &&
+      "$manifest_parent_one" != "$manifest_parent_two" ]] || {
+    fail_test "successful release manifest omitted merge parents"
+    return
+  }
+  [[ "$(/usr/bin/plutil -extract testing.gates.3 raw -o - "$manifest")" == "test_integration_tsan" &&
+      "$(/usr/bin/plutil -extract testing.gates.8 raw -o - "$manifest")" == "test_release_pipeline" ]] || {
+    fail_test "successful release manifest omitted required gate evidence"
     return
   }
   if /usr/bin/grep -Fq "fixture profile" "$manifest" "$release_dir"/notary-logs/*.json; then
@@ -571,6 +817,10 @@ test_success_and_order() {
   local artifact_name
   local expected_sha
   local manifest_sha
+  local expected_byte_count
+  local manifest_byte_count
+  local certificate_name
+  local certificate_sha256
   for index in 0 1 2; do
     artifact_name="$(
       /usr/bin/plutil -extract "artifacts.$index.name" raw -o - "$manifest"
@@ -578,22 +828,35 @@ test_success_and_order() {
     manifest_sha="$(
       /usr/bin/plutil -extract "artifacts.$index.sha256" raw -o - "$manifest"
     )"
+    manifest_byte_count="$(
+      /usr/bin/plutil -extract "artifacts.$index.byteCount" raw -o - "$manifest"
+    )"
+    certificate_name="$(
+      /usr/bin/plutil -extract "artifacts.$index.signingCertificateName" raw -o - "$manifest"
+    )"
+    certificate_sha256="$(
+      /usr/bin/plutil -extract "artifacts.$index.signingCertificateSHA256" raw -o - "$manifest"
+    )"
     expected_sha="$(
       /usr/bin/shasum -a 256 "$release_dir/$artifact_name" |
         /usr/bin/awk '{print $1}'
     )"
-    [[ "$manifest_sha" == "$expected_sha" ]] || {
-      fail_test "manifest checksum does not describe final stapled bytes"
+    expected_byte_count="$(/usr/bin/stat -f '%z' "$release_dir/$artifact_name")"
+    [[ "$manifest_sha" == "$expected_sha" &&
+        "$manifest_byte_count" == "$expected_byte_count" &&
+        "$certificate_name" == "Developer ID "* &&
+        "$certificate_sha256" =~ '^[0-9A-Fa-f]{64}$' ]] || {
+      fail_test "manifest artifact audit metadata does not describe final stapled bytes"
       return
     }
   done
 
   actual_order="$(
     /usr/bin/grep -E \
-      '^(build_app|notarytool submit (app|pkg|dmg)|stapler staple (app|pkg|dmg)|package_(pkg|dmg)|productsign|codesign dmg)$' \
+      '^(build_app|notarytool submit (app|pkg|dmg)|stapler (staple|validate) (app|pkg|dmg)|package_(pkg|dmg)|productsign|codesign dmg)$' \
       "$fixture/calls.log"
   )"
-  expected_order=$'build_app\nnotarytool submit app\nstapler staple app\npackage_pkg\nproductsign\nnotarytool submit pkg\nstapler staple pkg\npackage_dmg\ncodesign dmg\nnotarytool submit dmg\nstapler staple dmg'
+  expected_order=$'build_app\nnotarytool submit app\nstapler staple app\nstapler validate app\npackage_pkg\nstapler validate app\nproductsign\nnotarytool submit pkg\nstapler staple pkg\nstapler validate pkg\npackage_dmg\nstapler validate app\ncodesign dmg\nnotarytool submit dmg\nstapler staple dmg\nstapler validate dmg'
   [[ "$actual_order" == "$expected_order" ]] || {
     print -u2 -- "Expected call order:"
     print -u2 -- "$expected_order"
@@ -626,6 +889,11 @@ test_override_restriction() {
     GATEBEAM_DEVELOPER_TEAM_ID="ABCDE12345" \
     GATEBEAM_INSTALLER_SIGN_IDENTITY="Developer ID Installer: Gatebeam Tests (ABCDE12345)" \
     GATEBEAM_NOTARY_PROFILE="fixture profile" \
+    GATEBEAM_PREVIOUS_PUBLIC_BUILD_VERSION=4 \
+    GATEBEAM_RELEASE_TEST_EVIDENCE_URL="https://github.com/gatebeam-tests/gatebeam/actions/runs/123456" \
+    GATEBEAM_RELEASE_CLEAN_MACHINE_EVIDENCE_URL="https://github.com/gatebeam-tests/gatebeam/actions/runs/123457" \
+    GATEBEAM_RELEASE_ROLLBACK_VERSION=0.4.0 \
+    GATEBEAM_RELEASE_ROLLBACK_URL="https://github.com/gatebeam-tests/gatebeam/releases/tag/v0.4.0" \
     GATEBEAM_RELEASE_TEST_MODE=1 \
     GATEBEAM_RELEASE_TEST_TOOL_DIR="$TEST_ROOT/not-used" \
     /bin/zsh -f "$ROOT_DIR/scripts/release_formal.sh" >"$output" 2>&1; then
@@ -654,6 +922,10 @@ test_dirty_worktree
 test_git_environment_cannot_hide_dirty_state
 test_unsafe_version_rejected
 test_tag_mismatch
+test_annotated_tag_required
+test_two_parent_merge_required
+test_release_metadata_inputs
+test_build_version_contract
 test_wrong_identity
 test_wrong_signed_identity
 test_hardened_runtime
@@ -665,6 +937,7 @@ test_notary_log_failure
 test_notary_warning_log
 test_notary_profile_leak
 test_staple_failure
+test_stapler_state_validation
 test_gatekeeper_failure
 test_installer_identity
 test_installer_timestamp

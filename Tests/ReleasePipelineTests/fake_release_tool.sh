@@ -71,6 +71,27 @@ case "$TOOL_NAME" in
       fi
       exit 0
     fi
+    if [[ "$*" == *"--extract-certificates"* ]]; then
+      certificate_prefix=""
+      previous=""
+      for argument in "$@"; do
+        if [[ "$previous" == "--extract-certificates" ]]; then
+          certificate_prefix="$argument"
+          break
+        fi
+        previous="$argument"
+      done
+      target="${@: -1}"
+      kind="$(artifact_kind "$target")"
+      [[ -n "$certificate_prefix" && "$kind" != "unknown" ]] || exit 64
+      if [[ "$kind" == "app" ]]; then
+        [[ -d "$target" ]]
+      else
+        [[ -f "$target" && -s "$target" ]]
+      fi
+      print -r -- "fixture-$kind-leaf-certificate" >"${certificate_prefix}0"
+      exit 0
+    fi
     if [[ "$*" == *"--verbose=4"* ]]; then
       if [[ "${@: -1}" == *.dmg ]]; then
         print -u2 -- "Executable=${@: -1}"
@@ -103,6 +124,10 @@ case "$TOOL_NAME" in
     fi
     cp "${@: -2:1}" "${@: -1}"
     ;;
+  lipo)
+    [[ "$1" == "-archs" && -f "$2" && ! -L "$2" ]]
+    print -r -- "arm64"
+    ;;
   pkgutil)
     print -r -- "Package ${@: -1}:"
     print -r -- "   Status: signed by a certificate trusted by macOS"
@@ -115,6 +140,8 @@ case "$TOOL_NAME" in
     else
       print -r -- "    1. Developer ID Installer: Gatebeam Tests (ABCDE12345)"
     fi
+    print -r -- "       SHA256 Fingerprint:"
+    print -r -- "         AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
     ;;
   hdiutil)
     [[ "$1" == "verify" && "${GATEBEAM_FAKE_FAIL_HDIUTIL:-0}" != "1" ]]
@@ -169,7 +196,14 @@ case "$TOOL_NAME" in
         artifact="${@: -1}"
         kind="$(artifact_kind "$artifact")"
         print -r -- "stapler staple $kind" >>"$CALL_LOG"
+        [[ "$kind" != "unknown" ]] || exit 64
+        if [[ "$kind" == "app" ]]; then
+          [[ -d "$artifact" && ! -L "$artifact" ]]
+        else
+          [[ -f "$artifact" && ! -L "$artifact" && -s "$artifact" ]]
+        fi
         [[ "${GATEBEAM_FAKE_FAIL_STAPLE:-}" != "$kind" ]]
+        [[ "${GATEBEAM_FAKE_STAPLE_WITHOUT_STATE:-}" != "$kind" ]] || exit 0
         if [[ "$kind" == "app" ]]; then
           mkdir -p "$artifact/Contents/_CodeSignature"
           print -r -- "fixture-stapled-app" \
@@ -179,7 +213,26 @@ case "$TOOL_NAME" in
         fi
         ;;
       stapler:validate)
-        exit 0
+        artifact="${@: -1}"
+        kind="$(artifact_kind "$artifact")"
+        print -r -- "stapler validate $kind" >>"$CALL_LOG"
+        case "$kind" in
+          app)
+            [[ -d "$artifact" &&
+                ! -L "$artifact" &&
+                -f "$artifact/Contents/_CodeSignature/fixture-stapled-ticket" &&
+                "$(<"$artifact/Contents/_CodeSignature/fixture-stapled-ticket")" == "fixture-stapled-app" ]]
+            ;;
+          pkg|dmg)
+            [[ -f "$artifact" &&
+                ! -L "$artifact" &&
+                -s "$artifact" ]]
+            /usr/bin/grep -Fq "fixture-stapled-$kind" "$artifact"
+            ;;
+          *)
+            exit 1
+            ;;
+        esac
         ;;
       *)
         exit 64

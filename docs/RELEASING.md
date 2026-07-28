@@ -101,6 +101,8 @@ git diff --check
 /usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' Resources/Info.plist
 test "$(git rev-parse HEAD^{commit})" = \
   "$(git rev-parse "vVERSION^{commit}")"
+test "$(git cat-file -t "refs/tags/vVERSION")" = tag
+test "$(git rev-list --parents -n 1 HEAD | wc -w | tr -d ' ')" -eq 3
 ```
 
 Verify the visible version matches `VERSION`, the build version is the reviewed
@@ -117,10 +119,12 @@ Run the complete repository suite:
 ./scripts/test_backend.sh
 ./scripts/test_proxy_policy.sh
 ./scripts/test_integration_contract.sh
+./scripts/test_integration_tsan.sh
 ./scripts/test_keychain_identity.sh
 ./scripts/test_upgrade.sh
 ./scripts/test_ui_validation.sh
 ./scripts/test_build_assets.sh
+./scripts/test_release_pipeline.sh
 ./scripts/test_privacy.sh
 ./scripts/build_app.sh
 codesign --verify --deep --strict ./dist/Gatebeam.app
@@ -137,7 +141,8 @@ commit, it may automate the manual stages below. Do not use or document a
 working-tree-only or unmerged script as release infrastructure. The script must
 fail closed unless:
 
-- The worktree is clean and the release tag resolves exactly to `HEAD`.
+- The worktree is clean, `HEAD` has exactly two parents, and the annotated
+  release tag resolves exactly to `HEAD`.
 - Both bundle version keys match the reviewed release preparation, and
   `CFBundleVersion` is greater than the previous distributed build.
 - The app, PKG, and DMG satisfy the required Developer ID identities and secure
@@ -146,6 +151,26 @@ fail closed unless:
 - Every accepted ticket is stapled and validated.
 - Checksums and the manifest are generated only from the final stapled
   artifacts, and output publication is atomic.
+
+`release_formal.sh` also requires explicit, non-secret audit inputs:
+
+```sh
+export GATEBEAM_PREVIOUS_PUBLIC_BUILD_VERSION='PREVIOUS_POSITIVE_DECIMAL'
+export GATEBEAM_RELEASE_TEST_EVIDENCE_URL='https://github.com/OWNER/REPOSITORY/actions/runs/RUN_ID'
+export GATEBEAM_RELEASE_CLEAN_MACHINE_EVIDENCE_URL='https://github.com/OWNER/REPOSITORY/actions/runs/RUN_ID'
+export GATEBEAM_RELEASE_ROLLBACK_VERSION='PREVIOUS_VERSION'
+export GATEBEAM_RELEASE_ROLLBACK_URL='https://github.com/OWNER/REPOSITORY/releases/tag/vPREVIOUS_VERSION'
+```
+
+The previous build value must come from the protected manifest of the latest
+public release, contain only a positive decimal integer without leading zeroes,
+and be lower than the `CFBundleVersion` read back from the newly built app.
+Both evidence URLs must identify immutable numeric GitHub Actions runs for the
+exact release commit; the clean-machine run must contain the installation,
+upgrade, rollback, and removal evidence described below. The rollback URL must
+be an immutable GitHub release tag URL matching the rollback version. The
+script rejects missing values, URL credentials, query strings, fragments,
+moving aliases, malformed versions, and unsafe Keychain profile names.
 
 ## Build and Sign
 
@@ -301,14 +326,24 @@ Create a release manifest containing:
 - Exact source merge commit and annotated tag, which must resolve to the same
   commit.
 - `CFBundleShortVersionString` and the monotonically increasing
-  `CFBundleVersion`.
+  `CFBundleVersion`, plus the explicitly trusted previous public build version.
 - Artifact filenames, byte sizes, and SHA-256 checksums.
 - Bundle ID, Team ID, signing certificate common names and non-secret
   fingerprints.
 - Notary submission IDs and `Accepted` status, with sensitive fields redacted.
-- Supported macOS versions and architectures.
-- Test-suite and clean-machine verification summary.
-- Known limitations and rollback instructions.
+- Supported macOS version range and architectures, build-host platform, and
+  Xcode/Swift toolchain versions.
+- Exact release-suite, TSan, and clean-machine evidence URLs for the release
+  commit.
+- Known limitations, rollback version, immutable rollback release URL, and
+  rollback instructions.
+
+`release_formal.sh` writes these fields from the final stapled artifacts and
+validated inputs. It records byte counts after publication staging, extracts
+leaf-certificate SHA-256 fingerprints from the signed app and DMG, records the
+trusted installer certificate chain, and stores `Accepted` for all three
+notarization records. The Keychain profile name is never a manifest field and
+must not appear in the manifest or retained notary logs.
 
 Re-run the privacy scan against the tag and release notes. Reconfirm that the
 already-created annotated tag points to the exact merge commit used to build
