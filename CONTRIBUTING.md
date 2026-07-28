@@ -40,11 +40,14 @@ Run the complete suite before requesting final review:
 ./scripts/test_ui_validation.sh
 ./scripts/test_build_assets.sh
 ./scripts/test_release_pipeline.sh
-./scripts/test_privacy.sh
 ./scripts/build_app.sh
 codesign --verify --deep --strict ./dist/Gatebeam.app
+./scripts/test_privacy.sh --range main..HEAD
 git diff --check
 ```
+
+The privacy gate scans tracked and untracked worktree sources, every Git blob in
+the requested `main..HEAD` history range, and the final built executable.
 
 The Keychain/signing tests must remain fixture-based and non-interactive. Tests
 must not query a contributor's login Keychain, display SecurityAgent prompts,

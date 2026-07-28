@@ -99,10 +99,12 @@ Requirements: macOS with Xcode Command Line Tools or Xcode installed.
 ./scripts/test_backend.sh
 ./scripts/test_proxy_policy.sh
 ./scripts/test_integration_contract.sh
+./scripts/test_integration_tsan.sh
 ./scripts/test_keychain_identity.sh
 ./scripts/test_upgrade.sh
 ./scripts/test_ui_validation.sh
 ./scripts/test_build_assets.sh
+./scripts/test_release_pipeline.sh
 ./scripts/build_app.sh
 ./scripts/test_privacy.sh
 ```
@@ -112,11 +114,15 @@ The validation suite is split by contract:
 - `test_backend.sh`: Cloudflare, address-family, router mapping, IPv6, and status behavior.
 - `test_proxy_policy.sh`: system/direct/custom routing, direct-proxy disabling, supported `http://` / `socks5://` forms, invalid proxy rejection, and direct-only LAN control.
 - `test_integration_contract.sh`: configuration normalization, non-Custom proxy URL clearing, injected-store isolation, explicit Keychain migration/failure latching, local-origin status semantics, and stable login-path behavior.
+- `test_integration_tsan.sh`: the integration-contract suite compiled and run with Thread Sanitizer enabled.
 - `test_keychain_identity.sh`: Developer Preview and Developer ID signing-contract validation, exact-build identity rejection, and host-aware hardened-runtime library-validation evidence. It does not access any Keychain.
 - `test_upgrade.sh`: migration, rollback, symlink/path safety, and stable LaunchAgent installation behavior.
 - `test_ui_validation.sh`: isolated AppKit validation mode, no network side effects, no Keychain prompts, and UI contract coverage.
 - `test_build_assets.sh`: icon, app bundle, PKG, and DMG staging/build-asset checks.
+- `test_release_pipeline.sh`: fixture-based, fail-closed validation of the formal release pipeline and its publication gates.
 - `test_privacy.sh`: credentials, email addresses, bare domains, IPv4/IPv6 literals, user-specific paths, and built-binary private material against explicit fixture allowlists.
+
+Automated tests use injected stores or signing fixtures and do not access a contributor's login Keychain.
 
 The built app is written to `dist/Gatebeam.app`. `test_ui_validation.sh` is a UI contract check; the final preview should also be visually inspected from rendered screenshots for both Aqua and Dark Aqua states.
 

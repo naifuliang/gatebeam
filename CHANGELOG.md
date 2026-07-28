@@ -62,3 +62,5 @@ prove that a particular Mac is reachable from the public internet.
 - Formal distribution requires Apple Developer credentials, Developer ID
   Application and Developer ID Installer certificates, secure timestamps,
   notarization, stapling, and release-host verification.
+
+[Unreleased]: https://github.com/naifuliang/gatebeam/compare/main...HEAD
