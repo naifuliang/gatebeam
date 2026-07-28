@@ -559,7 +559,7 @@ final class RouterMappingService: RouterMappingServicing {
               echoedProtocolMatches,
               values["NewInternalClient"] == mapping.localAddress,
               values["NewInternalPort"] == String(mapping.internalPort),
-              values["NewEnabled"] != "0",
+              values["NewEnabled"]?.trimmingCharacters(in: .whitespacesAndNewlines) == "1",
               values["NewPortMappingDescription"].map(acceptedDescriptions.contains) == true else {
             throw RouterMappingError.protocolFailure(
                 "A UPnP rule exists on the original gateway, but its external port, protocol, "

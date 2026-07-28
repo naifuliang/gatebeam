@@ -1612,36 +1612,50 @@ func testUPnPUncertainAddRecoveryQueriesBeforeDelete() throws {
         "A foreign rule must stop recovery before DeletePortMapping"
     )
 
-    var exactActions: [String] = []
-    let exactRemover = RouterMappingService(
-        upnpDescriptionHandler: { _ in description },
-        soapRequestHandler: { _, _, action, _ in
-            exactActions.append(action)
-            switch action {
-            case "GetSpecificPortMappingEntry":
-                return response("""
-                <response>
-                  <NewExternalPort>45900</NewExternalPort>
-                  <NewProtocol>TCP</NewProtocol>
-                  <NewInternalClient>192.0.2.20</NewInternalClient>
-                  <NewInternalPort>5900</NewInternalPort>
-                  <NewEnabled>1</NewEnabled>
-                  <NewPortMappingDescription>Gatebeam</NewPortMappingDescription>
-                </response>
-                """)
-            case "DeletePortMapping":
-                return response("")
-            default:
-                throw TestFailure("Unexpected exact recovery action \(action)")
+    let enabledVariants: [(name: String, element: String, mayDelete: Bool)] = [
+        ("missing", "", false),
+        ("disabled", "<NewEnabled>0</NewEnabled>", false),
+        ("invalid", "<NewEnabled>yes</NewEnabled>", false),
+        ("enabled", "<NewEnabled> \n 1 \t</NewEnabled>", true)
+    ]
+    for variant in enabledVariants {
+        var actions: [String] = []
+        let remover = RouterMappingService(
+            upnpDescriptionHandler: { _ in description },
+            soapRequestHandler: { _, _, action, _ in
+                actions.append(action)
+                switch action {
+                case "GetSpecificPortMappingEntry":
+                    return response("""
+                    <response>
+                      <NewExternalPort>45900</NewExternalPort>
+                      <NewProtocol>TCP</NewProtocol>
+                      <NewInternalClient>192.0.2.20</NewInternalClient>
+                      <NewInternalPort>5900</NewInternalPort>
+                      \(variant.element)
+                      <NewPortMappingDescription>Gatebeam</NewPortMappingDescription>
+                    </response>
+                    """)
+                case "DeletePortMapping":
+                    return response("")
+                default:
+                    throw TestFailure("Unexpected \(variant.name) recovery action \(action)")
+                }
             }
-        }
-    )
-    let exactReport = exactRemover.removeMappings([recovery.mapping])
-    try expect(exactReport.allSucceeded, "An exact Gatebeam rule may be deleted during recovery")
-    try expect(
-        exactActions == ["GetSpecificPortMappingEntry", "DeletePortMapping"],
-        "Exact recovery must query immediately before deletion"
-    )
+        )
+        let report = remover.removeMappings([recovery.mapping])
+        try expect(
+            report.allSucceeded == variant.mayDelete,
+            "\(variant.name) NewEnabled must \(variant.mayDelete ? "allow" : "refuse") recovery deletion"
+        )
+        let expectedActions = variant.mayDelete
+            ? ["GetSpecificPortMappingEntry", "DeletePortMapping"]
+            : ["GetSpecificPortMappingEntry"]
+        try expect(
+            actions == expectedActions,
+            "\(variant.name) NewEnabled must follow the fail-closed recovery action contract"
+        )
+    }
 
     var timeoutActions: [String] = []
     let timeoutRemover = RouterMappingService(
