@@ -11,6 +11,7 @@ swiftc \
   -swift-version 5 \
   -O \
   -module-cache-path "$MODULE_CACHE_DIR" \
+  -framework LocalAuthentication \
   -framework Security \
   "$ROOT_DIR/Sources/RemoteControlNetwork/Models.swift" \
   "$ROOT_DIR/Sources/RemoteControlNetwork/AppConfigStore.swift" \

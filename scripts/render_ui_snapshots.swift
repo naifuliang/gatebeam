@@ -40,7 +40,9 @@ struct UISnapshotRenderer {
                 appearance.performAsCurrentDrawingAppearance {
                     let agent = NetworkAgent(
                         configStore: AppConfigStore(),
-                        keychain: KeychainStore(),
+                        keychain: KeychainStore.isolatedValidationStore(
+                            service: "io.github.naifuliang.gatebeam.snapshot-validation"
+                        ),
                         initialConfig: scenario.config
                     )
 

@@ -2,7 +2,7 @@
 
 Gatebeam is a native macOS menu bar app for keeping a remote-desktop entry point current without handing DNS and router mapping work to a collection of unrelated tools. It manages Cloudflare DDNS and local-network port exposure for macOS Screen Sharing / Remote Management (TCP `5900`).
 
-> **0.5.0 Developer Preview:** this is an open-source preview of Gatebeam, released under the [MIT License](LICENSE). The application is ad-hoc signed for development, the PKG is unsigned, and no artifact is notarized or stapled. Review and build it locally before exposing a remote-desktop service.
+> **0.5.0 Developer Preview:** this is an open-source preview of Gatebeam, released under the [MIT License](LICENSE). The application is ad-hoc signed for development, the PKG is unsigned, and no artifact is notarized or stapled. Its saved Cloudflare token is bound to the exact preview build. After replacing the app with another preview build, open Settings and click **Authorize Token** so macOS can approve and rebind the item. Review and build it locally before exposing a remote-desktop service.
 
 > **Known preview limitations:** a successful local mapping or DNS update does not prove that an outside client can reach the Mac. Router behavior, CGNAT, upstream firewalls, and ISP policy can still block inbound traffic. `Direct` bypasses URLSession proxy selection, but cannot bypass a VPN/TUN or transparent network interception. Custom proxy URLs support `http://` and `socks5://` only. External reachability verification must be performed from a separately controlled external network.
 
@@ -22,13 +22,13 @@ Gatebeam is a native macOS menu bar app for keeping a remote-desktop entry point
 - Supports UPnP `WANIPv6FirewallControl` pinholes for IPv6-capable routers.
 - Checks whether macOS Screen Sharing / Remote Management is listening on TCP `5900`.
 - Renews tracked mappings and attempts to remove them before disabling access or changing mapping identity.
-- Stores Cloudflare credentials in the macOS Keychain, not in the app configuration file.
+- Stores Cloudflare credentials in a versioned macOS Keychain item whose ACL is bound to Gatebeam's code-signing requirement, not in the app configuration file.
 
 ## Quick Start
 
 1. Enable **Screen Sharing** or **Remote Management** in macOS System Settings.
 2. Open Gatebeam from the menu bar and open **Settings**.
-3. Select **Cloudflare**, enter an API token, then choose a zone and hostname.
+3. Select **Cloudflare**, enter an API token, then choose a zone and hostname. When upgrading from an earlier Gatebeam build, click **Authorize Token** instead of pasting the token again.
 4. Choose `IPv4`, `Dual`, or `IPv6` address mode.
 5. Confirm the inside port (`5900`) and choose a high external IPv4 port.
 6. Review the network-path status and explicitly enable remote access.
@@ -99,6 +99,7 @@ Requirements: macOS with Xcode Command Line Tools or Xcode installed.
 ./scripts/test_backend.sh
 ./scripts/test_proxy_policy.sh
 ./scripts/test_integration_contract.sh
+./scripts/test_keychain_identity.sh
 ./scripts/test_upgrade.sh
 ./scripts/test_ui_validation.sh
 ./scripts/test_build_assets.sh
@@ -110,13 +111,24 @@ The validation suite is split by contract:
 
 - `test_backend.sh`: Cloudflare, address-family, router mapping, IPv6, and status behavior.
 - `test_proxy_policy.sh`: system/direct/custom routing, direct-proxy disabling, supported `http://` / `socks5://` forms, invalid proxy rejection, and direct-only LAN control.
-- `test_integration_contract.sh`: configuration normalization, non-Custom proxy URL clearing, injected-store isolation, local-origin status semantics, and stable login-path behavior.
+- `test_integration_contract.sh`: configuration normalization, non-Custom proxy URL clearing, injected-store isolation, explicit Keychain migration/failure latching, local-origin status semantics, and stable login-path behavior.
+- `test_keychain_identity.sh`: default designated-requirement validation, exact-build ACL access, and rejection of a different ad-hoc program with the same bundle identifier. It uses and removes an isolated temporary Keychain, never the production service.
 - `test_upgrade.sh`: migration, rollback, symlink/path safety, and stable LaunchAgent installation behavior.
 - `test_ui_validation.sh`: isolated AppKit validation mode, no network side effects, no Keychain prompts, and UI contract coverage.
 - `test_build_assets.sh`: icon, app bundle, PKG, and DMG staging/build-asset checks.
 - `test_privacy.sh`: credentials, email addresses, bare domains, IPv4/IPv6 literals, user-specific paths, and built-binary private material against explicit fixture allowlists.
 
 The built app is written to `dist/Gatebeam.app`. `test_ui_validation.sh` is a UI contract check; the final preview should also be visually inspected from rendered screenshots for both Aqua and Dark Aqua states.
+
+By default, `build_app.sh` creates a Developer Preview with the system-generated ad-hoc designated requirement. That requirement must contain an exact-build `cdhash`; the script refuses identifier-only signing. For a production Developer ID build, leave requirement synthesis to `codesign` and provide both values:
+
+```sh
+GATEBEAM_CODE_SIGN_IDENTITY='Developer ID Application: Example (TEAMID)' \
+GATEBEAM_DEVELOPER_TEAM_ID='TEAMID' \
+./scripts/build_app.sh
+```
+
+The build then enables hardened runtime and timestamping and verifies that the resulting designated requirement contains the Apple generic anchor and expected leaf Team ID. Gatebeam does not accept a manually weakened identifier-only requirement.
 
 For a distributable artifact:
 
@@ -131,9 +143,11 @@ The PKG supports installation and upgrade, but the preview PKG is unsigned. A DM
 
 The 0.5.0 Developer Preview app uses an ad-hoc signature. The PKG is unsigned, and the app, PKG, and DMG are not notarized or stapled. macOS may therefore show a security warning on first launch. Build from source when you need a fully auditable local artifact.
 
+Gatebeam stores new tokens under the versioned service `io.github.naifuliang.gatebeam.cloudflare-token.v3`. A Developer ID release uses the Apple-anchored, Team-ID-qualified default designated requirement, so ordinary updates signed by the same developer remain trusted. A Developer Preview has no durable developer identity, so its ACL intentionally trusts only that exact build's `cdhash`. Background checks never display Keychain authorization UI. If a replacement build needs access, the user must click **Authorize Token** in Settings; this refreshes the ACL for the current build. The same explicit action is the only path that reads the older `com.local.RemoteControlNetwork.secure-v2` item, verifies the new item, and deletes the weak legacy item.
+
 Start at Login is written only for a stable installed app in `/Applications/Gatebeam.app` or `~/Applications/Gatebeam.app`. The app refuses temporary, build-output, legacy, or symbolic-link locations so a LaunchAgent cannot be redirected by an unstable path.
 
-Do not grant Keychain access to a process you do not recognize. A legitimate app should request access only when saving or retrieving its own Cloudflare token, never repeatedly while merely displaying diagnostics or screenshots.
+Do not grant Keychain access to a process you do not recognize. Gatebeam permits authorization UI only after the explicit Settings action described above or while the user saves a token. Startup, timers, diagnostics, screenshots, UI validation, and CI use noninteractive or injected Keychain backends and must never touch the production service or repeatedly prompt.
 
 Use the macOS system proxy when it requires authentication. Avoid embedding a proxy username or password in a custom `http://` or `socks5://` URL, because configuration files are not a replacement for Keychain-backed secret storage.
 

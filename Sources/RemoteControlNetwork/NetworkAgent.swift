@@ -571,7 +571,10 @@ final class NetworkAgent {
                 revision: mutationRevision,
                 label: "keychain.read"
             ) {
-                try loadCloudflareToken(retryAfterFailure: true)
+                try loadCloudflareToken(
+                    retryAfterFailure: true,
+                    interaction: .userInitiated
+                )
             }
             var previousConfig = config
             var appliedConfig = newConfig
@@ -734,7 +737,10 @@ final class NetworkAgent {
     }
 
     @discardableResult
-    func loadCloudflareToken(retryAfterFailure: Bool = true) throws -> String {
+    func loadCloudflareToken(
+        retryAfterFailure: Bool = true,
+        interaction: KeychainInteraction = .background
+    ) throws -> String {
         guard sideEffectsEnabled else { return "" }
 
         enum Decision {
@@ -767,7 +773,12 @@ final class NetworkAgent {
         case .wait(let flight):
             return try flight.wait()
         case .perform(let flight):
-            let result = Result { try keychain.get(account: "cloudflare-api-token") ?? "" }
+            let result = Result {
+                try keychain.get(
+                    account: "cloudflare-api-token",
+                    interaction: interaction
+                ) ?? ""
+            }
             withState {
                 tokenLoadFlight = nil
                 switch result {
@@ -798,7 +809,10 @@ final class NetworkAgent {
         }
 
         try withTransaction {
-            let current = try loadCloudflareToken(retryAfterFailure: true)
+            let current = try loadCloudflareToken(
+                retryAfterFailure: true,
+                interaction: .userInitiated
+            )
             guard current != normalized else { return }
             do {
                 try writeTokenToKeychain(normalized)
@@ -816,6 +830,47 @@ final class NetworkAgent {
                 }
                 throw error
             }
+        }
+    }
+
+    func authorizeSavedCloudflareToken(
+        completion: @escaping (Result<KeychainAuthorizationOutcome, Error>) -> Void
+    ) {
+        guard sideEffectsEnabled else {
+            DispatchQueue.main.async {
+                completion(.success(.noSavedToken))
+            }
+            return
+        }
+
+        keychainReadQueue.async {
+            let result = Result {
+                try self.keychain.authorizeCurrentOrMigrateLegacy(
+                    account: "cloudflare-api-token"
+                )
+            }
+            self.withState {
+                switch result {
+                case .success(let outcome):
+                    self.cachedCloudflareToken = outcome.token
+                    self.keychainReadFailure = nil
+                    self.keychainErrorMessage = nil
+                case .failure(let error):
+                    self.cachedCloudflareToken = nil
+                    self.keychainReadFailure = error
+                    self.keychainErrorMessage = "Could not authorize the saved Cloudflare token: \(error.localizedDescription)"
+                }
+                self.publishCurrentSettingsErrorOnStateQueue()
+            }
+            DispatchQueue.main.async {
+                completion(result)
+            }
+        }
+    }
+
+    var savedTokenNeedsAuthorization: Bool {
+        withState {
+            (keychainReadFailure as? KeychainError)?.requiresUserAuthorization == true
         }
     }
 
@@ -847,7 +902,10 @@ final class NetworkAgent {
             do {
                 let suppliedToken = token?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                 let candidate = suppliedToken.isEmpty
-                    ? try self.loadCloudflareToken(retryAfterFailure: true)
+                    ? try self.loadCloudflareToken(
+                        retryAfterFailure: true,
+                        interaction: .userInitiated
+                    )
                     : suppliedToken
                 guard !candidate.isEmpty else {
                     throw CloudflareError.configuration("Cloudflare API token is missing")
@@ -895,7 +953,10 @@ final class NetworkAgent {
             do {
                 let suppliedToken = token?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                 let candidate = suppliedToken.isEmpty
-                    ? try self.loadCloudflareToken(retryAfterFailure: true)
+                    ? try self.loadCloudflareToken(
+                        retryAfterFailure: true,
+                        interaction: .userInitiated
+                    )
                     : suppliedToken
                 guard !candidate.isEmpty else {
                     throw CloudflareError.configuration("Cloudflare API token is missing")
@@ -2459,7 +2520,10 @@ final class NetworkAgent {
 
         keychainReadQueue.async {
             let result = Result {
-                try self.loadCloudflareToken(retryAfterFailure: retryKeychainAfterFailure)
+                try self.loadCloudflareToken(
+                    retryAfterFailure: retryKeychainAfterFailure,
+                    interaction: .background
+                )
             }
             execute(result)
         }

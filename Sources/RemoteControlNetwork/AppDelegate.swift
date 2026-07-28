@@ -5,10 +5,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private lazy var configStore = isUIValidationMode
         ? AppConfigStore.isolatedTemporary()
         : AppConfigStore()
-    private let keychain = KeychainStore()
     private var isUIValidationMode: Bool {
         CommandLine.arguments.contains("--ui-validation")
     }
+    private lazy var keychain = isUIValidationMode
+        ? KeychainStore.isolatedValidationStore()
+        : KeychainStore()
     private lazy var agent = NetworkAgent(
         configStore: configStore,
         keychain: keychain,
@@ -131,7 +133,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             var shouldLoadCloudflare = !isUIValidationMode
             if shouldLoadCloudflare {
                 do {
-                    try agent.loadCloudflareToken()
+                    try agent.loadCloudflareToken(
+                        retryAfterFailure: false,
+                        interaction: .background
+                    )
                 } catch {
                     // NetworkAgent publishes the Keychain failure into the settings status.
                     shouldLoadCloudflare = false

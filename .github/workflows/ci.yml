@@ -32,6 +32,8 @@ jobs:
 
       - name: Run integration contract tests
         run: ./scripts/test_integration_contract.sh
+      - name: Verify Keychain and code-signing identity
+        run: ./scripts/test_keychain_identity.sh
 
       - name: Run upgrade compatibility tests
         run: ./scripts/test_upgrade.sh

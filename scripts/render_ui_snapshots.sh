@@ -19,6 +19,7 @@ swiftc \
   -swift-version 5 \
   -module-cache-path "$MODULE_CACHE_DIR" \
   -framework AppKit \
+  -framework LocalAuthentication \
   -framework Security \
   "${FILTERED[@]}" \
   "$ROOT_DIR/scripts/render_ui_snapshots.swift" \

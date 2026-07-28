@@ -1038,6 +1038,319 @@ func testKeychainSingleFlightAndFailureLatch() throws {
     try expect(reads.current == 2, "An explicit retry must cross the failure latch exactly once")
 }
 
+func testKeychainLegacyMigrationRequiresExplicitAuthorization() throws {
+    let currentService = "io.github.naifuliang.gatebeam.keychain-test.v3"
+    let legacyService = "io.github.naifuliang.gatebeam.keychain-test.v2"
+    let account = "cloudflare-api-token"
+    let legacyToken = "legacy-fixture-token"
+    let lock = NSLock()
+    var values = ["\(legacyService):\(account)": legacyToken]
+    var events: [String] = []
+
+    let keychain = KeychainStore(
+        service: currentService,
+        legacyServices: [legacyService],
+        operationHandlers: KeychainOperationHandlers(
+            scopedSet: { value, scopedAccount, service, interaction, refreshAccess in
+                lock.lock()
+                events.append("set:\(service):\(interaction):\(refreshAccess)")
+                values["\(service):\(scopedAccount)"] = value
+                lock.unlock()
+            },
+            scopedGet: { scopedAccount, service, interaction in
+                lock.lock()
+                defer { lock.unlock() }
+                events.append("get:\(service):\(interaction)")
+                return values["\(service):\(scopedAccount)"]
+            },
+            scopedDelete: { scopedAccount, service, interaction in
+                lock.lock()
+                events.append("delete:\(service):\(interaction)")
+                values.removeValue(forKey: "\(service):\(scopedAccount)")
+                lock.unlock()
+            }
+        )
+    )
+
+    let backgroundValue = try keychain.get(account: account, interaction: .background)
+    try expect(backgroundValue == nil, "Background reads must query only the versioned current service")
+    try expect(
+        events == ["get:\(currentService):background"],
+        "Background reads must never enumerate or read a weak legacy service"
+    )
+
+    events.removeAll()
+    let outcome = try keychain.authorizeCurrentOrMigrateLegacy(account: account)
+    try expect(
+        outcome == .migratedLegacyToken(token: legacyToken),
+        "An explicit authorization action must migrate the legacy token"
+    )
+    try expect(
+        values["\(currentService):\(account)"] == legacyToken,
+        "Migration must create the versioned secure item"
+    )
+    try expect(
+        values["\(legacyService):\(account)"] == nil,
+        "Migration must delete the weak legacy item after verification"
+    )
+    try expect(
+        events.contains("get:\(legacyService):userInitiated"),
+        "Legacy reads must be user initiated"
+    )
+    try expect(
+        events.contains("set:\(currentService):userInitiated:true"),
+        "Migration must bind the new item to the current application ACL"
+    )
+    try expect(
+        events.contains("delete:\(legacyService):userInitiated"),
+        "Legacy cleanup must remain inside the explicit authorization action"
+    )
+}
+
+func testKeychainRequirementClassificationRejectsWeakAlternatives() throws {
+    try expect(
+        KeychainStore.isStrongDesignatedRequirement(
+            #"cdhash H"1111111111111111111111111111111111111111" or cdhash H"2222222222222222222222222222222222222222""#
+        ),
+        "A pure exact-build cdhash set must be accepted for Developer Preview"
+    )
+    try expect(
+        !KeychainStore.isStrongDesignatedRequirement(
+            #"identifier "com.local.RemoteControlNetwork""#
+        ),
+        "An identifier-only requirement must be rejected"
+    )
+    try expect(
+        !KeychainStore.isStrongDesignatedRequirement(
+            #"identifier "com.local.RemoteControlNetwork" or cdhash H"1111111111111111111111111111111111111111""#
+        ),
+        "A cdhash requirement with a weak identifier alternative must be rejected"
+    )
+    try expect(
+        KeychainStore.isStrongDesignatedRequirement(
+            #"identifier "com.local.RemoteControlNetwork" and anchor apple generic and certificate leaf[subject.OU] = "TEAMID1234""#
+        ),
+        "An Apple-anchored Team-ID-qualified Developer ID requirement must be accepted"
+    )
+    try expect(
+        !KeychainStore.isStrongDesignatedRequirement(
+            #"identifier "com.local.RemoteControlNetwork" or (anchor apple generic and certificate leaf[subject.OU] = "TEAMID1234")"#
+        ),
+        "A Developer ID requirement with a weak OR alternative must be rejected"
+    )
+}
+
+func testCurrentKeychainItemAuthorizationRefreshesAccess() throws {
+    let currentService = "io.github.naifuliang.gatebeam.keychain-rebind.v3"
+    let legacyService = "io.github.naifuliang.gatebeam.keychain-rebind.v2"
+    let account = "cloudflare-api-token"
+    let token = "current-fixture-token"
+    var values = ["\(currentService):\(account)": token]
+    var events: [String] = []
+
+    let keychain = KeychainStore(
+        service: currentService,
+        legacyServices: [legacyService],
+        operationHandlers: KeychainOperationHandlers(
+            scopedSet: { value, scopedAccount, service, interaction, refreshAccess in
+                events.append("set:\(service):\(interaction):\(refreshAccess)")
+                values["\(service):\(scopedAccount)"] = value
+            },
+            scopedGet: { scopedAccount, service, interaction in
+                events.append("get:\(service):\(interaction)")
+                return values["\(service):\(scopedAccount)"]
+            },
+            scopedDelete: { _, service, interaction in
+                events.append("delete:\(service):\(interaction)")
+            }
+        )
+    )
+
+    let outcome = try keychain.authorizeCurrentOrMigrateLegacy(account: account)
+    try expect(
+        outcome == .authorized(token: token),
+        "An existing current item must be authorized without legacy migration"
+    )
+    try expect(
+        events.contains("set:\(currentService):userInitiated:true"),
+        "Explicit authorization must refresh the current item's ACL for this build"
+    )
+    try expect(
+        events.contains("get:\(legacyService):userInitiated"),
+        "Explicit authorization must check for and clean any remaining weak legacy copy"
+    )
+}
+
+func testLegacyCleanupFailureRetriesWithoutLosingSecureCopy() throws {
+    let currentService = "io.github.naifuliang.gatebeam.keychain-cleanup.v3"
+    let legacyService = "io.github.naifuliang.gatebeam.keychain-cleanup.v2"
+    let account = "cloudflare-api-token"
+    let token = "cleanup-fixture-token"
+    var values = ["\(legacyService):\(account)": token]
+    var legacyDeleteShouldFail = true
+
+    let keychain = KeychainStore(
+        service: currentService,
+        legacyServices: [legacyService],
+        operationHandlers: KeychainOperationHandlers(
+            scopedSet: { value, scopedAccount, service, _, _ in
+                values["\(service):\(scopedAccount)"] = value
+            },
+            scopedGet: { scopedAccount, service, _ in
+                values["\(service):\(scopedAccount)"]
+            },
+            scopedDelete: { scopedAccount, service, _ in
+                if service == legacyService, legacyDeleteShouldFail {
+                    throw SimulatedKeychainFailure(operation: "legacy cleanup")
+                }
+                values.removeValue(forKey: "\(service):\(scopedAccount)")
+            }
+        )
+    )
+
+    do {
+        _ = try keychain.authorizeCurrentOrMigrateLegacy(account: account)
+        throw IntegrationContractFailure("A failed legacy cleanup must not report migration success")
+    } catch is KeychainError {
+        // The secure copy remains available while the weak copy is reported and retried.
+    }
+    try expect(
+        values["\(currentService):\(account)"] == token,
+        "A verified secure copy must survive a legacy cleanup failure"
+    )
+    try expect(
+        values["\(legacyService):\(account)"] == token,
+        "A failed cleanup must remain observable for a later explicit retry"
+    )
+
+    legacyDeleteShouldFail = false
+    let retryOutcome = try keychain.authorizeCurrentOrMigrateLegacy(account: account)
+    try expect(
+        retryOutcome == .migratedLegacyToken(token: token),
+        "The next explicit authorization must finish legacy cleanup"
+    )
+    try expect(
+        values["\(legacyService):\(account)"] == nil,
+        "A successful retry must remove the weak legacy copy"
+    )
+}
+
+func testExplicitKeychainAuthorizationClearsFailureLatch() throws {
+    let baseDirectory = try makeTemporaryDirectory(named: "keychain-explicit-authorization")
+    defer {
+        try? FileManager.default.removeItem(at: baseDirectory)
+    }
+
+    let currentService = "io.github.naifuliang.gatebeam.keychain-latch.v3"
+    let token = "authorized-fixture-token"
+    let lock = NSLock()
+    var explicitAuthorizationShouldFail = true
+    var currentBuildAuthorized = false
+    var backgroundReads = 0
+    var userReads = 0
+
+    let keychain = KeychainStore(
+        service: currentService,
+        legacyServices: [],
+        operationHandlers: KeychainOperationHandlers(
+            scopedSet: { _, _, _, interaction, refreshAccess in
+                try expect(interaction == .userInitiated, "ACL refresh must be user initiated")
+                try expect(refreshAccess, "Explicit authorization must refresh the access requirement")
+            },
+            scopedGet: { _, _, interaction in
+                lock.lock()
+                defer { lock.unlock() }
+                if interaction == .background {
+                    backgroundReads += 1
+                    guard currentBuildAuthorized else {
+                        throw KeychainError.status(
+                            operation: "read",
+                            code: errSecInteractionNotAllowed
+                        )
+                    }
+                    return token
+                }
+
+                userReads += 1
+                if explicitAuthorizationShouldFail {
+                    throw SimulatedKeychainFailure(operation: "authorization")
+                }
+                currentBuildAuthorized = true
+                return token
+            },
+            scopedDelete: { _, _, _ in }
+        )
+    )
+    let agent = NetworkAgent(
+        configStore: AppConfigStore(baseDirectory: baseDirectory),
+        keychain: keychain,
+        initialConfig: .default
+    )
+
+    do {
+        _ = try agent.loadCloudflareToken(
+            retryAfterFailure: false,
+            interaction: .background
+        )
+        throw IntegrationContractFailure("An unauthorized background read must fail without prompting")
+    } catch let error as KeychainError {
+        try expect(error.requiresUserAuthorization, "The denial must identify an explicit authorization boundary")
+    }
+    do {
+        _ = try agent.loadCloudflareToken(
+            retryAfterFailure: false,
+            interaction: .background
+        )
+    } catch {
+        // The second background caller must consume the latch.
+    }
+    try expect(backgroundReads == 1, "A background authorization denial must be latched")
+
+    var firstResult: Result<KeychainAuthorizationOutcome, Error>?
+    agent.authorizeSavedCloudflareToken { firstResult = $0 }
+    try expect(
+        waitUntil { firstResult != nil },
+        "The explicit authorization failure callback must arrive"
+    )
+    if case .success = firstResult {
+        throw IntegrationContractFailure("A denied explicit authorization must not report success")
+    }
+    try expect(userReads == 1, "One Settings action must create exactly one authorization attempt")
+
+    do {
+        _ = try agent.loadCloudflareToken(
+            retryAfterFailure: false,
+            interaction: .background
+        )
+    } catch {
+        // The explicit failure remains latched for background work.
+    }
+    try expect(
+        backgroundReads == 1,
+        "A failed Settings authorization must remain latched for background work"
+    )
+
+    lock.lock()
+    explicitAuthorizationShouldFail = false
+    lock.unlock()
+    var secondResult: Result<KeychainAuthorizationOutcome, Error>?
+    agent.authorizeSavedCloudflareToken { secondResult = $0 }
+    try expect(
+        waitUntil { secondResult != nil },
+        "The successful explicit authorization callback must arrive"
+    )
+    let successfulOutcome = try secondResult?.get()
+    try expect(
+        successfulOutcome == .authorized(token: token),
+        "A later explicit Settings action may cross the latch and rebind the item"
+    )
+    try expect(agent.cloudflareToken() == token, "Successful authorization must refresh the token cache")
+    try expect(
+        agent.status.settingsErrorMessage == nil,
+        "Successful authorization must clear the visible Keychain failure"
+    )
+}
+
 func testConfigStoreReportsRealWriteFailure() throws {
     let unwritableURL = URL(fileURLWithPath: "/dev/null/config.json")
     let store = AppConfigStore(configURL: unwritableURL)
@@ -2703,6 +3016,11 @@ let tests: [(String, () throws -> Void)] = [
     ("Keychain read error propagation", testKeychainReadFailurePropagates),
     ("Keychain delete rollback", testKeychainDeleteFailurePreservesTokenAndBlocksConfig),
     ("Keychain single-flight and failure latch", testKeychainSingleFlightAndFailureLatch),
+    ("Keychain explicit legacy migration", testKeychainLegacyMigrationRequiresExplicitAuthorization),
+    ("Keychain signing requirement classification", testKeychainRequirementClassificationRejectsWeakAlternatives),
+    ("Keychain current item ACL refresh", testCurrentKeychainItemAuthorizationRefreshesAccess),
+    ("Keychain legacy cleanup retry", testLegacyCleanupFailureRetriesWithoutLosingSecureCopy),
+    ("Keychain explicit authorization latch", testExplicitKeychainAuthorizationClearsFailureLatch),
     ("real config write failure", testConfigStoreReportsRealWriteFailure),
     ("settings transaction rollback", testSettingsTransactionRollsBackOnConfigWriteFailure),
     ("serialized concurrent state", testConcurrentStateAccessDoesNotDeadlock),

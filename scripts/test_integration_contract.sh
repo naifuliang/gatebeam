@@ -11,6 +11,7 @@ swiftc \
   -swift-version 5 \
   -module-cache-path "$MODULE_CACHE_DIR" \
   -framework AppKit \
+  -framework LocalAuthentication \
   -framework Security \
   "$ROOT_DIR/Sources/RemoteControlNetwork/HTTPClient.swift" \
   "$ROOT_DIR/Sources/RemoteControlNetwork/PublicIPService.swift" \

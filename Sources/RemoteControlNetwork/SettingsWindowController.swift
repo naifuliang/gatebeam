@@ -76,7 +76,9 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
     private let customProxyField = NSTextField()
     private let proxyExplanationLabel = NSTextField(labelWithString: "")
     private let proxyValidationLabel = NSTextField(labelWithString: "")
-    private let cloudflareFeedbackLabel = NSTextField(labelWithString: "Connect Cloudflare to load your domains.")
+    private let cloudflareFeedbackLabel = NSTextField(
+        labelWithString: "Paste a token, or authorize one saved by an earlier Gatebeam build."
+    )
     private let recordPreviewLabel = NSTextField(labelWithString: "Full address will appear after a domain is selected.")
     private let internalPortField = NSTextField()
     private let externalPortField = NSTextField()
@@ -99,6 +101,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
     private weak var saveButton: NSButton?
     private weak var checkButton: NSButton?
     private weak var connectButton: NSButton?
+    private weak var authorizeTokenButton: NSButton?
 
     init(agent: NetworkAgent, autoLoadCloudflare: Bool = true) {
         self.agent = agent
@@ -121,6 +124,10 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         let savedToken = autoLoadCloudflare ? agent.cloudflareToken() : ""
         update(config: agent.config, token: savedToken)
         update(status: agent.status)
+        if agent.savedTokenNeedsAuthorization {
+            cloudflareFeedbackLabel.stringValue = "A saved token needs approval. Click Authorize Token."
+            cloudflareFeedbackLabel.textColor = .systemOrange
+        }
         if autoLoadCloudflare, !savedToken.isEmpty {
             loadCloudflareZones(showErrors: false)
         }
@@ -362,14 +369,23 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         ))
         panel.addArrangedSubview(labeledField("API token", tokenField))
 
-        let connectButton = iconButton(title: "Verify & Load Domains", symbol: "arrow.triangle.2.circlepath", action: #selector(connectCloudflare))
+        let connectButton = iconButton(title: "Verify", symbol: "arrow.triangle.2.circlepath", action: #selector(connectCloudflare))
+        connectButton.toolTip = "Verify the entered token and load its available Cloudflare domains"
         self.connectButton = connectButton
+        let authorizeButton = iconButton(
+            title: "Authorize Token",
+            symbol: "key",
+            action: #selector(authorizeSavedToken)
+        )
+        authorizeButton.toolTip = "Allow this Gatebeam build to use and securely migrate a previously saved token"
+        self.authorizeTokenButton = authorizeButton
         let helpButton = symbolButton(symbol: "questionmark.circle", toolTip: "Cloudflare token permissions", action: #selector(showCloudflareHelp))
         let buttonStack = NSStackView()
         buttonStack.orientation = .horizontal
         buttonStack.alignment = .centerY
         buttonStack.spacing = 8
         buttonStack.addArrangedSubview(connectButton)
+        buttonStack.addArrangedSubview(authorizeButton)
         let buttonSpacer = NSView()
         buttonSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
         buttonStack.addArrangedSubview(buttonSpacer)
@@ -756,7 +772,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
     @objc private func connectCloudflare() {
         let token = tokenField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !token.isEmpty else {
-            cloudflareFeedbackLabel.stringValue = "Paste a token with Zone DNS Edit and Zone Read permissions."
+            cloudflareFeedbackLabel.stringValue = "Paste a token, or authorize a token saved by an earlier Gatebeam build."
             cloudflareFeedbackLabel.textColor = .systemRed
             return
         }
@@ -764,6 +780,40 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         persist(formConfig()) { [weak self] succeeded in
             guard succeeded else { return }
             self?.loadCloudflareZones(showErrors: true)
+        }
+    }
+
+    @objc private func authorizeSavedToken() {
+        guard !isPersisting else { return }
+        authorizeTokenButton?.isEnabled = false
+        cloudflareFeedbackLabel.stringValue = "Waiting for macOS Keychain authorization..."
+        cloudflareFeedbackLabel.textColor = .secondaryLabelColor
+
+        agent.authorizeSavedCloudflareToken { [weak self] result in
+            guard let self else { return }
+            self.authorizeTokenButton?.isEnabled = true
+            switch result {
+            case .success(.noSavedToken):
+                self.cloudflareFeedbackLabel.stringValue = "No saved token was found. Paste a new scoped token."
+                self.cloudflareFeedbackLabel.textColor = .secondaryLabelColor
+            case .success(.authorized(let token)):
+                self.tokenField.stringValue = token
+                self.cloudflareFeedbackLabel.stringValue = "Saved token authorized for this Gatebeam build."
+                self.cloudflareFeedbackLabel.textColor = .systemGreen
+                self.loadCloudflareZones(showErrors: false)
+            case .success(.migratedLegacyToken(let token)):
+                self.tokenField.stringValue = token
+                self.cloudflareFeedbackLabel.stringValue = "Legacy token secured and removed from the old Keychain item."
+                self.cloudflareFeedbackLabel.textColor = .systemGreen
+                self.loadCloudflareZones(showErrors: false)
+            case .failure(let error):
+                self.cloudflareFeedbackLabel.stringValue = error.localizedDescription
+                self.cloudflareFeedbackLabel.textColor = .systemRed
+                self.showAlert(
+                    title: "Saved token authorization failed",
+                    message: error.localizedDescription
+                )
+            }
         }
     }
 
@@ -778,6 +828,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         saveButton?.isEnabled = !busy
         checkButton?.isEnabled = !busy
         connectButton?.isEnabled = !busy
+        authorizeTokenButton?.isEnabled = !busy
         saveButton?.title = busy ? "Saving..." : "Save Changes"
     }
 
@@ -897,11 +948,13 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
            - Zone / Zone / Read
         3. Under Zone Resources, choose Specific Zone for least privilege, or All Zones to list every domain.
         4. Leave Client IP filtering empty because a DDNS connection can change IP.
-        5. Create the token, paste it here once, then click Verify & Load Domains.
+        5. Create the token, paste it here once, then click Verify.
 
         Domain means the Cloudflare zone, such as example.com. Subdomain is the relative part, such as remote; use @ for the root domain.
 
-        The token is stored only in macOS Keychain. Do not use the Global API Key.
+        The token is stored in a versioned macOS Keychain item restricted to Gatebeam's code-signing identity. Developer ID releases remain authorized across normal upgrades. Developer Preview builds are bound to the exact build; after replacing one, click Authorize Token to let macOS approve and rebind it. Legacy items are read only by that explicit action, then migrated and deleted.
+
+        Do not use the Global API Key.
         """
         alert.addButton(withTitle: "Open Cloudflare")
         alert.addButton(withTitle: "Documentation")
