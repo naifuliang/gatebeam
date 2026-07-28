@@ -112,7 +112,7 @@ The validation suite is split by contract:
 - `test_backend.sh`: Cloudflare, address-family, router mapping, IPv6, and status behavior.
 - `test_proxy_policy.sh`: system/direct/custom routing, direct-proxy disabling, supported `http://` / `socks5://` forms, invalid proxy rejection, and direct-only LAN control.
 - `test_integration_contract.sh`: configuration normalization, non-Custom proxy URL clearing, injected-store isolation, explicit Keychain migration/failure latching, local-origin status semantics, and stable login-path behavior.
-- `test_keychain_identity.sh`: Developer Preview and Developer ID signing-contract validation, exact-build identity rejection, and hardened-runtime library-injection rejection. It does not access any Keychain.
+- `test_keychain_identity.sh`: Developer Preview and Developer ID signing-contract validation, exact-build identity rejection, and host-aware hardened-runtime library-validation evidence. It does not access any Keychain.
 - `test_upgrade.sh`: migration, rollback, symlink/path safety, and stable LaunchAgent installation behavior.
 - `test_ui_validation.sh`: isolated AppKit validation mode, no network side effects, no Keychain prompts, and UI contract coverage.
 - `test_build_assets.sh`: icon, app bundle, PKG, and DMG staging/build-asset checks.
@@ -128,7 +128,9 @@ GATEBEAM_DEVELOPER_TEAM_ID='TEAMID' \
 ./scripts/build_app.sh
 ```
 
-The build then enables hardened runtime and timestamping and verifies that the resulting designated requirement contains the Apple generic anchor and expected leaf Team ID. Gatebeam does not accept a manually weakened identifier-only requirement.
+The build then enables hardened runtime and timestamping and verifies that the resulting designated requirement contains the Apple generic anchor and expected leaf Team ID. Gatebeam does not accept a manually weakened identifier-only requirement. A formal Developer ID build also runs an independent CLI fixture to confirm that the host can enforce library validation; if the host cannot provide that runtime evidence, the formal build is blocked instead of silently weakening the release gate.
+
+Developer Preview validation uses the same independent fixture to classify the host before testing Gatebeam. On hosts that enforce library validation for ad-hoc hardened-runtime processes, a different-identity library must be rejected by Gatebeam. Some CI hosts do not enforce that ad-hoc policy; they emit an explicit warning and retain all static runtime, identifier, strict-signature, and entitlement checks without claiming that runtime injection rejection was proven.
 
 For a distributable artifact:
 

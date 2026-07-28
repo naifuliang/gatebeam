@@ -8,6 +8,7 @@ APP_PATH="$ROOT_DIR/dist/Gatebeam.app"
 APP_EXECUTABLE="$APP_PATH/Contents/MacOS/Gatebeam"
 INJECTION_SOURCE="$ROOT_DIR/Tests/KeychainIdentityTests/DYLDInjectionProbe.c"
 SIGNING_CONTRACT="$ROOT_DIR/scripts/signing_contract.sh"
+LIBRARY_VALIDATION_PROBE="$ROOT_DIR/scripts/probe_library_validation.sh"
 BUNDLE_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$ROOT_DIR/Resources/Info.plist")"
 SPOOF_APP="$BUILD_DIR/SpoofedGatebeam.bundle-fixture"
 INJECTION_DYLIB="$BUILD_DIR/libGatebeamInjectionProbe.dylib"
@@ -52,9 +53,20 @@ fi
 if ! gatebeam_validate_preview_contract \
   "$requirement" \
   "$signing_details" \
-  "$entitlements"; then
+  "$entitlements" \
+  "$BUNDLE_ID"; then
   print -u2 "Developer Preview does not satisfy its signing contract."
   print -u2 "$requirement_output"
+  exit 1
+fi
+
+wrong_preview_details="${signing_details/Identifier=$BUNDLE_ID/Identifier=$BUNDLE_ID.spoof}"
+if gatebeam_validate_preview_contract \
+  "$requirement" \
+  "$wrong_preview_details" \
+  "$entitlements" \
+  "$BUNDLE_ID" >/dev/null 2>&1; then
+  print -u2 "Developer Preview accepted a mismatched signed bundle identifier."
   exit 1
 fi
 
@@ -168,86 +180,132 @@ expect_developer_id_rejection \
   "$developer_id_requirement" \
   "Identifier=$BUNDLE_ID"$'\nCodeDirectory v=20500 flags=0x10000(runtime)\nTeamIdentifier=TEAMID1234\nRuntime Version=15.0.0\nTimestamp=Jul 28, 2026 at 12:34:56' \
   "$empty_entitlements"
-expect_developer_id_rejection \
-  "unsafe DYLD entitlement" \
-  "$developer_id_requirement" \
-  "$developer_id_details" \
-  '<key>com.apple.security.cs.allow-dyld-environment-variables</key><true/>'
-expect_developer_id_rejection \
-  "disabled library validation" \
-  "$developer_id_requirement" \
-  "$developer_id_details" \
-  '<key>com.apple.security.cs.disable-library-validation</key><true/>'
-expect_developer_id_rejection \
-  "debug task entitlement" \
-  "$developer_id_requirement" \
-  "$developer_id_details" \
-  '<key>com.apple.security.get-task-allow</key><true/>'
-expect_developer_id_rejection \
-  "unsigned executable memory entitlement" \
-  "$developer_id_requirement" \
-  "$developer_id_details" \
-  '<key>com.apple.security.cs.allow-unsigned-executable-memory</key><true/>'
-
-/usr/bin/xcrun clang \
-  -dynamiclib \
-  -O2 \
-  "$INJECTION_SOURCE" \
-  -o "$INJECTION_DYLIB"
-/usr/bin/codesign \
-  --force \
-  --sign - \
-  "$INJECTION_DYLIB" >/dev/null
-
-app_cdhash="$(
-  /usr/bin/codesign -d --verbose=4 "$APP_PATH" 2>&1 |
-    /usr/bin/sed -n 's/^CDHash=//p'
-)"
-injection_cdhash="$(
-  /usr/bin/codesign -d --verbose=4 "$INJECTION_DYLIB" 2>&1 |
-    /usr/bin/sed -n 's/^CDHash=//p'
-)"
-if [[ -z "$app_cdhash" ||
-      -z "$injection_cdhash" ||
-      "$app_cdhash" == "$injection_cdhash" ]]; then
-  print -u2 "DYLD injection fixture must have a different code identity."
-  exit 1
-fi
-
-HOME="$INJECTION_HOME" \
-CFFIXED_USER_HOME="$INJECTION_HOME" \
-TMPDIR="$INJECTION_HOME/tmp/" \
-GATEBEAM_DYLD_INJECTION_SENTINEL="$INJECTION_SENTINEL" \
-DYLD_INSERT_LIBRARIES="$INJECTION_DYLIB" \
-  "$APP_EXECUTABLE" --signing-runtime-probe >"$INJECTION_LOG" 2>&1 &
-INJECTION_PID=$!
-
-injection_process_survived=true
-for _ in {1..40}; do
-  if ! kill -0 "$INJECTION_PID" 2>/dev/null; then
-    injection_process_survived=false
-    break
-  fi
-  if [[ -e "$INJECTION_SENTINEL" ]]; then
-    print -u2 "A different-cdhash library was injected into Gatebeam."
-    exit 1
-  fi
-  /bin/sleep 0.1
+for forbidden_entitlement in \
+  "com.apple.security.cs.allow-jit" \
+  "com.apple.security.cs.allow-unsigned-executable-memory" \
+  "com.apple.security.cs.disable-executable-page-protection" \
+  "com.apple.security.cs.allow-dyld-environment-variables" \
+  "com.apple.security.cs.disable-library-validation" \
+  "com.apple.security.cs.debugger" \
+  "com.apple.security.get-task-allow"
+do
+  expect_developer_id_rejection \
+    "forbidden entitlement $forbidden_entitlement" \
+    "$developer_id_requirement" \
+    "$developer_id_details" \
+    "<key>$forbidden_entitlement</key><true/>"
 done
 
-if [[ "$injection_process_survived" == true ]]; then
-  kill -TERM "$INJECTION_PID" 2>/dev/null || true
+[[ "$(gatebeam_classify_ad_hoc_library_validation loaded rejected)" == "supported" ]]
+[[ "$(gatebeam_classify_ad_hoc_library_validation loaded loaded)" == "unsupported" ]]
+if gatebeam_classify_ad_hoc_library_validation rejected rejected >/dev/null 2>&1; then
+  print -u2 "Capability classification accepted a broken control fixture."
+  exit 1
 fi
-wait "$INJECTION_PID" 2>/dev/null || true
-INJECTION_PID=""
-if [[ -e "$INJECTION_SENTINEL" ]]; then
-  print -u2 "A different-cdhash library was injected into Gatebeam."
+gatebeam_validate_preview_library_validation_evidence supported rejected
+if gatebeam_validate_preview_library_validation_evidence \
+  supported loaded >/dev/null 2>&1; then
+  print -u2 "Preview policy accepted an injected library on a supported host."
+  exit 1
+fi
+unsupported_warning="$(
+  GITHUB_ACTIONS=true \
+    gatebeam_validate_preview_library_validation_evidence \
+      unsupported not-run 2>&1
+)"
+if [[ "$unsupported_warning" != *"::warning "* ||
+      "$unsupported_warning" != *"runtime injection rejection was not proven"* ]]; then
+  print -u2 "Unsupported-host policy did not emit an explicit CI warning."
+  exit 1
+fi
+if gatebeam_validate_preview_library_validation_evidence \
+  unsupported rejected >/dev/null 2>&1; then
+  print -u2 "Unsupported-host policy incorrectly claimed runtime evidence."
+  exit 1
+fi
+gatebeam_require_formal_library_validation_capability supported
+if gatebeam_require_formal_library_validation_capability \
+  unsupported >/dev/null 2>&1; then
+  print -u2 "Formal release policy accepted an unverified host capability."
   exit 1
 fi
 
-# An ad-hoc hardened process may reject the malicious launch before main,
-# while a Developer ID process can ignore the DYLD variable. Both outcomes
-# are secure; the same signed executable must still pass a clean CLI-only probe.
+library_validation_capability="$(
+  /bin/zsh -f "$LIBRARY_VALIDATION_PROBE"
+)"
+case "$library_validation_capability" in
+  supported)
+    /usr/bin/xcrun clang \
+      -dynamiclib \
+      -O2 \
+      "$INJECTION_SOURCE" \
+      -o "$INJECTION_DYLIB"
+    /usr/bin/codesign \
+      --force \
+      --sign - \
+      "$INJECTION_DYLIB" >/dev/null
+
+    app_cdhash="$(
+      /usr/bin/codesign -d --verbose=4 "$APP_PATH" 2>&1 |
+        /usr/bin/sed -n 's/^CDHash=//p'
+    )"
+    injection_cdhash="$(
+      /usr/bin/codesign -d --verbose=4 "$INJECTION_DYLIB" 2>&1 |
+        /usr/bin/sed -n 's/^CDHash=//p'
+    )"
+    if [[ -z "$app_cdhash" ||
+          -z "$injection_cdhash" ||
+          "$app_cdhash" == "$injection_cdhash" ]]; then
+      print -u2 "DYLD injection fixture must have a different code identity."
+      exit 1
+    fi
+
+    HOME="$INJECTION_HOME" \
+    CFFIXED_USER_HOME="$INJECTION_HOME" \
+    TMPDIR="$INJECTION_HOME/tmp/" \
+    GATEBEAM_DYLD_INJECTION_SENTINEL="$INJECTION_SENTINEL" \
+    DYLD_INSERT_LIBRARIES="$INJECTION_DYLIB" \
+      "$APP_EXECUTABLE" --signing-runtime-probe >"$INJECTION_LOG" 2>&1 &
+    INJECTION_PID=$!
+
+    injection_process_survived=true
+    for _ in {1..40}; do
+      if ! kill -0 "$INJECTION_PID" 2>/dev/null; then
+        injection_process_survived=false
+        break
+      fi
+      if [[ -e "$INJECTION_SENTINEL" ]]; then
+        gatebeam_validate_preview_library_validation_evidence \
+          supported loaded
+      fi
+      /bin/sleep 0.1
+    done
+
+    if [[ "$injection_process_survived" == true ]]; then
+      kill -TERM "$INJECTION_PID" 2>/dev/null || true
+    fi
+    wait "$INJECTION_PID" 2>/dev/null || true
+    INJECTION_PID=""
+    if [[ -e "$INJECTION_SENTINEL" ]]; then
+      gatebeam_validate_preview_library_validation_evidence \
+        supported loaded
+    fi
+    gatebeam_validate_preview_library_validation_evidence \
+      supported rejected
+    validation_summary="runtime injection rejection proven"
+    ;;
+  unsupported)
+    gatebeam_validate_preview_library_validation_evidence \
+      unsupported not-run
+    validation_summary="runtime injection rejection not proven on this host"
+    ;;
+  *)
+    print -u2 "Library-validation capability probe returned: $library_validation_capability"
+    exit 1
+    ;;
+esac
+
+# The same signed executable must always pass a clean CLI-only probe.
 if ! clean_probe_output="$(
   HOME="$INJECTION_HOME" \
   CFFIXED_USER_HOME="$INJECTION_HOME" \
@@ -271,4 +329,4 @@ if [[ "$identity_probe_output" != "Gatebeam signing identity accepted" ]]; then
   exit 1
 fi
 
-print "Signing identity contract passed: runtime identity binding, hardened runtime, TN3127 fixtures, exact-build requirement, and injection rejection."
+print "Signing identity contract passed: runtime identity binding, hardened runtime, TN3127 fixtures, exact-build requirement, and $validation_summary."

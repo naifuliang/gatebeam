@@ -20,6 +20,7 @@ HARDENED_SCRIPTS=(
   build_icon.sh
   package_dmg.sh
   package_pkg.sh
+  probe_library_validation.sh
   render_ui_snapshots.sh
   test_backend.sh
   test_build_assets.sh

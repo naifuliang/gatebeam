@@ -38,16 +38,31 @@ chmod +x "$EXECUTABLE"
 
 if command -v codesign >/dev/null 2>&1; then
   source "$SIGNING_CONTRACT"
+  if [[ "$CODE_SIGN_IDENTITY" != "-" &&
+        ! "$DEVELOPER_TEAM_ID" =~ '^[A-Z0-9]{10}$' ]]; then
+    print -u2 "GATEBEAM_DEVELOPER_TEAM_ID must be a 10-character Apple Team ID."
+    exit 1
+  fi
   if [[ "$CODE_SIGN_IDENTITY" == "-" ]]; then
-    /usr/bin/plutil -remove GatebeamDeveloperTeamIdentifier \
-      "$CONTENTS_DIR/Info.plist" 2>/dev/null || true
-  else
-    /usr/bin/plutil -replace GatebeamDeveloperTeamIdentifier \
-      -string "$DEVELOPER_TEAM_ID" \
-      "$CONTENTS_DIR/Info.plist" 2>/dev/null ||
-      /usr/bin/plutil -insert GatebeamDeveloperTeamIdentifier \
-        -string "$DEVELOPER_TEAM_ID" \
+    if /usr/libexec/PlistBuddy \
+      -c "Print :GatebeamDeveloperTeamIdentifier" \
+      "$CONTENTS_DIR/Info.plist" >/dev/null 2>&1; then
+      /usr/libexec/PlistBuddy \
+        -c "Delete :GatebeamDeveloperTeamIdentifier" \
         "$CONTENTS_DIR/Info.plist"
+    fi
+  else
+    if /usr/libexec/PlistBuddy \
+      -c "Print :GatebeamDeveloperTeamIdentifier" \
+      "$CONTENTS_DIR/Info.plist" >/dev/null 2>&1; then
+      /usr/libexec/PlistBuddy \
+        -c "Set :GatebeamDeveloperTeamIdentifier $DEVELOPER_TEAM_ID" \
+        "$CONTENTS_DIR/Info.plist"
+    else
+      /usr/libexec/PlistBuddy \
+        -c "Add :GatebeamDeveloperTeamIdentifier string $DEVELOPER_TEAM_ID" \
+        "$CONTENTS_DIR/Info.plist"
+    fi
   fi
   sign_arguments=(
     --force
@@ -75,7 +90,8 @@ if command -v codesign >/dev/null 2>&1; then
     if ! gatebeam_validate_preview_contract \
       "$designated_requirement" \
       "$signing_details" \
-      "$entitlements"; then
+      "$entitlements" \
+      "$bundle_identifier"; then
       print -u2 "$designated_requirement"
       exit 1
     fi
@@ -100,6 +116,12 @@ if command -v codesign >/dev/null 2>&1; then
       print -u2 "Signature does not satisfy the required Developer ID Application certificate chain."
       exit 1
     fi
+
+    library_validation_capability="$(
+      /bin/zsh -f "$ROOT_DIR/scripts/probe_library_validation.sh"
+    )"
+    gatebeam_require_formal_library_validation_capability \
+      "$library_validation_capability"
   fi
 fi
 
