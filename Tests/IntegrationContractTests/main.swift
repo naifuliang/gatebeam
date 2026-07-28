@@ -2819,6 +2819,152 @@ func testTemporaryAccessUsesIndependentExpirationTimer() throws {
     agent.stop()
 }
 
+func testTemporaryAccessExpirationDoesNotWaitForKeychainAuthorization() throws {
+    let baseDirectory = try makeTemporaryDirectory(named: "expiration-keychain-isolation")
+    defer { try? FileManager.default.removeItem(at: baseDirectory) }
+
+    let clock = LockedClock(Date(timeIntervalSince1970: 2_000_300_000))
+    let expiresAt = clock.now().addingTimeInterval(60)
+    let mapping = activeMappingFixture(
+        transport: .pcp,
+        family: .ipv4,
+        renewAfter: clock.now().addingTimeInterval(30),
+        leaseExpiresAt: expiresAt
+    )
+    var config = AppConfig.default
+    config.remoteAccessEnabled = true
+    config.dnsProvider = .disabled
+    config.preferredAddressFamily = .ipv4
+    config.mappingProtocolPreference = .pcp
+    config.externalPort = mapping.externalPort
+    config.pcpNonce = mapping.pcpNonce
+    config.activeRouterMappings = [mapping]
+    config.accessExpiresAt = expiresAt
+
+    let authorizationStarted = DispatchSemaphore(value: 0)
+    let releaseAuthorization = DispatchSemaphore(value: 0)
+    let keychain = KeychainStore(
+        service: "io.github.naifuliang.gatebeam.expiration-keychain-isolation",
+        legacyServices: [],
+        operationHandlers: KeychainOperationHandlers(
+            scopedSet: { _, _, _, _, _ in },
+            scopedGet: { _, _, interaction in
+                if interaction == .userInitiated {
+                    authorizationStarted.signal()
+                    releaseAuthorization.wait()
+                }
+                return "blocked-authorization-token"
+            },
+            scopedDelete: { _, _, _ in }
+        )
+    )
+    let scheduleLock = NSLock()
+    var expirationHandler: (() -> Void)?
+    let resultLock = NSLock()
+    var authorizationResult: Result<KeychainAuthorizationOutcome, Error>?
+    var staleSaveResult: Result<AppConfig, Error>?
+    let router = MockRouterMappingService()
+    let agent = NetworkAgent(
+        configStore: AppConfigStore(baseDirectory: baseDirectory),
+        keychain: keychain,
+        initialConfig: config,
+        localNetworkService: MockLocalNetworkService(),
+        routerMappingService: router,
+        nowProvider: { clock.now() },
+        expirationTimerScheduler: { _, handler in
+            scheduleLock.lock()
+            expirationHandler = handler
+            scheduleLock.unlock()
+            return NetworkAgentScheduledTimer {}
+        }
+    )
+
+    agent.start()
+    try expect(
+        waitUntil {
+            scheduleLock.lock()
+            let isScheduled = expirationHandler != nil
+            scheduleLock.unlock()
+            return isScheduled
+        },
+        "The access deadline must be scheduled before authorization starts"
+    )
+    agent.authorizeSavedCloudflareToken { result in
+        resultLock.lock()
+        authorizationResult = result
+        resultLock.unlock()
+    }
+    try expect(
+        authorizationStarted.wait(timeout: .now() + 3) == .success,
+        "The injected authorization must block on the isolated Keychain queue"
+    )
+    agent.persistSettingsAsync(
+        config: config,
+        token: "stale-settings-token"
+    ) { result in
+        resultLock.lock()
+        staleSaveResult = result
+        resultLock.unlock()
+    }
+
+    clock.set(expiresAt)
+    scheduleLock.lock()
+    let handler = expirationHandler
+    scheduleLock.unlock()
+    guard let handler else {
+        throw IntegrationContractFailure("The access expiration handler was not captured")
+    }
+    handler()
+
+    try expect(
+        waitUntil {
+            !agent.config.remoteAccessEnabled
+                && agent.config.accessExpiresAt == nil
+                && agent.config.activeRouterMappings.isEmpty
+        },
+        "Temporary access must expire while Keychain authorization is still blocked"
+    )
+    try expect(
+        router.removalCalls == [mapping],
+        "Expiration must schedule and complete exact mapping cleanup without waiting for Keychain UI"
+    )
+    resultLock.lock()
+    let completedWhileBlocked = authorizationResult != nil
+    let staleSaveCompletedWhileBlocked = staleSaveResult != nil
+    resultLock.unlock()
+    try expect(!completedWhileBlocked, "The fixture must still have authorization blocked at the deadline")
+    try expect(
+        !staleSaveCompletedWhileBlocked,
+        "A settings save queued behind authorization must not occupy the access state queue"
+    )
+
+    releaseAuthorization.signal()
+    try expect(
+        waitUntil {
+            resultLock.lock()
+            let completed = authorizationResult != nil && staleSaveResult != nil
+            resultLock.unlock()
+            return completed
+        },
+        "Authorization and the stale queued save must finish after the fixture releases it"
+    )
+    resultLock.lock()
+    let finalAuthorization = authorizationResult
+    let finalStaleSave = staleSaveResult
+    resultLock.unlock()
+    _ = try finalAuthorization?.get()
+    if case .success = finalStaleSave {
+        throw IntegrationContractFailure(
+            "A settings save based on the pre-expiration revision must be superseded"
+        )
+    }
+    try expect(!agent.config.remoteAccessEnabled, "Late authorization must not reopen remote access")
+    try expect(agent.config.accessExpiresAt == nil, "Late authorization must not restore the expired deadline")
+    try expect(agent.config.activeRouterMappings.isEmpty, "Late authorization must not restore router mappings")
+    try expect(router.removalCalls == [mapping], "Late authorization must not repeat or undo mapping cleanup")
+    agent.stop()
+}
+
 func testTemporaryAccessRevokesAnExistingOverlongLease() throws {
     let baseDirectory = try makeTemporaryDirectory(named: "temporary-lease-shortening")
     defer { try? FileManager.default.removeItem(at: baseDirectory) }
@@ -3597,6 +3743,7 @@ let tests: [(String, () throws -> Void)] = [
     ("post-cleanup persistence truth", testPostCleanupPersistenceFailureKeepsTruthfulMappingState),
     ("temporary access cleanup retry", testTemporaryAccessExpiryDoesNotHideCleanupFailure),
     ("independent temporary access expiration", testTemporaryAccessUsesIndependentExpirationTimer),
+    ("temporary access expiration ignores Keychain prompts", testTemporaryAccessExpirationDoesNotWaitForKeychainAuthorization),
     ("temporary access shortens existing router lease", testTemporaryAccessRevokesAnExistingOverlongLease),
     ("mapping renewal and address reconciliation", testMappingRenewalWindowAndAddressChangeReconciliation),
     ("mapping checkpoint compensation", testMappingCreationIsCompensatedWhenCheckpointWriteFails),
