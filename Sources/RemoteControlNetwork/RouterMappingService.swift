@@ -72,17 +72,20 @@ final class RouterMappingService: RouterMappingServicing {
     private let upnpDiscoveryHandler: (() throws -> [UPnPService])?
     private let upnpDescriptionHandler: ((URL) throws -> Data)?
     private let soapRequestHandler: ((URL, String, String, String) throws -> HTTPResponse)?
+    private let udpRequestHandler: ((Data, String, UInt16, Int) throws -> Data)?
     private let removalHandler: ((ActiveRouterMapping) throws -> Void)?
 
     init(
         upnpDiscoveryHandler: (() throws -> [UPnPService])? = nil,
         upnpDescriptionHandler: ((URL) throws -> Data)? = nil,
         soapRequestHandler: ((URL, String, String, String) throws -> HTTPResponse)? = nil,
+        udpRequestHandler: ((Data, String, UInt16, Int) throws -> Data)? = nil,
         removalHandler: ((ActiveRouterMapping) throws -> Void)? = nil
     ) {
         self.upnpDiscoveryHandler = upnpDiscoveryHandler
         self.upnpDescriptionHandler = upnpDescriptionHandler
         self.soapRequestHandler = soapRequestHandler
+        self.udpRequestHandler = udpRequestHandler
         self.removalHandler = removalHandler
     }
 
@@ -389,14 +392,34 @@ final class RouterMappingService: RouterMappingServicing {
         familyName: String
     ) throws -> PortMappingResult {
         let nonce = pcpNonce(config: config)
-        let response = try sendPCPMapping(
-            config: config,
-            localAddress: localAddress,
-            gatewayAddress: gatewayAddress,
-            lifetime: config.mappingLeaseSeconds,
-            nonce: nonce
-        )
         let family: RouterMappingAddressFamily = familyName == "IPv6" ? .ipv6 : .ipv4
+        let response: PCPMappingResponse
+        do {
+            response = try sendPCPMapping(
+                config: config,
+                localAddress: localAddress,
+                gatewayAddress: gatewayAddress,
+                lifetime: config.mappingLeaseSeconds,
+                nonce: nonce
+            )
+        } catch {
+            guard Self.isUncertainCreationError(error) else { throw error }
+            var candidate = activeMapping(
+                config: config,
+                transport: .pcp,
+                family: family,
+                localAddress: localAddress,
+                gatewayAddress: gatewayAddress,
+                externalPort: config.externalPort,
+                lifetime: config.mappingLeaseSeconds
+            )
+            candidate.pcpNonce = nonce.base64EncodedString()
+            throw RouterMappingRecoveryRequiredError(
+                mapping: candidate,
+                operationDescription: "PCP mapping request was sent, but its result is uncertain.",
+                cleanupDescription: error.localizedDescription
+            )
+        }
         var mapping = activeMapping(
             config: config,
             transport: .pcp,
@@ -446,7 +469,30 @@ final class RouterMappingService: RouterMappingServicing {
         localAddress: String,
         gatewayAddress: String
     ) throws -> PortMappingResult {
-        let response = try sendNATPMPMapping(config: config, gatewayAddress: gatewayAddress, lifetime: config.mappingLeaseSeconds)
+        let response: NATPMPMappingResponse
+        do {
+            response = try sendNATPMPMapping(
+                config: config,
+                gatewayAddress: gatewayAddress,
+                lifetime: config.mappingLeaseSeconds
+            )
+        } catch {
+            guard Self.isUncertainCreationError(error) else { throw error }
+            let candidate = activeMapping(
+                config: config,
+                transport: .natpmp,
+                family: .ipv4,
+                localAddress: localAddress,
+                gatewayAddress: gatewayAddress,
+                externalPort: config.externalPort,
+                lifetime: config.mappingLeaseSeconds
+            )
+            throw RouterMappingRecoveryRequiredError(
+                mapping: candidate,
+                operationDescription: "NAT-PMP mapping request was sent, but its result is uncertain.",
+                cleanupDescription: error.localizedDescription
+            )
+        }
         let routerExternalAddress = try? queryNATPMPExternalAddress(gatewayAddress: gatewayAddress)
         return PortMappingResult(
             protocolName: "NAT-PMP",
@@ -679,8 +725,27 @@ final class RouterMappingService: RouterMappingServicing {
         if let existingID = pinholeID {
             do {
                 try updateUPnPIPv6Pinhole(service: service, pinholeID: existingID, lease: lease)
-            } catch {
+            } catch let error as RouterMappingError
+            where error.isMissingIPv6UPnPPinholeForUpdate {
                 pinholeID = nil
+            } catch {
+                let candidate = activeMapping(
+                    config: config,
+                    transport: .upnp,
+                    family: .ipv6,
+                    localAddress: localAddress,
+                    gatewayAddress: gatewayAddress,
+                    externalPort: config.internalPort,
+                    lifetime: lease,
+                    pinholeID: existingID,
+                    protocolState: binding
+                )
+                throw RouterMappingRecoveryRequiredError(
+                    mapping: candidate,
+                    operationDescription:
+                        "UPnP IPv6 pinhole \(existingID) renewal result is uncertain.",
+                    cleanupDescription: error.localizedDescription
+                )
             }
         }
         if pinholeID == nil {
@@ -1081,6 +1146,9 @@ final class RouterMappingService: RouterMappingServicing {
     }
 
     private func udpRequest(payload: Data, host: String, port: UInt16, timeoutSeconds: Int) throws -> Data {
+        if let udpRequestHandler {
+            return try udpRequestHandler(payload, host, port, timeoutSeconds)
+        }
         var hints = addrinfo()
         hints.ai_family = AF_UNSPEC
         hints.ai_socktype = SOCK_DGRAM
@@ -1132,9 +1200,21 @@ final class RouterMappingService: RouterMappingServicing {
             if count > 0 {
                 return Data(buffer.prefix(count))
             }
-            lastError = "No UDP response from \(host):\(port)"
+            throw RouterMappingError.uncertainAfterSend(
+                "No UDP response from \(host):\(port) after the request was sent"
+            )
         }
         throw RouterMappingError.timeout(lastError)
+    }
+
+    private static func isUncertainCreationError(_ error: Error) -> Bool {
+        guard let mappingError = error as? RouterMappingError else { return false }
+        switch mappingError {
+        case .uncertainAfterSend, .invalidResponse:
+            return true
+        default:
+            return false
+        }
     }
 
     private func pcpNonce(config: AppConfig) -> Data {
@@ -1509,6 +1589,7 @@ enum RouterMappingError: Error, LocalizedError {
     case disabled
     case socket(String)
     case timeout(String)
+    case uncertainAfterSend(String)
     case invalidResponse(String)
     case protocolFailure(String)
     case upnpFault(action: String, serviceType: String, statusCode: Int, errorCode: Int?, description: String?)
@@ -1518,7 +1599,7 @@ enum RouterMappingError: Error, LocalizedError {
         switch self {
         case .disabled:
             return "Router mapping is disabled"
-        case .socket(let message), .timeout(let message), .invalidResponse(let message), .protocolFailure(let message), .allProtocolsFailed(let message):
+        case .socket(let message), .timeout(let message), .uncertainAfterSend(let message), .invalidResponse(let message), .protocolFailure(let message), .allProtocolsFailed(let message):
             return message
         case .upnpFault(let action, _, let statusCode, let errorCode, let description):
             let code = errorCode.map { " code \($0)" } ?? ""
@@ -1555,6 +1636,24 @@ enum RouterMappingError: Error, LocalizedError {
             let description
         ) = self,
               action == "DeletePinhole",
+              serviceType.contains("WANIPv6FirewallControl") else {
+            return false
+        }
+        if let errorCode {
+            return errorCode == 704
+        }
+        return Self.isNoSuchEntryDescription(description)
+    }
+
+    var isMissingIPv6UPnPPinholeForUpdate: Bool {
+        guard case .upnpFault(
+            let action,
+            let serviceType,
+            _,
+            let errorCode,
+            let description
+        ) = self,
+              action == "UpdatePinhole",
               serviceType.contains("WANIPv6FirewallControl") else {
             return false
         }

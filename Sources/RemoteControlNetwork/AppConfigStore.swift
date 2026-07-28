@@ -139,11 +139,14 @@ enum SecureAtomicFileWriter {
 
 enum AppConfigStoreError: Error, LocalizedError {
     case persistenceFailed(URL, Error)
+    case decodingFailed(URL, Error)
 
     var errorDescription: String? {
         switch self {
         case .persistenceFailed(let url, let error):
             return "Could not save configuration at \(url.path): \(error.localizedDescription)"
+        case .decodingFailed(let url, let error):
+            return "Could not decode configuration at \(url.path): \(error.localizedDescription)"
         }
     }
 }
@@ -228,9 +231,7 @@ final class AppConfigStore {
         do {
             decoded = try decoder.decode(AppConfig.self, from: data)
         } catch {
-            let config = AppConfig.default
-            try save(config)
-            return config
+            throw AppConfigStoreError.decodingFailed(fileURL, error)
         }
 
         let sanitized = sanitizedForStorage(decoded)

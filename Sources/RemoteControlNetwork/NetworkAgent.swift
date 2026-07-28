@@ -261,6 +261,7 @@ final class NetworkAgent {
     private var pendingCheckRetriesKeychain = false
     private var mappingRecoveryMappings: [ActiveRouterMapping]
     private var recoveryStateUnknown = false
+    private var configStateUnknown = false
     private var storedStatus = AppStatus.initial
     private var storedConfig: AppConfig
     private var storedStatusCallback: ((AppStatus) -> Void)?
@@ -321,11 +322,18 @@ final class NetworkAgent {
         var recoveryMappings: [ActiveRouterMapping] = []
         var loadErrorMessage: String?
         var loadedRecoveryStateUnknown = false
+        var loadedConfigStateUnknown = false
         if initialConfig == nil, sideEffectsEnabled {
             do {
                 loadedConfig = try effectiveConfigStore.load()
             } catch {
-                loadErrorMessage = error.localizedDescription
+                loadedConfigStateUnknown = true
+                loadedRecoveryStateUnknown = true
+                loadErrorMessage = [
+                    "Configuration could not be decoded or read.",
+                    "Back up the damaged config before restoring a known-good copy.",
+                    error.localizedDescription
+                ].joined(separator: "\n")
             }
         }
         if sideEffectsEnabled {
@@ -380,6 +388,7 @@ final class NetworkAgent {
         self.storedConfig = loadedConfig
         self.mappingRecoveryMappings = recoveryMappings
         self.recoveryStateUnknown = loadedRecoveryStateUnknown
+        self.configStateUnknown = loadedConfigStateUnknown
         self.configPersistenceErrorMessage = loadErrorMessage
         if loadedRecoveryStateUnknown {
             self.routerMappingErrorMessage = Self.unknownRecoveryStateMessage(
@@ -440,6 +449,7 @@ final class NetworkAgent {
             }
 
             do {
+                try self.requireKnownConfigState()
                 try self.requireCurrentRevision(mutationRevision)
                 if self.mappingLifecycleChanged(from: rollbackConfig, to: appliedConfig) {
                     rollbackConfig = try self.revokeMappingsBeforeConfigChange(
@@ -516,6 +526,7 @@ final class NetworkAgent {
         }
 
         return try withTransaction {
+            try requireKnownConfigState()
             try requireCurrentRevision(mutationRevision)
             let previousToken = try withMutationSideEffect(
                 revision: mutationRevision,
@@ -951,7 +962,7 @@ final class NetworkAgent {
     private static func unknownRecoveryStateMessage(detail: String) -> String {
         [
             "Router recovery state could not be verified. Gatebeam will not create a new mapping.",
-            "Repair the journal permissions or remove the damaged journal only after confirming that the router rule is closed, then run Check Now.",
+            "Back up the damaged file, then restore a known-good config or repair the journal. Remove recovery data only after confirming that the router rule is closed, then run Check Now.",
             detail
         ].joined(separator: "\n")
     }
@@ -997,6 +1008,14 @@ final class NetworkAgent {
         var recoveredMappings = withState { mappingRecoveryMappings }
         if withState({ recoveryStateUnknown }) {
             do {
+                if withState({ configStateUnknown }) {
+                    workingConfig = try configStore.load()
+                    withState {
+                        configStateUnknown = false
+                        storedConfig = workingConfig
+                        notifyConfigChangedOnStateQueue(workingConfig)
+                    }
+                }
                 recoveredMappings = try reloadAllRecoverySources(config: workingConfig)
                 if recoveredMappings.isEmpty {
                     try saveAllRecoveryJournals([])
@@ -2252,6 +2271,14 @@ final class NetworkAgent {
     private func requireCurrentRevision(_ revision: UInt64) throws {
         guard isCurrentRevision(revision) else {
             throw NetworkAgentError.superseded
+        }
+    }
+
+    private func requireKnownConfigState() throws {
+        guard !withState({ configStateUnknown }) else {
+            throw NetworkAgentError.transactionFailed(
+                "The damaged configuration must be backed up and restored before settings can be saved."
+            )
         }
     }
 

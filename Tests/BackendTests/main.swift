@@ -695,6 +695,175 @@ func testAutomaticMappingPreservesRecoveryIdentity() throws {
     }
 }
 
+func testAutomaticStopsAfterUncertainPCPOrNATPMPRequest() throws {
+    var config = AppConfig.default
+    config.mappingProtocolPreference = .automatic
+    config.preferredAddressFamily = .ipv4
+    config.internalPort = 5900
+    config.externalPort = 45900
+    config.mappingLeaseSeconds = 3600
+    config.pcpNonce = Data(repeating: 13, count: 12).base64EncodedString()
+
+    var pcpCalls = 0
+    let uncertainPCP = RouterMappingService(
+        udpRequestHandler: { _, _, _, _ in
+            pcpCalls += 1
+            throw RouterMappingError.uncertainAfterSend("Injected PCP response loss")
+        }
+    )
+    do {
+        _ = try uncertainPCP.ensureMapping(
+            config: config,
+            localAddress: "192.0.2.20",
+            gatewayAddress: "192.0.2.1"
+        )
+        throw TestFailure("Uncertain PCP creation must require recovery")
+    } catch let recovery as RouterMappingRecoveryRequiredError {
+        try expect(pcpCalls == 1, "Automatic must stop immediately after uncertain PCP creation")
+        try expect(recovery.mapping.transport == .pcp, "PCP uncertainty must retain PCP identity")
+        try expect(recovery.mapping.gatewayAddress == "192.0.2.1", "PCP uncertainty must retain the gateway")
+        try expect(recovery.mapping.internalPort == 5900, "PCP uncertainty must retain the internal port")
+        try expect(recovery.mapping.externalPort == 45900, "PCP uncertainty must retain the candidate external port")
+        try expect(recovery.mapping.pcpNonce == config.pcpNonce, "PCP uncertainty must retain the nonce")
+    }
+
+    var udpActions: [String] = []
+    var upnpDiscoveryCount = 0
+    let uncertainNATPMP = RouterMappingService(
+        upnpDiscoveryHandler: {
+            upnpDiscoveryCount += 1
+            return []
+        },
+        udpRequestHandler: { payload, _, _, _ in
+            if payload.first == 2 {
+                udpActions.append("pcp-rejected")
+                var rejected = payload
+                rejected[1] = 0x81
+                rejected[3] = 2
+                return rejected
+            }
+            udpActions.append("natpmp-uncertain")
+            throw RouterMappingError.uncertainAfterSend("Injected NAT-PMP response loss")
+        }
+    )
+    do {
+        _ = try uncertainNATPMP.ensureMapping(
+            config: config,
+            localAddress: "192.0.2.20",
+            gatewayAddress: "192.0.2.1"
+        )
+        throw TestFailure("Uncertain NAT-PMP creation must require recovery")
+    } catch let recovery as RouterMappingRecoveryRequiredError {
+        try expect(
+            udpActions == ["pcp-rejected", "natpmp-uncertain"],
+            "A clear PCP rejection may fall back, but uncertain NAT-PMP must stop Automatic"
+        )
+        try expect(upnpDiscoveryCount == 0, "UPnP must not run after uncertain NAT-PMP creation")
+        try expect(recovery.mapping.transport == .natpmp, "NAT-PMP uncertainty must retain protocol identity")
+        try expect(recovery.mapping.gatewayAddress == "192.0.2.1", "NAT-PMP uncertainty must retain the gateway")
+        try expect(recovery.mapping.internalPort == 5900, "NAT-PMP uncertainty must retain the internal port")
+        try expect(recovery.mapping.externalPort == 45900, "NAT-PMP uncertainty must retain the candidate external port")
+    }
+}
+
+func testIPv6PinholeRenewalPreservesOldIDUnlessExplicitlyMissing() throws {
+    let gateway = "192.0.2.1"
+    let controlURL = URL(string: "http://192.0.2.1:5000/upnp/control/IPv6Firewall1")!
+    let serviceType = "urn:schemas-upnp-org:service:WANIPv6FirewallControl:1"
+    let service = UPnPService(
+        serviceType: serviceType,
+        controlURL: controlURL,
+        gatewayIdentity: gateway,
+        descriptionURL: URL(string: "http://192.0.2.1:5000/rootDesc.xml")!,
+        deviceIdentity: "uuid:gatebeam-renew-router"
+    )
+    var config = AppConfig.default
+    config.mappingProtocolPreference = .upnp
+    config.preferredAddressFamily = .ipv6
+    config.internalPort = 5900
+    config.mappingLeaseSeconds = 3600
+    config.ipv6PinholeID = 77
+
+    var timeoutActions: [String] = []
+    let timeoutMapper = RouterMappingService(
+        upnpDiscoveryHandler: { [service] },
+        soapRequestHandler: { _, _, action, _ in
+            timeoutActions.append(action)
+            switch action {
+            case "GetFirewallStatus":
+                return response("""
+                <response>
+                  <FirewallEnabled>1</FirewallEnabled>
+                  <InboundPinholeAllowed>1</InboundPinholeAllowed>
+                </response>
+                """)
+            case "UpdatePinhole":
+                throw RouterMappingError.timeout("Injected UpdatePinhole timeout")
+            default:
+                throw TestFailure("Unexpected action after renewal timeout: \(action)")
+            }
+        }
+    )
+    do {
+        _ = try timeoutMapper.ensureIPv6Pinhole(
+            config: config,
+            localAddress: "2606:4700:4700::20",
+            gatewayAddress: gateway
+        )
+        throw TestFailure("UpdatePinhole timeout must require recovery")
+    } catch let recovery as RouterMappingRecoveryRequiredError {
+        try expect(
+            timeoutActions == ["GetFirewallStatus", "UpdatePinhole"],
+            "Renewal timeout must not issue AddPinhole"
+        )
+        try expect(recovery.mapping.pinholeID == 77, "Renewal uncertainty must retain the old pinhole ID")
+        try expect(recovery.mapping.gatewayAddress == gateway, "Renewal uncertainty must retain the original gateway")
+        try expect(
+            recovery.mapping.pcpNonce?.hasPrefix("gatebeam-upnp-v1:") == true,
+            "Renewal uncertainty must retain the bound IGD identity"
+        )
+    }
+
+    var missingActions: [String] = []
+    let missingMapper = RouterMappingService(
+        upnpDiscoveryHandler: { [service] },
+        soapRequestHandler: { _, _, action, _ in
+            missingActions.append(action)
+            switch action {
+            case "GetFirewallStatus":
+                return response("""
+                <response>
+                  <FirewallEnabled>1</FirewallEnabled>
+                  <InboundPinholeAllowed>1</InboundPinholeAllowed>
+                </response>
+                """)
+            case "UpdatePinhole":
+                return response("""
+                <fault>
+                  <errorCode>704</errorCode>
+                  <errorDescription>NoSuchEntry</errorDescription>
+                </fault>
+                """, status: 500)
+            case "AddPinhole":
+                return response("<response><UniqueID>88</UniqueID></response>")
+            default:
+                throw TestFailure("Unexpected missing-pinhole action: \(action)")
+            }
+        }
+    )
+    let replacement = try missingMapper.ensureIPv6Pinhole(
+        config: config,
+        localAddress: "2606:4700:4700::20",
+        gatewayAddress: gateway
+    )
+    try expect(
+        missingActions == ["GetFirewallStatus", "UpdatePinhole", "AddPinhole"],
+        "Only explicit 704/NoSuchEntry may create a replacement pinhole"
+    )
+    try expect(replacement.pinholeID == 88, "Explicitly missing pinhole must track the replacement ID")
+    try expect(replacement.activeMapping.pinholeID == 88, "Replacement mapping identity must contain only the new ID")
+}
+
 func testPCPMapCodec() throws {
     let nonce = Data(0..<12)
     let request = try PCPMessageCodec.makeMapRequest(
@@ -979,6 +1148,8 @@ let tests: [(String, () throws -> Void)] = [
     ("preserves UPnP recovery identity after verification failure", testUPnPVerificationFailurePreservesRecoveryIdentity),
     ("repeats IPv6 UPnP deletion idempotently", testUPnPIPv6RepeatedDeleteIsIdempotentOnlyForFirewallService),
     ("preserves recovery identity in automatic mode", testAutomaticMappingPreservesRecoveryIdentity),
+    ("stops automatic fallback after uncertain UDP creation", testAutomaticStopsAfterUncertainPCPOrNATPMPRequest),
+    ("preserves IPv6 pinhole ID on uncertain renewal", testIPv6PinholeRenewalPreservesOldIDUnlessExplicitlyMissing),
     ("encodes and decodes PCP MAP", testPCPMapCodec),
     ("selects physical IPv6 from anonymous fixtures", testLocalIPv6SelectionUsesAnonymousFixtures),
     ("prefers default physical IPv6 route", testLocalIPv6SelectionPrefersDefaultPhysicalRoute),

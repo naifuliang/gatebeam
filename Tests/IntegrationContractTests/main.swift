@@ -613,23 +613,73 @@ func testConfigStoreNormalizesValidActiveProxy() throws {
     try expect(!persisted.contains("  socks5://"), "Normalized proxy storage must not retain surrounding whitespace")
 }
 
-func testConfigStoreReplacesMalformedLegacyData() throws {
+func testCorruptConfigIsPreservedAndFailsMappingRecoveryClosed() throws {
     let baseDirectory = try makeTemporaryDirectory(named: "malformed-config-migration")
     defer {
         try? FileManager.default.removeItem(at: baseDirectory)
     }
 
     let store = AppConfigStore(baseDirectory: baseDirectory)
-    let malformed = #"{"customProxyURL":"http://old-user:old-pass@proxy.example.test:8080","broken":"#
-    try Data(malformed.utf8).write(to: store.location, options: [.atomic])
+    var damagedConfig = AppConfig.default
+    damagedConfig.remoteAccessEnabled = true
+    damagedConfig.mappingProtocolPreference = .pcp
+    damagedConfig.pcpNonce = Data(repeating: 14, count: 12).base64EncodedString()
+    damagedConfig.activeRouterMappings = [
+        activeMappingFixture(transport: .pcp, family: .ipv4)
+    ]
+    let encoder = JSONEncoder()
+    encoder.dateEncodingStrategy = .iso8601
+    var malformed = try encoder.encode(damagedConfig)
+    malformed.removeLast()
+    malformed.append(contentsOf: Data(#","broken":"# .utf8))
+    try malformed.write(to: store.location, options: [.atomic])
 
-    let migrated = try store.load()
-    try expect(migrated.customProxyURL.isEmpty, "Malformed legacy data must fail closed")
+    do {
+        _ = try store.load()
+        throw IntegrationContractFailure("Corrupt config must return a typed decode error")
+    } catch AppConfigStoreError.decodingFailed(let url, _) {
+        try expect(url == store.location, "Typed decode error must identify the preserved config")
+    }
+    let preservedAfterLoad = try Data(contentsOf: store.location)
+    try expect(
+        preservedAfterLoad == malformed,
+        "Config decode failure must preserve the damaged bytes for backup and recovery"
+    )
+    let preserved = String(decoding: malformed, as: UTF8.self)
+    try expect(
+        preserved.contains("activeRouterMappings") && preserved.contains(damagedConfig.pcpNonce!),
+        "The preserved corrupt fixture must retain its mapping recovery identity"
+    )
 
-    let persisted = try String(contentsOf: store.location, encoding: .utf8)
-    try expect(!persisted.contains("old-user"), "Malformed legacy usernames must not remain on disk")
-    try expect(!persisted.contains("old-pass"), "Malformed legacy passwords must not remain on disk")
-    _ = try JSONDecoder().decode(AppConfig.self, from: Data(persisted.utf8))
+    let router = MockRouterMappingService()
+    let agent = NetworkAgent(
+        configStore: store,
+        keychain: inMemoryKeychain(),
+        localNetworkService: MockLocalNetworkService(),
+        routerMappingService: router,
+        emergencyMappingJournal: emergencyJournal(in: baseDirectory),
+        fallbackMappingJournal: EmergencyMappingJournal(
+            fileURL: baseDirectory.appendingPathComponent("fallback/mappings.json")
+        )
+    )
+    agent.runCheck()
+    try expect(
+        waitUntil {
+            agent.status.routerStatus.message == "Router recovery state is unknown"
+        },
+        "Corrupt config containing mappings must set recovery state unknown"
+    )
+    try expect(router.ensureCalls.isEmpty, "Unknown config mapping state must block every new mapping")
+    try expect(
+        agent.status.settingsErrorMessage?.contains("Back up the damaged") == true,
+        "The UI must tell the user to back up and restore the damaged config"
+    )
+    let preservedAfterCheck = try Data(contentsOf: store.location)
+    try expect(
+        preservedAfterCheck == malformed,
+        "NetworkAgent must not replace the damaged config while fail-closed"
+    )
+    agent.stop()
 }
 
 func testInvalidProxyPreventsAllPersistence() throws {
@@ -778,11 +828,10 @@ func testDisabledSideEffectsDoNotReadSuppliedConfigStore() throws {
     }
 
     let suppliedStore = AppConfigStore(baseDirectory: baseDirectory)
-    var productionLikeConfig = AppConfig.default
-    productionLikeConfig.dnsRecordName = "must-not-be-read.example.test"
-    productionLikeConfig.remoteAccessEnabled = true
-    try suppliedStore.save(productionLikeConfig)
-    let originalData = try Data(contentsOf: suppliedStore.location)
+    let originalData = Data(
+        #"{"activeRouterMappings":[{"pcpNonce":"must-not-be-read"}],"broken":"#.utf8
+    )
+    try originalData.write(to: suppliedStore.location, options: [.atomic])
 
     let agent = NetworkAgent(
         configStore: suppliedStore,
@@ -2245,7 +2294,7 @@ func testUnknownRecoverySourcesFailClosed() throws {
         try expect(router.ensureCalls.isEmpty, "\(sourceName) failure must block every new mapping")
         let visibleError = agent.status.settingsErrorMessage ?? ""
         try expect(
-            visibleError.contains("Repair the journal permissions or remove the damaged journal"),
+            visibleError.contains("Back up the damaged file"),
             "\(sourceName) failure must present an actionable settings error"
         )
         try expect(
@@ -2471,7 +2520,7 @@ let tests: [(String, () throws -> Void)] = [
     ("inactive legacy proxy migration", testConfigStoreMigratesInactiveLegacyProxyCredentials),
     ("invalid active proxy migration", testConfigStoreMigratesInvalidActiveProxy),
     ("valid active proxy normalization", testConfigStoreNormalizesValidActiveProxy),
-    ("malformed legacy config replacement", testConfigStoreReplacesMalformedLegacyData),
+    ("corrupt config preservation and fail-closed recovery", testCorruptConfigIsPreservedAndFailsMappingRecoveryClosed),
     ("invalid proxy persistence ordering", testInvalidProxyPreventsAllPersistence),
     ("inactive credential proxy scrubbing", testInactiveCredentialProxyIsScrubbedBeforePersistence),
     ("inactive valid proxy scrubbing", testInactiveValidProxyIsClearedBeforePersistence),

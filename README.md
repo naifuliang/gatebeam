@@ -100,8 +100,8 @@ Requirements: macOS with Xcode Command Line Tools or Xcode installed.
 ./scripts/test_upgrade.sh
 ./scripts/test_ui_validation.sh
 ./scripts/test_build_assets.sh
-./scripts/test_privacy.sh
 ./scripts/build_app.sh
+./scripts/test_privacy.sh
 ```
 
 The validation suite is split by contract:
