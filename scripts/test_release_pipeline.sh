@@ -106,6 +106,8 @@ run_release() {
     GATEBEAM_NOTARY_PROFILE="fixture profile" \
     GATEBEAM_RELEASE_CI_RUN_ID=123456 \
     GATEBEAM_RELEASE_CLEAN_MACHINE_RUN_ID=123457 \
+    GATEBEAM_GITHUB_TOKEN=fixture_github_token_0123456789 \
+    GATEBEAM_FAKE_EXPECTED_GITHUB_TOKEN=fixture_github_token_0123456789 \
     GATEBEAM_RELEASE_TEST_MODE=1 \
     GATEBEAM_RELEASE_TEST_TOOL_DIR="$tool_dir" \
     GATEBEAM_FAKE_CALL_LOG="$fixture/calls.log" \
@@ -307,6 +309,20 @@ test_github_evidence_binding() {
     "GitHub ci workflow evidence did not satisfy the release contract" \
     GATEBEAM_FAKE_GITHUB_SCENARIO=wrong-head
 
+  fixture="$(new_fixture github-pull-request-merge-ref)"
+  expect_failure \
+    "GitHub pull request merge-ref evidence" \
+    "$fixture" \
+    "GitHub ci workflow evidence did not satisfy the release contract" \
+    GATEBEAM_FAKE_GITHUB_SCENARIO=pull-request-merge-ref
+
+  fixture="$(new_fixture github-clean-wrong-event)"
+  expect_failure \
+    "GitHub clean-machine wrong event" \
+    "$fixture" \
+    "GitHub clean-machine workflow evidence did not satisfy the release contract" \
+    GATEBEAM_FAKE_GITHUB_SCENARIO=wrong-clean-event
+
   fixture="$(new_fixture github-wrong-conclusion)"
   expect_failure \
     "GitHub workflow wrong conclusion" \
@@ -349,6 +365,37 @@ test_github_evidence_binding() {
     "previous immutable release manifest, checksum, build, or rollback asset did not validate" \
     GATEBEAM_FAKE_GITHUB_SCENARIO=rollback-mismatch
 
+  local scenario
+  local label
+  for scenario label in \
+    missing-artifact "missing previous artifact" \
+    duplicate-artifact "duplicate previous artifact" \
+    extra-artifact "extra previous artifact" \
+    mismatched-artifact "mismatched previous artifact" \
+    missing-checksum "missing previous checksum" \
+    duplicate-checksum "duplicate previous checksum" \
+    extra-checksum "extra previous checksum" \
+    mismatched-checksum "mismatched previous checksum"; do
+    fixture="$(new_fixture "github-$scenario")"
+    expect_failure \
+      "$label" \
+      "$fixture" \
+      "previous immutable release manifest, checksum, build, or rollback asset did not validate" \
+      "GATEBEAM_FAKE_GITHUB_SCENARIO=$scenario"
+  done
+
+  for scenario label in \
+    missing-release-asset "missing immutable release asset" \
+    duplicate-release-asset "duplicate immutable release asset" \
+    extra-release-asset "extra immutable release asset"; do
+    fixture="$(new_fixture "github-$scenario")"
+    expect_failure \
+      "$label" \
+      "$fixture" \
+      "latest GitHub release is not a complete immutable formal release" \
+      "GATEBEAM_FAKE_GITHUB_SCENARIO=$scenario"
+  done
+
   fixture="$(new_fixture github-network-failure)"
   expect_failure \
     "GitHub network failure" \
@@ -369,6 +416,38 @@ test_github_evidence_binding() {
     "$fixture" \
     "GitHub release asset download failed for previous release manifest" \
     GATEBEAM_FAKE_GITHUB_SCENARIO=asset-failure
+
+  fixture="$(new_fixture github-app-asset-failure)"
+  expect_failure \
+    "GitHub app archive download failure" \
+    "$fixture" \
+    "GitHub release asset download failed for previous release app archive" \
+    GATEBEAM_FAKE_GITHUB_SCENARIO=app-asset-failure
+
+  fixture="$(new_fixture github-dmg-asset-failure)"
+  expect_failure \
+    "GitHub disk image download failure" \
+    "$fixture" \
+    "GitHub release asset download failed for previous release disk image" \
+    GATEBEAM_FAKE_GITHUB_SCENARIO=dmg-asset-failure
+
+  for scenario label in \
+    wrong-internal-version "rollback app wrong internal version" \
+    wrong-internal-build "rollback app wrong internal build"; do
+    fixture="$(new_fixture "github-$scenario")"
+    expect_failure \
+      "$label" \
+      "$fixture" \
+      "previous release rollback app contents or signature did not validate" \
+      "GATEBEAM_FAKE_GITHUB_SCENARIO=$scenario"
+  done
+
+  fixture="$(new_fixture github-wrong-rollback-signature)"
+  expect_failure \
+    "rollback package wrong signature" \
+    "$fixture" \
+    "previous release rollback package signature did not validate" \
+    GATEBEAM_FAKE_GITHUB_SCENARIO=wrong-rollback-signature
 
   fixture="$(new_fixture bootstrap-existing-release)"
   expect_failure \
@@ -430,7 +509,8 @@ test_github_token_not_logged() {
 
   if ! run_release \
        "$fixture" \
-       "GATEBEAM_GITHUB_TOKEN=$token" >"$fixture/test-output.log" 2>&1; then
+       "GATEBEAM_GITHUB_TOKEN=$token" \
+       "GATEBEAM_FAKE_EXPECTED_GITHUB_TOKEN=$token" >"$fixture/test-output.log" 2>&1; then
     fail_test "GitHub token privacy fixture failed"
     return
   fi
@@ -443,6 +523,31 @@ test_github_token_not_logged() {
     return
   fi
   pass "GitHub token is absent from logs and release output"
+}
+
+test_github_authentication() {
+  local fixture
+
+  fixture="$(new_fixture github-token-missing)"
+  expect_failure \
+    "missing GitHub token" \
+    "$fixture" \
+    "GATEBEAM_GITHUB_TOKEN is required for a formal release" \
+    GATEBEAM_GITHUB_TOKEN=
+
+  fixture="$(new_fixture github-token-unsafe)"
+  expect_failure \
+    "unsafe GitHub token" \
+    "$fixture" \
+    "GATEBEAM_GITHUB_TOKEN contains unsafe characters" \
+    "GATEBEAM_GITHUB_TOKEN=unsafe token"
+
+  fixture="$(new_fixture github-token-auth-failure)"
+  expect_failure \
+    "GitHub token authentication failure" \
+    "$fixture" \
+    "GitHub API request failed for immutable release policy" \
+    GATEBEAM_GITHUB_TOKEN=fixture_wrong_github_token_0123456789
 }
 
 test_wrong_identity() {
@@ -458,6 +563,7 @@ test_wrong_identity() {
     GATEBEAM_NOTARY_PROFILE="fixture profile" \
     GATEBEAM_RELEASE_CI_RUN_ID=123456 \
     GATEBEAM_RELEASE_CLEAN_MACHINE_RUN_ID=123457 \
+    GATEBEAM_GITHUB_TOKEN=fixture_github_token_0123456789 \
     GATEBEAM_RELEASE_TEST_MODE=1 \
     GATEBEAM_RELEASE_TEST_TOOL_DIR="$fixture/fake tools" \
     /bin/zsh -f "$fixture/scripts/release_formal.sh" >"$output" 2>&1; then
@@ -988,6 +1094,7 @@ test_override_restriction() {
     GATEBEAM_NOTARY_PROFILE="fixture profile" \
     GATEBEAM_RELEASE_CI_RUN_ID=123456 \
     GATEBEAM_RELEASE_CLEAN_MACHINE_RUN_ID=123457 \
+    GATEBEAM_GITHUB_TOKEN=fixture_github_token_0123456789 \
     GATEBEAM_RELEASE_TEST_MODE=1 \
     GATEBEAM_RELEASE_TEST_TOOL_DIR="$TEST_ROOT/not-used" \
     /bin/zsh -f "$ROOT_DIR/scripts/release_formal.sh" >"$output" 2>&1; then
@@ -1022,6 +1129,7 @@ test_release_metadata_inputs
 test_github_evidence_binding
 test_build_version_contract
 test_bootstrap_success
+test_github_authentication
 test_github_token_not_logged
 test_wrong_identity
 test_wrong_signed_identity

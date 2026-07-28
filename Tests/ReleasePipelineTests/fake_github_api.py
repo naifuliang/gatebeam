@@ -1,10 +1,13 @@
 #!/usr/bin/python3
 import hashlib
+import io
 import json
 import os
 import pathlib
+import plistlib
 import subprocess
 import sys
+import zipfile
 
 
 REPOSITORY = "naifuliang/gatebeam"
@@ -63,10 +66,53 @@ def sha256(payload):
     return hashlib.sha256(payload).hexdigest()
 
 
+def previous_package(scenario):
+    version = "9.9.9" if scenario == "wrong-internal-version" else "0.4.0"
+    if scenario == "wrong-internal-build":
+        build_version = "99"
+    elif scenario == "stale-build":
+        build_version = "5"
+    else:
+        build_version = "4"
+    info_plist = plistlib.dumps(
+        {
+            "CFBundleExecutable": "Gatebeam",
+            "CFBundleIdentifier": "io.github.naifuliang.gatebeam",
+            "CFBundleShortVersionString": version,
+            "CFBundleVersion": build_version,
+            "GatebeamDeveloperTeamIdentifier": "ABCDE12345",
+        },
+        sort_keys=True,
+    )
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_STORED) as package:
+        for name, payload, mode in (
+            (
+                "Payload/Gatebeam.app/Contents/Info.plist",
+                info_plist,
+                0o100644,
+            ),
+            (
+                "Payload/Gatebeam.app/Contents/MacOS/Gatebeam",
+                b"fixture rollback executable\n",
+                0o100755,
+            ),
+        ):
+            entry = zipfile.ZipInfo(name, date_time=(2026, 1, 1, 0, 0, 0))
+            entry.create_system = 3
+            entry.external_attr = mode << 16
+            package.writestr(entry, payload)
+    return archive.getvalue()
+
+
 def previous_release_payloads(root, scenario):
     previous_commit = git_revision(root, "HEAD^1")
-    package = b"fixture rollback package\n"
+    app_archive = b"fixture previous app archive\n"
+    package = previous_package(scenario)
+    disk_image = b"fixture previous disk image\n"
+    app_archive_digest = sha256(app_archive)
     package_digest = sha256(package)
+    disk_image_digest = sha256(disk_image)
     manifest_digest = (
         "0" * 64 if scenario == "rollback-mismatch" else package_digest
     )
@@ -82,18 +128,65 @@ def previous_release_payloads(root, scenario):
         "bundleIdentifier": "io.github.naifuliang.gatebeam",
         "artifacts": [
             {
+                "name": "Gatebeam-0.4.0.zip",
+                "type": "app-archive",
+                "byteCount": len(app_archive),
+                "sha256": app_archive_digest,
+            },
+            {
                 "name": "Gatebeam-0.4.0.pkg",
                 "type": "installer-package",
                 "byteCount": len(package),
                 "sha256": manifest_digest,
-            }
+            },
+            {
+                "name": "Gatebeam-0.4.0.dmg",
+                "type": "disk-image",
+                "byteCount": len(disk_image),
+                "sha256": disk_image_digest,
+            },
         ],
     }
+    if scenario == "missing-artifact":
+        manifest["artifacts"].pop(0)
+    elif scenario == "duplicate-artifact":
+        manifest["artifacts"].append(dict(manifest["artifacts"][1]))
+    elif scenario == "extra-artifact":
+        manifest["artifacts"].append(
+            {
+                "name": "Gatebeam-0.4.0.txt",
+                "type": "release-notes",
+                "byteCount": 1,
+                "sha256": "0" * 64,
+            }
+        )
+    elif scenario == "mismatched-artifact":
+        manifest["artifacts"][2]["byteCount"] += 1
     manifest_bytes = json.dumps(
         manifest, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
-    checksums = f"{package_digest}  Gatebeam-0.4.0.pkg\n".encode("utf-8")
-    return previous_commit, package, manifest_bytes, checksums
+    checksum_lines = [
+        f"{app_archive_digest}  Gatebeam-0.4.0.zip",
+        f"{package_digest}  Gatebeam-0.4.0.pkg",
+        f"{disk_image_digest}  Gatebeam-0.4.0.dmg",
+    ]
+    if scenario == "missing-checksum":
+        checksum_lines.pop()
+    elif scenario == "duplicate-checksum":
+        checksum_lines.append(checksum_lines[0])
+    elif scenario == "extra-checksum":
+        checksum_lines.append(f'{"0" * 64}  Gatebeam-0.4.0.txt')
+    elif scenario == "mismatched-checksum":
+        checksum_lines[2] = f'{"0" * 64}  Gatebeam-0.4.0.dmg'
+    checksums = ("\n".join(checksum_lines) + "\n").encode("utf-8")
+    return (
+        previous_commit,
+        app_archive,
+        package,
+        disk_image,
+        manifest_bytes,
+        checksums,
+    )
 
 
 def asset(asset_id, name, payload):
@@ -111,7 +204,27 @@ def asset(asset_id, name, payload):
 
 
 def latest_release(root, scenario):
-    _, package, manifest, checksums = previous_release_payloads(root, scenario)
+    (
+        _,
+        app_archive,
+        package,
+        disk_image,
+        manifest,
+        checksums,
+    ) = previous_release_payloads(root, scenario)
+    assets = [
+        asset(101, "release-manifest.json", manifest),
+        asset(102, "SHA256SUMS", checksums),
+        asset(103, "Gatebeam-0.4.0.zip", app_archive),
+        asset(104, "Gatebeam-0.4.0.pkg", package),
+        asset(105, "Gatebeam-0.4.0.dmg", disk_image),
+    ]
+    if scenario == "missing-release-asset":
+        assets.pop()
+    elif scenario == "duplicate-release-asset":
+        assets.append(asset(106, "Gatebeam-0.4.0.dmg", disk_image))
+    elif scenario == "extra-release-asset":
+        assets.append(asset(106, "Gatebeam-0.4.0.txt", b"notes\n"))
     return {
         "id": 44,
         "tag_name": "v0.4.0",
@@ -120,17 +233,14 @@ def latest_release(root, scenario):
         "prerelease": False,
         "immutable": scenario != "mutable-release",
         "html_url": f"{WEB_ROOT}/releases/tag/v0.4.0",
-        "assets": [
-            asset(101, "release-manifest.json", manifest),
-            asset(102, "SHA256SUMS", checksums),
-            asset(103, "Gatebeam-0.4.0.pkg", package),
-        ],
+        "assets": assets,
     }
 
 
 def workflow_run(root, run_id, scenario):
     head_sha = git_revision(root, "HEAD")
     clean = run_id == "123457"
+    event = "workflow_dispatch" if clean else "push"
     name = (
         "Release clean-machine validation"
         if clean
@@ -141,16 +251,23 @@ def workflow_run(root, run_id, scenario):
         if clean
         else ".github/workflows/ci.yml"
     )
+    path_ref = "refs/heads/main"
     if scenario == "wrong-workflow" and not clean:
         name = "Untrusted CI"
         path = ".github/workflows/untrusted.yml"
     if scenario == "wrong-head" and not clean:
         head_sha = "f" * 40
+    if scenario == "pull-request-merge-ref" and not clean:
+        event = "pull_request"
+        path_ref = "refs/pull/42/merge"
+    if scenario == "wrong-clean-event" and clean:
+        event = "push"
     run_url = f"{API_ROOT}/actions/runs/{run_id}"
     return {
         "id": int(run_id),
         "name": name,
-        "path": f"{path}@refs/heads/main",
+        "path": f"{path}@{path_ref}",
+        "event": event,
         "head_sha": head_sha,
         "status": "completed",
         "conclusion": (
@@ -205,9 +322,14 @@ def workflow_jobs(root, run_id, scenario):
 
 
 def response_for(root, url, scenario):
-    previous_commit, package, manifest, checksums = (
-        previous_release_payloads(root, scenario)
-    )
+    (
+        previous_commit,
+        app_archive,
+        package,
+        disk_image,
+        manifest,
+        checksums,
+    ) = previous_release_payloads(root, scenario)
     if url == f"{API_ROOT}/immutable-releases":
         return {"enabled": scenario != "immutable-disabled"}, False
     if url == f"{API_ROOT}/releases?per_page=1":
@@ -231,7 +353,11 @@ def response_for(root, url, scenario):
     if url == f"{API_ROOT}/releases/assets/102":
         return checksums, True
     if url == f"{API_ROOT}/releases/assets/103":
+        return app_archive, True
+    if url == f"{API_ROOT}/releases/assets/104":
         return package, True
+    if url == f"{API_ROOT}/releases/assets/105":
+        return disk_image, True
     fail(f"unexpected fake GitHub URL: {url}")
 
 
@@ -239,21 +365,44 @@ def main():
     root = fixture_root()
     scenario = os.environ.get("GATEBEAM_FAKE_GITHUB_SCENARIO", "success")
     arguments = sys.argv[1:]
+    config_path = None
     output_path = None
     url = None
     for index, argument in enumerate(arguments):
+        if argument == "--config" and index + 1 < len(arguments):
+            config_path = pathlib.Path(arguments[index + 1])
         if argument == "--output" and index + 1 < len(arguments):
             output_path = pathlib.Path(arguments[index + 1])
         if argument.startswith("https://"):
             url = argument
     if output_path is None or url is None:
         fail("fake curl requires an output path and fixed HTTPS URL")
+    expected_token = os.environ.get(
+        "GATEBEAM_FAKE_EXPECTED_GITHUB_TOKEN",
+        "fixture_github_token_0123456789",
+    )
+    expected_header = (
+        f'header = "Authorization: Bearer {expected_token}"\n'
+    )
+    if (
+        config_path is None
+        or not config_path.is_file()
+        or config_path.is_symlink()
+        or config_path.read_text(encoding="utf-8") != expected_header
+    ):
+        fail("fake GitHub authentication failed")
     with open(os.environ["GATEBEAM_FAKE_CALL_LOG"], "a", encoding="utf-8") as stream:
         stream.write(f"github {url}\n")
+    if scenario == "auth-failure":
+        fail("injected GitHub authentication failure")
     if scenario == "network-failure":
         fail("injected GitHub network failure")
     if scenario == "asset-failure" and "/releases/assets/" in url:
         fail("injected GitHub asset failure")
+    if scenario == "app-asset-failure" and url.endswith("/releases/assets/103"):
+        fail("injected GitHub app archive failure")
+    if scenario == "dmg-asset-failure" and url.endswith("/releases/assets/105"):
+        fail("injected GitHub disk image failure")
     if scenario == "malformed-json" and url.endswith("/immutable-releases"):
         output_path.write_bytes(b"{")
         return

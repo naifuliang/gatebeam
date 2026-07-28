@@ -129,11 +129,14 @@ Run the complete repository suite:
 ./scripts/test_ui_validation.sh
 ./scripts/test_build_assets.sh
 ./scripts/test_release_pipeline.sh
-./scripts/test_privacy.sh
 ./scripts/build_app.sh
+./scripts/test_privacy.sh
 codesign --verify --deep --strict ./dist/Gatebeam.app
 git diff --check
 ```
+
+Build before the privacy gate so the scan covers the final Gatebeam binary as
+well as the reviewed source.
 
 For UI changes, regenerate every canonical Aqua and Dark Aqua state and inspect
 each image for alignment, clipping, overlap, disabled state, scroll reachability,
@@ -162,6 +165,7 @@ evidence records:
 ```sh
 export GATEBEAM_RELEASE_CI_RUN_ID='CI_RUN_ID'
 export GATEBEAM_RELEASE_CLEAN_MACHINE_RUN_ID='CLEAN_MACHINE_RUN_ID'
+export GATEBEAM_GITHUB_TOKEN='FINE_GRAINED_TOKEN'
 ```
 
 The script never accepts a repository, evidence URL, previous build number,
@@ -177,18 +181,23 @@ Before building, the script requires
 For both run IDs it fetches the workflow run and its jobs/steps, then verifies
 the public repository, exact workflow path and name, `head_sha == HEAD`,
 `completed/success`, the required job, and every required step. The regular CI
-record must be `.github/workflows/ci.yml`; the clean-machine record must be
-`.github/workflows/release-validation.yml`, whose isolated test actually runs
-installation, upgrade, injected-failure rollback, and uninstall validation.
-Only after those machine checks validate may the manifest record `Passed`.
+record must be a `push` run of `.github/workflows/ci.yml`; pull-request and
+merge-ref runs are rejected. The clean-machine record must be a
+`workflow_dispatch` run of `.github/workflows/release-validation.yml`, whose
+isolated test actually runs installation, upgrade, injected-failure rollback,
+and uninstall validation. Only after those machine checks validate may the
+manifest record `Passed`.
 
 For every release after the first, the script reads `/releases/latest`, requires
-that published release to be immutable, resolves its tag commit, and downloads
-its protected `release-manifest.json` and `SHA256SUMS` assets. GitHub asset
-digests, local bytes, manifest product/tag/version/commit/build fields,
-checksums, and the previous PKG rollback asset must all agree. The new
-`CFBundleVersion` must be greater than that validated manifest's
-`buildVersion`; rollback metadata is derived from the same immutable release.
+that published release to be immutable and to contain exactly the ZIP, PKG,
+DMG, `release-manifest.json`, and `SHA256SUMS` assets. It resolves the tag
+commit, downloads all five protected assets, and requires the manifest and
+checksum file to describe exactly one ZIP, PKG, and DMG with matching names,
+types, hashes, and byte counts. The rollback PKG is expanded; its internal
+Gatebeam app version, build, Bundle ID, and signature, plus the PKG signature,
+must match the validated previous manifest and signing contract. The new
+`CFBundleVersion` must be greater than that manifest's `buildVersion`;
+rollback metadata is derived from the same immutable release.
 
 The first formal release is the only exception and must be explicit:
 
@@ -201,11 +210,12 @@ It records `previousBuildVersion` as `0` and `rollback.available` as `false`;
 it cannot invent a historical rollback version or URL. Bootstrap is rejected
 as soon as any published release exists.
 
-The fixed repository is public, so authentication is optional. When API rate
-limits require it, `GATEBEAM_GITHUB_TOKEN` may be supplied through a protected
-environment; the script passes it through a mode-`0600` temporary curl config,
-unsets it before child processes run, and never writes it or the notarization
-Keychain profile to retained logs or release output.
+`GATEBEAM_GITHUB_TOKEN` is required for every formal release. Use a fine-grained
+token scoped to the fixed `naifuliang/gatebeam` repository with at least
+Administration (read), Actions (read), and Contents (read). The script sends it
+as a Bearer credential on every GitHub API request through a mode-`0600`
+temporary curl config, unsets it before child processes run, and never writes
+the token to logs, the release manifest, or retained release output.
 
 ## Build and Sign
 

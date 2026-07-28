@@ -17,8 +17,10 @@ GITHUB_API_ROOT="https://api.github.com/repos/$GITHUB_REPOSITORY"
 GITHUB_WEB_ROOT="https://github.com/$GITHUB_REPOSITORY"
 CI_WORKFLOW_NAME="CI"
 CI_WORKFLOW_PATH=".github/workflows/ci.yml"
+CI_WORKFLOW_EVENT="push"
 CLEAN_WORKFLOW_NAME="Release clean-machine validation"
 CLEAN_WORKFLOW_PATH=".github/workflows/release-validation.yml"
+CLEAN_WORKFLOW_EVENT="workflow_dispatch"
 TEMP_ROOT=""
 PUBLISH_STAGING=""
 PUBLISH_LOCK=""
@@ -205,16 +207,14 @@ validate_run_id() {
 }
 
 prepare_github_auth() {
-  local token="${GATEBEAM_GITHUB_TOKEN:-}"
+  local token="$GATEBEAM_GITHUB_TOKEN"
 
-  if [[ -n "$token" ]]; then
-    [[ ${#token} -le 255 && "$token" =~ '^[A-Za-z0-9_.=-]+$' ]] ||
-      fail "GATEBEAM_GITHUB_TOKEN contains unsafe characters"
-    GITHUB_CURL_CONFIG="$TEMP_ROOT/github-auth.conf"
-    print -r -- "header = \"Authorization: Bearer $token\"" \
-      >"$GITHUB_CURL_CONFIG"
-    chmod 0600 "$GITHUB_CURL_CONFIG"
-  fi
+  [[ ${#token} -le 255 && "$token" =~ '^[A-Za-z0-9_.=-]+$' ]] ||
+    fail "GATEBEAM_GITHUB_TOKEN contains unsafe characters"
+  GITHUB_CURL_CONFIG="$TEMP_ROOT/github-auth.conf"
+  print -r -- "header = \"Authorization: Bearer $token\"" \
+    >"$GITHUB_CURL_CONFIG"
+  chmod 0600 "$GITHUB_CURL_CONFIG"
   unset GATEBEAM_GITHUB_TOKEN GITHUB_TOKEN GH_TOKEN
 }
 
@@ -239,9 +239,7 @@ github_api_json() {
     --header 'Accept: application/vnd.github+json'
     --header 'X-GitHub-Api-Version: 2026-03-10'
   )
-  if [[ -n "$GITHUB_CURL_CONFIG" ]]; then
-    curl_arguments+=(--config "$GITHUB_CURL_CONFIG")
-  fi
+  curl_arguments+=(--config "$GITHUB_CURL_CONFIG")
   curl_arguments+=(--output "$output_path" "$url")
 
   if ! "$CURL" "${curl_arguments[@]}"; then
@@ -281,9 +279,7 @@ github_asset_download() {
     --header 'Accept: application/octet-stream'
     --header 'X-GitHub-Api-Version: 2026-03-10'
   )
-  if [[ -n "$GITHUB_CURL_CONFIG" ]]; then
-    curl_arguments+=(--config "$GITHUB_CURL_CONFIG")
-  fi
+  curl_arguments+=(--config "$GITHUB_CURL_CONFIG")
   curl_arguments+=(--output "$output_path" "$url")
 
   if ! "$CURL" "${curl_arguments[@]}"; then
@@ -300,8 +296,9 @@ validate_workflow_evidence() {
   local run_id="$2"
   local workflow_name="$3"
   local workflow_path="$4"
-  local job_name="$5"
-  shift 5
+  local workflow_event="$5"
+  local job_name="$6"
+  shift 6
   local run_json="$TEMP_ROOT/github-$evidence_kind-run.json"
   local jobs_json="$TEMP_ROOT/github-$evidence_kind-jobs.json"
   local run_url="$GITHUB_API_ROOT/actions/runs/$run_id"
@@ -313,7 +310,7 @@ validate_workflow_evidence() {
 import json
 import sys
 
-run_path, jobs_path, repository, run_id, head_sha, workflow_name, workflow_path, job_name, *required_steps = sys.argv[1:]
+run_path, jobs_path, repository, run_id, head_sha, workflow_name, workflow_path, workflow_event, job_name, *required_steps = sys.argv[1:]
 with open(run_path, "rb") as stream:
     run = json.load(stream)
 with open(jobs_path, "rb") as stream:
@@ -335,32 +332,34 @@ if run.get("jobs_url") != f"{expected_run_url}/jobs":
     raise SystemExit(5)
 if run.get("name") != workflow_name or str(run.get("path", "")).split("@", 1)[0] != workflow_path:
     raise SystemExit(6)
-if run.get("head_sha") != head_sha or run.get("status") != "completed" or run.get("conclusion") != "success":
+if run.get("event") != workflow_event:
     raise SystemExit(7)
+if run.get("head_sha") != head_sha or run.get("status") != "completed" or run.get("conclusion") != "success":
+    raise SystemExit(8)
 
 if not isinstance(jobs_document, dict) or not isinstance(jobs_document.get("jobs"), list):
-    raise SystemExit(8)
+    raise SystemExit(9)
 jobs = jobs_document["jobs"]
 if jobs_document.get("total_count") != len(jobs) or len(jobs) > 100:
-    raise SystemExit(9)
+    raise SystemExit(10)
 matching_jobs = [job for job in jobs if isinstance(job, dict) and job.get("name") == job_name]
 if len(matching_jobs) != 1:
-    raise SystemExit(10)
+    raise SystemExit(11)
 job = matching_jobs[0]
 if job.get("head_sha") != head_sha or job.get("status") != "completed" or job.get("conclusion") != "success":
-    raise SystemExit(11)
-if job.get("workflow_name") != workflow_name or job.get("run_url") != expected_run_url:
     raise SystemExit(12)
+if job.get("workflow_name") != workflow_name or job.get("run_url") != expected_run_url:
+    raise SystemExit(13)
 steps = job.get("steps")
 if not isinstance(steps, list):
-    raise SystemExit(13)
+    raise SystemExit(14)
 for required_name in required_steps:
     matching_steps = [step for step in steps if isinstance(step, dict) and step.get("name") == required_name]
     if len(matching_steps) != 1:
-        raise SystemExit(14)
+        raise SystemExit(15)
     step = matching_steps[0]
     if step.get("status") != "completed" or step.get("conclusion") != "success":
-        raise SystemExit(15)
+        raise SystemExit(16)
 ' \
     "$run_json" \
     "$jobs_json" \
@@ -369,6 +368,7 @@ for required_name in required_steps:
     "$HEAD_COMMIT" \
     "$workflow_name" \
     "$workflow_path" \
+    "$workflow_event" \
     "$job_name" \
     "$@" ||
     fail "GitHub $evidence_kind workflow evidence did not satisfy the release contract"
@@ -400,11 +400,18 @@ validate_release_history() {
   local commit_json="$TEMP_ROOT/github-previous-release-commit.json"
   local manifest_path="$TEMP_ROOT/previous-release-manifest.json"
   local checksums_path="$TEMP_ROOT/previous-release-SHA256SUMS"
+  local app_archive_path="$TEMP_ROOT/previous-release-app.zip"
   local rollback_path="$TEMP_ROOT/previous-release-rollback.pkg"
+  local disk_image_path="$TEMP_ROOT/previous-release-disk-image.dmg"
+  local expanded_package_path="$TEMP_ROOT/previous-release-expanded-pkg"
+  local rollback_app_list="$TEMP_ROOT/previous-release-app-paths"
   local validated_json="$TEMP_ROOT/github-validated-history.json"
   local manifest_id manifest_digest manifest_size
   local checksums_id checksums_digest checksums_size
-  local rollback_id rollback_size
+  local app_archive_id app_archive_digest app_archive_size
+  local rollback_id rollback_digest rollback_size
+  local disk_image_id disk_image_digest disk_image_size
+  local rollback_app_path rollback_app_count
 
   if [[ "$GATEBEAM_RELEASE_BOOTSTRAP" == "1" ]]; then
     github_api_json \
@@ -455,27 +462,40 @@ if not isinstance(release.get("id"), int) or release["id"] <= 0:
 assets = release.get("assets")
 if not isinstance(assets, list):
     raise SystemExit(6)
+expected_names = {
+    "release-manifest.json",
+    "SHA256SUMS",
+    f"Gatebeam-{version}.zip",
+    f"Gatebeam-{version}.pkg",
+    f"Gatebeam-{version}.dmg",
+}
+if (
+    len(assets) != len(expected_names)
+    or any(not isinstance(asset, dict) for asset in assets)
+    or {asset.get("name") for asset in assets} != expected_names
+):
+    raise SystemExit(7)
 
 def select_asset(name, maximum_size):
     matches = [asset for asset in assets if isinstance(asset, dict) and asset.get("name") == name]
     if len(matches) != 1:
-        raise SystemExit(7)
+        raise SystemExit(8)
     asset = matches[0]
     asset_id = asset.get("id")
     digest = asset.get("digest")
     size = asset.get("size")
     if not isinstance(asset_id, int) or asset_id <= 0:
-        raise SystemExit(8)
-    if not isinstance(size, int) or size <= 0 or size > maximum_size:
         raise SystemExit(9)
-    if not isinstance(digest, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None:
+    if not isinstance(size, int) or size <= 0 or size > maximum_size:
         raise SystemExit(10)
-    if asset.get("state") != "uploaded":
+    if not isinstance(digest, str) or re.fullmatch(r"sha256:[0-9a-f]{64}", digest) is None:
         raise SystemExit(11)
-    if asset.get("url") != f"{api_root}/releases/assets/{asset_id}":
+    if asset.get("state") != "uploaded":
         raise SystemExit(12)
-    if asset.get("browser_download_url") != f"{web_root}/releases/download/{tag}/{name}":
+    if asset.get("url") != f"{api_root}/releases/assets/{asset_id}":
         raise SystemExit(13)
+    if asset.get("browser_download_url") != f"{web_root}/releases/download/{tag}/{name}":
+        raise SystemExit(14)
     return {"id": asset_id, "digest": digest[7:], "size": size, "name": name}
 
 selection = {
@@ -484,8 +504,13 @@ selection = {
     "releaseURL": release["html_url"],
     "manifest": select_asset("release-manifest.json", 10485760),
     "checksums": select_asset("SHA256SUMS", 10485760),
+    "appArchive": select_asset(f"Gatebeam-{version}.zip", 1073741824),
     "rollback": select_asset(f"Gatebeam-{version}.pkg", 1073741824),
+    "diskImage": select_asset(f"Gatebeam-{version}.dmg", 1073741824),
 }
+selected_ids = [entry["id"] for key, entry in selection.items() if isinstance(entry, dict)]
+if len(selected_ids) != len(set(selected_ids)):
+    raise SystemExit(15)
 with open(output_path, "w", encoding="utf-8") as stream:
     json.dump(selection, stream, sort_keys=True)
 ' "$latest_json" "$selection_json" "$GITHUB_REPOSITORY" ||
@@ -502,8 +527,15 @@ with open(output_path, "w", encoding="utf-8") as stream:
   checksums_id="$(/usr/bin/plutil -extract checksums.id raw -o - "$selection_json")"
   checksums_digest="$(/usr/bin/plutil -extract checksums.digest raw -o - "$selection_json")"
   checksums_size="$(/usr/bin/plutil -extract checksums.size raw -o - "$selection_json")"
+  app_archive_id="$(/usr/bin/plutil -extract appArchive.id raw -o - "$selection_json")"
+  app_archive_digest="$(/usr/bin/plutil -extract appArchive.digest raw -o - "$selection_json")"
+  app_archive_size="$(/usr/bin/plutil -extract appArchive.size raw -o - "$selection_json")"
   rollback_id="$(/usr/bin/plutil -extract rollback.id raw -o - "$selection_json")"
+  rollback_digest="$(/usr/bin/plutil -extract rollback.digest raw -o - "$selection_json")"
   rollback_size="$(/usr/bin/plutil -extract rollback.size raw -o - "$selection_json")"
+  disk_image_id="$(/usr/bin/plutil -extract diskImage.id raw -o - "$selection_json")"
+  disk_image_digest="$(/usr/bin/plutil -extract diskImage.digest raw -o - "$selection_json")"
+  disk_image_size="$(/usr/bin/plutil -extract diskImage.size raw -o - "$selection_json")"
 
   github_api_json \
     "$GITHUB_API_ROOT/commits/$PREVIOUS_RELEASE_TAG" \
@@ -514,13 +546,21 @@ with open(output_path, "w", encoding="utf-8") as stream:
   github_asset_download \
     "$checksums_id" "$checksums_size" "$checksums_path" "previous release checksums"
   github_asset_download \
+    "$app_archive_id" "$app_archive_size" "$app_archive_path" "previous release app archive"
+  github_asset_download \
     "$rollback_id" "$rollback_size" "$rollback_path" "previous release rollback package"
+  github_asset_download \
+    "$disk_image_id" "$disk_image_size" "$disk_image_path" "previous release disk image"
   [[ "$(/usr/bin/shasum -a 256 "$manifest_path" | /usr/bin/awk '{print $1}')" == "$manifest_digest" ]] ||
     fail "previous release manifest did not match its protected GitHub digest"
   [[ "$(/usr/bin/shasum -a 256 "$checksums_path" | /usr/bin/awk '{print $1}')" == "$checksums_digest" ]] ||
     fail "previous release checksums did not match their protected GitHub digest"
-  [[ "$(/usr/bin/shasum -a 256 "$rollback_path" | /usr/bin/awk '{print $1}')" == "$ROLLBACK_ASSET_SHA256" ]] ||
+  [[ "$(/usr/bin/shasum -a 256 "$app_archive_path" | /usr/bin/awk '{print $1}')" == "$app_archive_digest" ]] ||
+    fail "previous release app archive did not match its protected GitHub digest"
+  [[ "$(/usr/bin/shasum -a 256 "$rollback_path" | /usr/bin/awk '{print $1}')" == "$rollback_digest" ]] ||
     fail "previous release rollback package did not match its protected GitHub digest"
+  [[ "$(/usr/bin/shasum -a 256 "$disk_image_path" | /usr/bin/awk '{print $1}')" == "$disk_image_digest" ]] ||
+    fail "previous release disk image did not match its protected GitHub digest"
 
   /usr/bin/python3 -I -E -s -c '
 import json
@@ -557,20 +597,31 @@ if older_build is not None:
     if int(older_build) >= int(build):
         raise SystemExit(6)
 
-rollback = selection["rollback"]
 artifacts = manifest.get("artifacts")
-if not isinstance(artifacts, list):
+if not isinstance(artifacts, list) or len(artifacts) != 3:
     raise SystemExit(7)
-matching_artifacts = [artifact for artifact in artifacts if isinstance(artifact, dict) and artifact.get("name") == rollback["name"]]
-if len(matching_artifacts) != 1:
-    raise SystemExit(8)
-artifact = matching_artifacts[0]
-if (
-    artifact.get("type") != "installer-package"
-    or artifact.get("sha256") != rollback["digest"]
-    or artifact.get("byteCount") != rollback["size"]
-):
-    raise SystemExit(9)
+expected_artifacts = {
+    selection["appArchive"]["name"]: ("app-archive", selection["appArchive"]),
+    selection["rollback"]["name"]: ("installer-package", selection["rollback"]),
+    selection["diskImage"]["name"]: ("disk-image", selection["diskImage"]),
+}
+seen_artifacts = set()
+for artifact in artifacts:
+    if not isinstance(artifact, dict):
+        raise SystemExit(8)
+    name = artifact.get("name")
+    if name not in expected_artifacts or name in seen_artifacts:
+        raise SystemExit(9)
+    artifact_type, selected_asset = expected_artifacts[name]
+    if (
+        artifact.get("type") != artifact_type
+        or artifact.get("sha256") != selected_asset["digest"]
+        or artifact.get("byteCount") != selected_asset["size"]
+    ):
+        raise SystemExit(10)
+    seen_artifacts.add(name)
+if seen_artifacts != set(expected_artifacts):
+    raise SystemExit(11)
 
 checksums = {}
 with open(checksums_path, "r", encoding="utf-8") as stream:
@@ -578,18 +629,59 @@ with open(checksums_path, "r", encoding="utf-8") as stream:
         line = raw_line.rstrip("\n")
         match = re.fullmatch(r"([0-9a-f]{64})  ([A-Za-z0-9][A-Za-z0-9._-]*)", line)
         if match is None or match.group(2) in checksums:
-            raise SystemExit(10)
+            raise SystemExit(12)
         checksums[match.group(2)] = match.group(1)
-if checksums.get(rollback["name"]) != rollback["digest"]:
-    raise SystemExit(11)
+expected_checksums = {
+    name: selected_asset["digest"]
+    for name, (_, selected_asset) in expected_artifacts.items()
+}
+if checksums != expected_checksums:
+    raise SystemExit(13)
 
 with open(output_path, "w", encoding="utf-8") as stream:
-    json.dump({"commit": commit, "previousBuildVersion": build}, stream, sort_keys=True)
+    json.dump(
+        {
+            "bundleIdentifier": manifest["bundleIdentifier"],
+            "commit": commit,
+            "previousBuildVersion": build,
+            "previousVersion": manifest["version"],
+        },
+        stream,
+        sort_keys=True,
+    )
 ' "$manifest_path" "$checksums_path" "$commit_json" "$selection_json" "$validated_json" ||
     fail "previous immutable release manifest, checksum, build, or rollback asset did not validate"
 
   PREVIOUS_RELEASE_COMMIT="$(/usr/bin/plutil -extract commit raw -o - "$validated_json")"
   PREVIOUS_BUILD_VERSION="$(/usr/bin/plutil -extract previousBuildVersion raw -o - "$validated_json")"
+  /bin/zsh -f "$ROOT_DIR/scripts/verify_release.sh" \
+    pkg-signature \
+    "$rollback_path" \
+    "$PREVIOUS_RELEASE_VERSION" \
+    "$PREVIOUS_BUILD_VERSION" \
+    "$EXPECTED_BUNDLE_ID" \
+    "$GATEBEAM_DEVELOPER_TEAM_ID" ||
+    fail "previous release rollback package signature did not validate"
+  "$PKGUTIL" --expand-full "$rollback_path" "$expanded_package_path" >/dev/null ||
+    fail "previous release rollback package could not be expanded"
+  /usr/bin/find \
+    "$expanded_package_path" \
+    -type d \
+    -name Gatebeam.app \
+    -prune \
+    -print >"$rollback_app_list"
+  rollback_app_count="$(/usr/bin/wc -l <"$rollback_app_list" | /usr/bin/tr -d '[:space:]')"
+  [[ "$rollback_app_count" == "1" ]] ||
+    fail "previous release rollback package must contain exactly one Gatebeam app"
+  rollback_app_path="$(/usr/bin/head -n 1 "$rollback_app_list")"
+  /bin/zsh -f "$ROOT_DIR/scripts/verify_release.sh" \
+    app-signature \
+    "$rollback_app_path" \
+    "$PREVIOUS_RELEASE_VERSION" \
+    "$PREVIOUS_BUILD_VERSION" \
+    "$EXPECTED_BUNDLE_ID" \
+    "$GATEBEAM_DEVELOPER_TEAM_ID" ||
+    fail "previous release rollback app contents or signature did not validate"
   git_safe -C "$ROOT_DIR" cat-file -e "$PREVIOUS_RELEASE_COMMIT^{commit}" 2>/dev/null ||
     fail "previous immutable release commit is unavailable in the release worktree"
   git_safe -C "$ROOT_DIR" merge-base --is-ancestor \
@@ -862,6 +954,7 @@ require_environment GATEBEAM_INSTALLER_SIGN_IDENTITY
 require_environment GATEBEAM_NOTARY_PROFILE
 require_environment GATEBEAM_RELEASE_CI_RUN_ID
 require_environment GATEBEAM_RELEASE_CLEAN_MACHINE_RUN_ID
+require_environment GATEBEAM_GITHUB_TOKEN
 
 GATEBEAM_RELEASE_BOOTSTRAP="${GATEBEAM_RELEASE_BOOTSTRAP:-0}"
 
@@ -961,6 +1054,7 @@ validate_workflow_evidence \
   "$GATEBEAM_RELEASE_CI_RUN_ID" \
   "$CI_WORKFLOW_NAME" \
   "$CI_WORKFLOW_PATH" \
+  "$CI_WORKFLOW_EVENT" \
   "Test, isolate, and build Gatebeam" \
   "Check out repository" \
   "Run backend tests" \
@@ -981,6 +1075,7 @@ validate_workflow_evidence \
   "$GATEBEAM_RELEASE_CLEAN_MACHINE_RUN_ID" \
   "$CLEAN_WORKFLOW_NAME" \
   "$CLEAN_WORKFLOW_PATH" \
+  "$CLEAN_WORKFLOW_EVENT" \
   "Validate install, upgrade, rollback, and uninstall" \
   "Check out repository" \
   "Build and validate isolated install, upgrade, rollback, and uninstall"

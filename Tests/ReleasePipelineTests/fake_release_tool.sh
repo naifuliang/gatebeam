@@ -132,13 +132,19 @@ case "$TOOL_NAME" in
     print -r -- "arm64"
     ;;
   pkgutil)
+    if [[ "$1" == "--expand-full" ]]; then
+      [[ $# -eq 3 && -f "$2" && ! -e "$3" ]]
+      /usr/bin/ditto -x -k "$2" "$3"
+      exit
+    fi
     print -r -- "Package ${@: -1}:"
     print -r -- "   Status: signed by a certificate trusted by macOS"
     if [[ "${GATEBEAM_FAKE_NO_PKG_TIMESTAMP:-0}" != "1" ]]; then
       print -r -- "   Signed with a trusted timestamp"
     fi
     print -r -- "   Certificate Chain:"
-    if [[ "${GATEBEAM_FAKE_WRONG_INSTALLER_AUTHORITY:-0}" == "1" ]]; then
+    if [[ "${GATEBEAM_FAKE_WRONG_INSTALLER_AUTHORITY:-0}" == "1" ||
+          "${GATEBEAM_FAKE_GITHUB_SCENARIO:-}" == "wrong-rollback-signature" ]]; then
       print -r -- "    1. Developer ID Application: Gatebeam Tests (ABCDE12345)"
     else
       print -r -- "    1. Developer ID Installer: Gatebeam Tests (ABCDE12345)"
