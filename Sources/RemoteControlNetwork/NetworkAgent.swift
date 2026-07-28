@@ -1299,7 +1299,7 @@ final class NetworkAgent {
                 next.publicAddress = discovery.publicAddress
                 if let routerAddress = discovery.routerWANAddress,
                    discovery.blocksDDNS {
-                    ipv4Issue = "Router WAN address \(routerAddress) is private or CGNAT. Internet-facing address: \(discovery.publicAddress)."
+                    ipv4Issue = "Router WAN address \(routerAddress) is not publicly routable. Internet-facing address: \(discovery.publicAddress)."
                 } else {
                     ddnsIPv4 = discovery.publicAddress
                 }
@@ -1610,7 +1610,7 @@ final class NetworkAgent {
         return PublicIPv4Discovery(
             publicAddress: probedAddress,
             routerWANAddress: routerWANAddress,
-            blocksDDNS: routerWANAddress.map(PublicIPService.isPrivateOrCGNAT) ?? false
+            blocksDDNS: routerWANAddress.map { !PublicIPService.isPublicIPv4($0) } ?? false
         )
     }
 

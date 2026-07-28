@@ -2404,14 +2404,18 @@ func testRouterWANIPv4RequiresPublicRoutability() throws {
     try expect(publicRouter.publicAddress == "8.8.8.8", "A public router WAN address must take priority")
     try expect(publicIP.ipv4CallCount == 0, "A public router WAN address must avoid the fallback probe")
 
-    let specialAddresses = [
-        "0.0.0.0",
-        "127.0.0.1",
-        "169.254.1.2",
-        "224.0.0.1",
-        "240.0.0.1"
+    let nonPublicAddresses = [
+        ("10.0.0.1", "RFC1918"),
+        ("100.64.1.20", "CGNAT"),
+        ("169.254.1.2", "link-local"),
+        ("192.0.2.1", "documentation"),
+        ("198.18.0.1", "benchmark"),
+        ("224.0.0.1", "multicast"),
+        ("240.0.0.1", "reserved"),
+        ("127.0.0.1", "loopback"),
+        ("0.0.0.0", "unspecified")
     ]
-    for address in specialAddresses {
+    for (address, category) in nonPublicAddresses {
         router.externalIPv4 = address
         let discovery = try agent.currentPublicIPv4(
             config: config,
@@ -2420,20 +2424,16 @@ func testRouterWANIPv4RequiresPublicRoutability() throws {
         )
         try expect(
             discovery.publicAddress == publicIP.ipv4,
-            "\(address) must fall back to the independent public-IP probe"
+            "\(category) address \(address) must fall back to the independent public-IP probe"
         )
-        try expect(!discovery.blocksDDNS, "\(address) must not be misdiagnosed as RFC1918 or CGNAT")
-    }
-
-    for address in ["192.168.1.20", "100.64.1.20"] {
-        router.externalIPv4 = address
-        let discovery = try agent.currentPublicIPv4(
-            config: config,
-            gatewayAddress: "192.0.2.1",
-            revision: 0
+        try expect(
+            discovery.routerWANAddress == address,
+            "\(category) address \(address) must remain available for diagnostics"
         )
-        try expect(discovery.publicAddress == publicIP.ipv4, "Private WAN addresses still need a public diagnostic address")
-        try expect(discovery.blocksDDNS, "RFC1918 and CGNAT WAN addresses must block A-record updates")
+        try expect(
+            discovery.blocksDDNS,
+            "\(category) address \(address) must block A-record updates"
+        )
     }
     agent.stop()
 }
