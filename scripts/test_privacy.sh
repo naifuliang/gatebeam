@@ -280,6 +280,7 @@ is_allowed_ipv4() {
   fi
 
   if [[ "$source_path" == "Tests/IntegrationContractTests/main.swift" ]]; then
+    (( octet1 == 198 && octet2 == 18 && octet3 == 0 && octet4 == 1 )) && return 0
     (( octet1 == 8 && octet2 == 8 && octet3 == 8 && octet4 == 8 )) && return 0
     (( octet1 == 8 && octet2 == 8 && octet3 == 4 && octet4 == 4 )) && return 0
     (( octet1 >= 240 )) && return 0

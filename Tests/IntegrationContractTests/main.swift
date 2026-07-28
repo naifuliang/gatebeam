@@ -44,6 +44,7 @@ struct KeychainQueryRecord {
     let operation: KeychainQueryOperation
     let interaction: KeychainInteraction
     let hasAuthenticationContext: Bool
+    let authenticationContextInteractionNotAllowed: Bool?
     let authenticationUIValue: String?
 }
 
@@ -64,6 +65,7 @@ final class LockedKeychainQueryAudit {
                 operation: operation,
                 interaction: interaction,
                 hasAuthenticationContext: context != nil,
+                authenticationContextInteractionNotAllowed: context?.interactionNotAllowed,
                 authenticationUIValue: authenticationUIValue
             )
         )
@@ -75,6 +77,15 @@ final class LockedKeychainQueryAudit {
         let result = records
         lock.unlock()
         return result
+    }
+}
+
+final class AuditedLAContext: LAContext {
+    private var storedInteractionNotAllowed = false
+
+    override var interactionNotAllowed: Bool {
+        get { storedInteractionNotAllowed }
+        set { storedInteractionNotAllowed = newValue }
     }
 }
 
@@ -419,6 +430,7 @@ func testKeychainQueryInteractionPolicy() throws {
             scopedGet: { _, _, _ in nil },
             scopedDelete: { _, _, _ in }
         ),
+        authenticationContextFactory: AuditedLAContext.init,
         queryObserver: audit.observe
     )
     let account = "cloudflare-api-token"
@@ -453,8 +465,12 @@ func testKeychainQueryInteractionPolicy() throws {
         "Background read, write, and delete must share the audited query builder"
     )
     try expect(
-        background.allSatisfy { $0.interaction == .background && $0.hasAuthenticationContext },
-        "Every background Keychain query must contain the policy-configured LAContext"
+        background.allSatisfy {
+            $0.interaction == .background
+                && $0.hasAuthenticationContext
+                && $0.authenticationContextInteractionNotAllowed == true
+        },
+        "Every background Keychain query must contain a non-interactive LAContext"
     )
     try expect(
         background.allSatisfy {
@@ -469,8 +485,12 @@ func testKeychainQueryInteractionPolicy() throws {
         "Explicit read, write, and delete must share the audited query builder"
     )
     try expect(
-        explicit.allSatisfy { $0.interaction == .userInitiated && $0.hasAuthenticationContext },
-        "User-initiated Keychain queries must contain their interactive LAContext"
+        explicit.allSatisfy {
+            $0.interaction == .userInitiated
+                && $0.hasAuthenticationContext
+                && $0.authenticationContextInteractionNotAllowed == false
+        },
+        "User-initiated Keychain queries must contain an interactive LAContext"
     )
     try expect(
         explicit.allSatisfy { $0.authenticationUIValue == nil },
@@ -483,7 +503,6 @@ func testScheduledChecksUseBackgroundKeychainPolicy() throws {
     defer { try? FileManager.default.removeItem(at: baseDirectory) }
 
     let audit = LockedKeychainQueryAudit()
-    let checkExecutions = LockedCounter()
     let keychain = KeychainStore(
         service: "io.github.naifuliang.gatebeam.scheduled-query-policy",
         legacyServices: [],
@@ -501,6 +520,7 @@ func testScheduledChecksUseBackgroundKeychainPolicy() throws {
             },
             scopedDelete: { _, _, _ in }
         ),
+        authenticationContextFactory: AuditedLAContext.init,
         queryObserver: audit.observe
     )
     var config = AppConfig.default
@@ -508,39 +528,85 @@ func testScheduledChecksUseBackgroundKeychainPolicy() throws {
     config.cloudflareZoneID = "zone-fixture"
     config.dnsRecordName = "host.example.test"
     config.checkIntervalSeconds = AppConfig.maximumCheckIntervalSeconds
-    let agent = NetworkAgent(
+    let startupChecks = LockedCounter()
+    let startupAgent = NetworkAgent(
         configStore: AppConfigStore(baseDirectory: baseDirectory),
         keychain: keychain,
         initialConfig: config,
-        checkExecutionObserver: { checkExecutions.increment() },
+        checkExecutionObserver: { startupChecks.increment() },
         localNetworkService: MockLocalNetworkService(),
         routerMappingService: MockRouterMappingService()
     )
 
-    agent.start()
+    startupAgent.start()
     try expect(
-        waitUntil { checkExecutions.current == 1 && audit.snapshot.count == 1 },
+        waitUntil { startupChecks.current == 1 && audit.snapshot.count == 1 },
         "Startup must complete one non-interactive Keychain-backed check"
     )
-    agent.runCheck()
-    try expect(
-        waitUntil { checkExecutions.current == 2 && audit.snapshot.count == 2 },
-        "A later scheduled check must repeat the non-interactive Keychain policy"
+    startupAgent.stop()
+
+    let scheduleLock = NSLock()
+    var periodicHandler: (() -> Void)?
+    let periodicChecks = LockedCounter()
+    let periodicAgent = NetworkAgent(
+        configStore: AppConfigStore(baseDirectory: baseDirectory),
+        keychain: keychain,
+        initialConfig: config,
+        checkExecutionObserver: { periodicChecks.increment() },
+        localNetworkService: MockLocalNetworkService(),
+        routerMappingService: MockRouterMappingService(),
+        performInitialCheckOnStart: false,
+        periodicTimerScheduler: { _, handler in
+            scheduleLock.lock()
+            periodicHandler = handler
+            scheduleLock.unlock()
+            return NetworkAgentScheduledTimer {}
+        }
     )
-    agent.stop()
+    periodicAgent.start()
+    scheduleLock.lock()
+    let capturedPeriodicHandler = periodicHandler
+    scheduleLock.unlock()
+    guard let capturedPeriodicHandler else {
+        throw IntegrationContractFailure("The periodic check handler was not scheduled")
+    }
+    capturedPeriodicHandler()
+    try expect(
+        waitUntil { periodicChecks.current == 1 && audit.snapshot.count == 2 },
+        "The injected periodic timer must run one non-interactive Keychain-backed check"
+    )
+    periodicAgent.stop()
+
+    _ = try? keychain.get(
+        account: "cloudflare-api-token",
+        interaction: .userInitiated
+    )
 
     let records = audit.snapshot
     let backgroundPolicy = KeychainStore.queryPolicy(for: .background)
+    let backgroundRecords = Array(records.prefix(2))
     try expect(
-        records.allSatisfy {
+        backgroundRecords.count == 2 && backgroundRecords.allSatisfy {
             $0.operation == .read
                 && $0.interaction == .background
                 && $0.hasAuthenticationContext
+                && $0.authenticationContextInteractionNotAllowed == true
                 && $0.authenticationUIValue == kSecUseAuthenticationUIFail as String
         }
             && backgroundPolicy.interactionNotAllowed
             && backgroundPolicy.failsAuthenticationUI,
         "Startup and periodic checks must carry both independent background UI prohibitions"
+    )
+    guard let explicitRecord = records.last else {
+        throw IntegrationContractFailure("The explicit Keychain authorization query was not observed")
+    }
+    try expect(
+        explicitRecord.operation == .read
+            && explicitRecord.interaction == .userInitiated
+            && explicitRecord.hasAuthenticationContext
+            && explicitRecord.authenticationContextInteractionNotAllowed == false
+            && explicitRecord.authenticationUIValue == nil,
+        "Explicit Keychain authorization must not inherit the background UI-fail policy"
     )
 }
 

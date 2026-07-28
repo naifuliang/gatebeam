@@ -242,9 +242,12 @@ final class NetworkAgent {
     private let checkExecutionObserver: (() -> Void)?
     private let sideEffectWillStartObserver: ((String) -> Void)?
     private let nowProvider: () -> Date
+    private let performInitialCheckOnStart: Bool
+    private let periodicTimerScheduler:
+        ((TimeInterval, @escaping () -> Void) -> NetworkAgentScheduledTimer)?
     private let expirationTimerScheduler:
         (Date, @escaping () -> Void) -> NetworkAgentScheduledTimer
-    private var timer: DispatchSourceTimer?
+    private var timer: NetworkAgentScheduledTimer?
     private var expirationTimer: NetworkAgentScheduledTimer?
     private var expirationRetryNotBefore: Date?
     private var isRunning = false
@@ -303,6 +306,9 @@ final class NetworkAgent {
         emergencyMappingJournal: EmergencyMappingJournal? = nil,
         fallbackMappingJournal: EmergencyMappingJournal? = nil,
         nowProvider: @escaping () -> Date = Date.init,
+        performInitialCheckOnStart: Bool = true,
+        periodicTimerScheduler:
+            ((TimeInterval, @escaping () -> Void) -> NetworkAgentScheduledTimer)? = nil,
         expirationTimerScheduler:
             ((Date, @escaping () -> Void) -> NetworkAgentScheduledTimer)? = nil
     ) {
@@ -317,6 +323,8 @@ final class NetworkAgent {
         self.checkExecutionObserver = checkExecutionObserver
         self.sideEffectWillStartObserver = sideEffectWillStartObserver
         self.nowProvider = nowProvider
+        self.performInitialCheckOnStart = performInitialCheckOnStart
+        self.periodicTimerScheduler = periodicTimerScheduler
         self.expirationTimerScheduler = expirationTimerScheduler
             ?? Self.scheduleSystemExpirationTimer
         self.localNetworkService = localNetworkService
@@ -421,7 +429,9 @@ final class NetworkAgent {
 
     func start() {
         guard sideEffectsEnabled else { return }
-        scheduleCheck(retryKeychainAfterFailure: false)
+        if performInitialCheckOnStart {
+            scheduleCheck(retryKeychainAfterFailure: false)
+        }
         withState {
             isRunning = true
             restartTimerOnStateQueue()
@@ -2624,16 +2634,26 @@ final class NetworkAgent {
         guard sideEffectsEnabled else { return }
         timer?.cancel()
         let interval = AppConfig.normalizedCheckInterval(storedConfig.checkIntervalSeconds)
-        let timer = DispatchSource.makeTimerSource(queue: stateQueue)
-        timer.schedule(
+        let handler: () -> Void = { [weak self] in
+            guard let self else { return }
+            self.scheduleCheck(retryKeychainAfterFailure: false)
+        }
+        if let periodicTimerScheduler {
+            timer = periodicTimerScheduler(interval, handler)
+            return
+        }
+
+        let source = DispatchSource.makeTimerSource(queue: stateQueue)
+        source.schedule(
             deadline: .now() + interval,
             repeating: interval
         )
-        timer.setEventHandler { [weak self] in
-            self?.scheduleCheck(retryKeychainAfterFailure: false)
+        source.setEventHandler(handler: handler)
+        source.resume()
+        timer = NetworkAgentScheduledTimer {
+            source.setEventHandler {}
+            source.cancel()
         }
-        self.timer = timer
-        timer.resume()
     }
 
     private func restartExpirationTimerOnStateQueue() {

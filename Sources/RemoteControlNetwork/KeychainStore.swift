@@ -134,6 +134,7 @@ final class KeychainStore {
     private let legacyServices: [String]
     private let useDataProtectionKeychain: Bool
     private let operationHandlers: KeychainOperationHandlers?
+    private let authenticationContextFactory: () -> LAContext
     private let queryObserver: KeychainQueryObserver?
 
     init(
@@ -141,10 +142,12 @@ final class KeychainStore {
         service: String? = nil,
         legacyServices: [String]? = nil,
         operationHandlers: KeychainOperationHandlers? = nil,
+        authenticationContextFactory: @escaping () -> LAContext = LAContext.init,
         queryObserver: KeychainQueryObserver? = nil
     ) {
         self.useDataProtectionKeychain = useDataProtectionKeychain
         self.operationHandlers = operationHandlers
+        self.authenticationContextFactory = authenticationContextFactory
         self.queryObserver = queryObserver
         self.service = service ?? (useDataProtectionKeychain
             ? "io.github.naifuliang.gatebeam.data-protection.v1"
@@ -424,7 +427,7 @@ final class KeychainStore {
         interaction: KeychainInteraction
     ) -> [String: Any] {
         let policy = Self.queryPolicy(for: interaction)
-        let authenticationContext = LAContext()
+        let authenticationContext = authenticationContextFactory()
         authenticationContext.interactionNotAllowed = policy.interactionNotAllowed
         let query = Self.makeQueryDictionary(
             account: account,
