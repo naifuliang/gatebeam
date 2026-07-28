@@ -300,7 +300,7 @@ assert_rollback_state() {
   local home="$6"
 
   assert_file_content "old-destination" "$destination/old-marker"
-  assert_file_content "old-legacy" "$legacy/old-marker"
+  assert_file_content "old-legacy" "$legacy/Contents/Resources/old-marker"
   assert_tree_snapshot "$rollback_root/destination-before.manifest" "$destination"
   assert_tree_snapshot "$rollback_root/legacy-before.manifest" "$legacy"
   assert_same_file "$rollback_root/stable-before.plist" "$stable"
@@ -434,7 +434,7 @@ stable_plist="$developer_agents/$stable_label.plist"
 transitional_plist="$developer_agents/$transitional_label.plist"
 mkdir -p "$developer_apps" "$developer_agents"
 make_app "$source_app" "com.local.RemoteControlNetwork" "Gatebeam" true
-make_app "$developer_legacy" "com.local.RemoteControlNetwork" "RemoteControlNetwork"
+make_app "$developer_legacy" "com.local.RemoteControlNetwork" "RemoteControlNetwork" true
 make_agent "$transitional_plist" "$transitional_label" "$developer_legacy"
 
 GATEBEAM_APP_DIR="$source_app" \
@@ -482,6 +482,62 @@ assert_file_content "previous-install" "$signature_destination/old-marker"
 assert_exists "$signature_stable"
 assert_no_transaction "$signature_home"
 
+legacy_signature_root="$fixture_root/developer-legacy-signature-rejection"
+legacy_signature_home="$legacy_signature_root/home"
+legacy_signature_apps="$legacy_signature_home/Applications"
+legacy_signature_agents="$legacy_signature_home/Library/LaunchAgents"
+legacy_signature_source="$legacy_signature_root/source/Gatebeam.app"
+legacy_signature_destination="$legacy_signature_apps/Gatebeam.app"
+legacy_signature_app="$legacy_signature_apps/Remote Control Network.app"
+legacy_signature_stable="$legacy_signature_agents/$stable_label.plist"
+legacy_signature_log="$legacy_signature_root/install.log"
+legacy_signature_before="$legacy_signature_root/before.manifest"
+mkdir -p "$legacy_signature_apps" "$legacy_signature_agents"
+make_app "$legacy_signature_source" "com.local.RemoteControlNetwork" "Gatebeam" true
+make_app "$legacy_signature_destination" "com.local.RemoteControlNetwork" "Gatebeam" true
+make_app "$legacy_signature_app" "com.local.RemoteControlNetwork" "RemoteControlNetwork"
+print -r -- "preserve-unsigned-legacy" > "$legacy_signature_app/legacy-marker"
+make_agent "$legacy_signature_stable" "$stable_label" "$legacy_signature_app"
+snapshot_tree "$legacy_signature_home" "$legacy_signature_before"
+if GATEBEAM_APP_DIR="$legacy_signature_source" \
+  GATEBEAM_INSTALL_DIR="$legacy_signature_apps" \
+  GATEBEAM_USER_HOME="$legacy_signature_home" \
+    "$INSTALLER" >"$legacy_signature_log" 2>&1; then
+  print -u2 -- "FAIL: installer deleted an unsigned metadata-matching legacy app"
+  exit 1
+fi
+assert_tree_snapshot "$legacy_signature_before" "$legacy_signature_home"
+assert_file_content "preserve-unsigned-legacy" "$legacy_signature_app/legacy-marker"
+assert_text_present \
+  fixed \
+  "Preserving legacy app because its code signature is missing or invalid: $legacy_signature_app" \
+  "$legacy_signature_log"
+assert_text_present \
+  fixed \
+  "Remove or repair the legacy app manually, then run the Gatebeam installer again." \
+  "$legacy_signature_log"
+assert_no_transaction "$legacy_signature_home"
+
+rm -rf -- "$legacy_signature_app"
+make_app "$legacy_signature_app" "com.local.RemoteControlNetwork" "RemoteControlNetwork" true
+print -n -- "tampered" >> "$legacy_signature_app/Contents/MacOS/RemoteControlNetwork"
+print -r -- "preserve-damaged-legacy" > "$legacy_signature_app/legacy-marker"
+snapshot_tree "$legacy_signature_home" "$legacy_signature_before"
+if GATEBEAM_APP_DIR="$legacy_signature_source" \
+  GATEBEAM_INSTALL_DIR="$legacy_signature_apps" \
+  GATEBEAM_USER_HOME="$legacy_signature_home" \
+    "$INSTALLER" >"$legacy_signature_log" 2>&1; then
+  print -u2 -- "FAIL: installer deleted a damaged metadata-matching legacy app"
+  exit 1
+fi
+assert_tree_snapshot "$legacy_signature_before" "$legacy_signature_home"
+assert_file_content "preserve-damaged-legacy" "$legacy_signature_app/legacy-marker"
+assert_text_present \
+  fixed \
+  "Preserving legacy app because its code signature is missing or invalid: $legacy_signature_app" \
+  "$legacy_signature_log"
+assert_no_transaction "$legacy_signature_home"
+
 rollback_root="$fixture_root/developer-rollback"
 rollback_home="$rollback_root/home"
 rollback_apps="$rollback_home/Applications"
@@ -494,9 +550,16 @@ rollback_transitional="$rollback_agents/$transitional_label.plist"
 mkdir -p "$rollback_apps" "$rollback_agents"
 make_app "$rollback_source" "com.local.RemoteControlNetwork" "Gatebeam" true
 make_app "$rollback_destination" "com.local.RemoteControlNetwork" "Gatebeam"
-make_app "$rollback_legacy" "com.local.RemoteControlNetwork" "RemoteControlNetwork"
+make_app "$rollback_legacy" "com.local.RemoteControlNetwork" "RemoteControlNetwork" true
 print "old-destination" > "$rollback_destination/old-marker"
-print "old-legacy" > "$rollback_legacy/old-marker"
+mkdir -p "$rollback_legacy/Contents/Resources"
+print "old-legacy" > "$rollback_legacy/Contents/Resources/old-marker"
+codesign \
+  --force \
+  --deep \
+  --sign - \
+  --requirements '=designated => identifier "com.local.RemoteControlNetwork"' \
+  "$rollback_legacy" >/dev/null
 make_agent "$rollback_stable" "$stable_label" "$rollback_legacy"
 make_agent "$rollback_transitional" "$transitional_label" "$rollback_legacy"
 chmod 0711 "$rollback_destination"

@@ -73,6 +73,14 @@ has_valid_code_signature() {
   /usr/bin/codesign --verify --deep --strict "$1" >/dev/null 2>&1
 }
 
+validate_legacy_code_signature() {
+  has_valid_code_signature "$LEGACY_APP" && return 0
+  /bin/echo \
+    "Preserving legacy app because its code signature is missing or invalid: $LEGACY_APP. Remove or repair the legacy app manually, then run the Gatebeam installer again." \
+    >&2
+  return 1
+}
+
 managed_plist_label() {
   local plist_path="$1"
   [[ -f "$plist_path" && ! -L "$plist_path" ]] || return 1
@@ -287,6 +295,9 @@ if path_exists "$LEGACY_APP"; then
     fail "Refusing to migrate an unrecognized legacy app: $LEGACY_APP"
     exit 1
   }
+  validate_legacy_code_signature || {
+    exit 1
+  }
 fi
 if path_exists "$STABLE_PLIST"; then
   [[ "$(managed_plist_label "$STABLE_PLIST" || true)" == "$STABLE_LABEL" ]] || {
@@ -349,6 +360,7 @@ if path_exists "$DESTINATION"; then
   /bin/mv -- "$DESTINATION" "$destination_backup" || exit_with_rollback "$?"
 fi
 if path_exists "$LEGACY_APP"; then
+  validate_legacy_code_signature || exit_with_rollback 1
   /bin/mv -- "$LEGACY_APP" "$legacy_backup" || exit_with_rollback "$?"
 fi
 if path_exists "$STABLE_PLIST"; then

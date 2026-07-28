@@ -9,11 +9,49 @@ APP_EXECUTABLE="$ROOT_DIR/dist/Gatebeam.app/Contents/MacOS/Gatebeam"
 VALIDATION_ROOT=""
 APP_PID=""
 
+if (( $+commands[rg] )); then
+  TEXT_SEARCH_TOOL="$commands[rg]"
+  TEXT_SEARCH_KIND="rg"
+elif [[ -x /usr/bin/grep ]]; then
+  TEXT_SEARCH_TOOL="/usr/bin/grep"
+  TEXT_SEARCH_KIND="grep"
+else
+  print -u2 'UI validation contract failed: neither rg nor /usr/bin/grep is available'
+  exit 1
+fi
+
+fixed_text_search_quiet() {
+  local pattern="$1"
+  shift
+
+  local search_status
+  if [[ "$TEXT_SEARCH_KIND" == "rg" ]]; then
+    if "$TEXT_SEARCH_TOOL" --fixed-strings --quiet -- "$pattern" "$@"; then
+      search_status=0
+    else
+      search_status="$?"
+    fi
+  else
+    if "$TEXT_SEARCH_TOOL" -Fq -- "$pattern" "$@"; then
+      search_status=0
+    else
+      search_status="$?"
+    fi
+  fi
+
+  if (( search_status > 1 )); then
+    print -u2 -- "UI validation contract failed: $TEXT_SEARCH_KIND could not search: $*"
+    exit "$search_status"
+  fi
+  return "$search_status"
+}
+
 require_contract() {
   local pattern="$1"
   local description="$2"
+  local file_path="${3:-$APP_DELEGATE}"
 
-  if ! rg --fixed-strings --quiet "$pattern" "$APP_DELEGATE"; then
+  if ! fixed_text_search_quiet "$pattern" "$file_path"; then
     print -u2 "UI validation contract failed: $description"
     exit 1
   fi
@@ -38,10 +76,10 @@ require_contract 'if !isUIValidationMode {' 'validation mode lifecycle guards ar
 require_contract 'LaunchAgentManager().migrateLegacyUserState()' 'login item migration wiring is missing'
 require_contract 'agent.start()' 'agent lifecycle wiring is missing'
 require_contract 'SettingsWindowController(' 'settings window construction is missing'
-if ! rg --fixed-strings --quiet 'guard sideEffectsEnabled else { return }' "$NETWORK_AGENT"; then
-  print -u2 'UI validation contract failed: NetworkAgent entry points are not side-effect gated'
-  exit 1
-fi
+require_contract \
+  'guard sideEffectsEnabled else { return }' \
+  'NetworkAgent entry points are not side-effect gated' \
+  "$NETWORK_AGENT"
 
 "$ROOT_DIR/scripts/test_integration_contract.sh"
 "$ROOT_DIR/scripts/build_app.sh"
@@ -129,15 +167,26 @@ APP_PID=""
   exit 1
 }
 
-if [[ -d "$VALIDATION_HOME/Library/Keychains" ]] &&
-   find "$VALIDATION_HOME/Library/Keychains" -type f -print -quit | grep -q .; then
+KEYCHAIN_FILE=""
+if [[ -d "$VALIDATION_HOME/Library/Keychains" ]]; then
+  KEYCHAIN_FILE="$(find "$VALIDATION_HOME/Library/Keychains" -type f -print -quit)"
+fi
+if [[ -n "$KEYCHAIN_FILE" ]]; then
   print -u2 'UI validation failed: validation created a Keychain file.'
   exit 1
 fi
 
-if find "$LAUNCH_AGENTS" -mindepth 1 -maxdepth 1 -type f |
-   grep -Ev '/(com\.local\.RemoteControlNetwork\.login|io\.github\.naifuliang\.gatebeam\.login)\.plist$' |
-   grep -q .; then
+UNEXPECTED_LAUNCH_AGENT="$(
+  find "$LAUNCH_AGENTS" \
+    -mindepth 1 \
+    -maxdepth 1 \
+    -type f \
+    ! -name 'com.local.RemoteControlNetwork.login.plist' \
+    ! -name 'io.github.naifuliang.gatebeam.login.plist' \
+    -print \
+    -quit
+)"
+if [[ -n "$UNEXPECTED_LAUNCH_AGENT" ]]; then
   print -u2 'UI validation failed: validation created an unexpected LaunchAgent.'
   exit 1
 fi

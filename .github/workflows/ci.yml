@@ -49,7 +49,15 @@ jobs:
         run: codesign --verify --deep --strict ./dist/Gatebeam.app
 
       - name: Scan source and app for private material
-        run: ./scripts/test_privacy.sh
+        env:
+          PRIVACY_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          PRIVACY_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          if git cat-file -e "${PRIVACY_BASE_SHA}^{commit}" 2>/dev/null; then
+            ./scripts/test_privacy.sh --range "${PRIVACY_BASE_SHA}..${PRIVACY_HEAD_SHA}"
+          else
+            ./scripts/test_privacy.sh --range "${PRIVACY_HEAD_SHA}"
+          fi
 
       - name: Check committed patch whitespace
         run: git show --check HEAD
