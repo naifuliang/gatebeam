@@ -9,6 +9,136 @@ MIGRATOR="$ROOT_DIR/scripts/pkg/migrate_legacy_install.sh"
 POSTINSTALL="$ROOT_DIR/scripts/pkg/postinstall"
 INSTALLER="$ROOT_DIR/scripts/install_app.sh"
 
+if (( $+commands[rg] )); then
+  TEXT_SEARCH_TOOL="$commands[rg]"
+  TEXT_SEARCH_KIND="rg"
+elif [[ -x /usr/bin/grep ]]; then
+  TEXT_SEARCH_TOOL="/usr/bin/grep"
+  TEXT_SEARCH_KIND="grep"
+else
+  print -u2 -- "FAIL: neither rg nor /usr/bin/grep is available"
+  exit 1
+fi
+
+text_search_quiet() {
+  local mode="$1"
+  local pattern="$2"
+  shift 2
+
+  local search_status
+  if [[ "$TEXT_SEARCH_KIND" == "rg" ]]; then
+    case "$mode" in
+      regex)
+        if "$TEXT_SEARCH_TOOL" --quiet -- "$pattern" "$@"; then
+          search_status=0
+        else
+          search_status="$?"
+        fi
+        ;;
+      fixed)
+        if "$TEXT_SEARCH_TOOL" --fixed-strings --quiet -- "$pattern" "$@"; then
+          search_status=0
+        else
+          search_status="$?"
+        fi
+        ;;
+      *)
+        print -u2 -- "FAIL: unsupported text search mode: $mode"
+        exit 1
+        ;;
+    esac
+  else
+    case "$mode" in
+      regex)
+        if "$TEXT_SEARCH_TOOL" -Eq -- "$pattern" "$@"; then
+          search_status=0
+        else
+          search_status="$?"
+        fi
+        ;;
+      fixed)
+        if "$TEXT_SEARCH_TOOL" -Fq -- "$pattern" "$@"; then
+          search_status=0
+        else
+          search_status="$?"
+        fi
+        ;;
+      *)
+        print -u2 -- "FAIL: unsupported text search mode: $mode"
+        exit 1
+        ;;
+    esac
+  fi
+
+  if (( search_status > 1 )); then
+    print -u2 -- "FAIL: $TEXT_SEARCH_KIND could not search: $*"
+    exit "$search_status"
+  fi
+  return "$search_status"
+}
+
+assert_text_present() {
+  local mode="$1"
+  local pattern="$2"
+  shift 2
+
+  if ! text_search_quiet "$mode" "$pattern" "$@"; then
+    print -u2 -- "FAIL: expected text was not found in: $*"
+    exit 1
+  fi
+}
+
+assert_text_absent() {
+  local mode="$1"
+  local pattern="$2"
+  shift 2
+
+  if text_search_quiet "$mode" "$pattern" "$@"; then
+    print -u2 -- "FAIL: forbidden text was found in: $*"
+    exit 1
+  fi
+}
+
+assert_adjacent_lines() {
+  local first_pattern="$1"
+  local second_pattern="$2"
+  local file_path="$3"
+  local context
+  local search_status
+
+  if [[ "$TEXT_SEARCH_KIND" == "rg" ]]; then
+    if "$TEXT_SEARCH_TOOL" --multiline --quiet -- \
+      "${first_pattern}"$'\n'"${second_pattern}" \
+      "$file_path"; then
+      search_status=0
+    else
+      search_status="$?"
+    fi
+  else
+    if context="$("$TEXT_SEARCH_TOOL" -A 1 -E -- "$first_pattern" "$file_path")"; then
+      search_status=0
+    else
+      search_status="$?"
+    fi
+    if (( search_status == 0 )); then
+      if print -r -- "$context" | "$TEXT_SEARCH_TOOL" -Eq -- "$second_pattern"; then
+        search_status=0
+      else
+        search_status="$?"
+      fi
+    fi
+  fi
+
+  if (( search_status > 1 )); then
+    print -u2 -- "FAIL: $TEXT_SEARCH_KIND could not search adjacent lines in: $file_path"
+    exit "$search_status"
+  fi
+  if (( search_status == 1 )); then
+    print -u2 -- "FAIL: expected adjacent lines were not found in: $file_path"
+    exit 1
+  fi
+}
+
 mkdir -p "$BUILD_DIR" "$MODULE_CACHE_DIR"
 
 swiftc \
@@ -153,7 +283,9 @@ assert_tree_snapshot() {
 
 assert_no_transaction() {
   local home="$1"
-  if find "$home" -maxdepth 1 -name '.gatebeam-install.*' -print -quit | rg --quiet .; then
+  local transaction
+  transaction="$(find "$home" -maxdepth 1 -name '.gatebeam-install.*' -print -quit)"
+  if [[ -n "$transaction" ]]; then
     print -u2 -- "FAIL: install left a transaction directory in $home"
     exit 1
   fi
@@ -286,10 +418,10 @@ GATEBEAM_PLIST_BUDDY="$malicious_buddy" \
 assert_exists "$injected_target/Remote Control Network.app"
 assert_missing "$malicious_marker"
 
-if rg --quiet '(/dev/console|LaunchAgents|NFSHomeDirectory|GATEBEAM_USER_HOME|GATEBEAM_USER_NAME|GATEBEAM_PLIST_BUDDY)' "$MIGRATOR"; then
-  print -u2 -- "FAIL: root migrator contains a per-user or environment-controlled path"
-  exit 1
-fi
+assert_text_absent \
+  regex \
+  '(/dev/console|LaunchAgents|NFSHomeDirectory|GATEBEAM_USER_HOME|GATEBEAM_USER_NAME|GATEBEAM_PLIST_BUDDY)' \
+  "$MIGRATOR"
 
 developer_root="$fixture_root/developer-success"
 developer_home="$developer_root/home"
@@ -497,12 +629,10 @@ restore_failure_transaction="$(
 assert_file_content \
   "recoverable-previous-app" \
   "$restore_failure_transaction/previous.app/old-marker"
-rg --fixed-strings --quiet \
+assert_text_present \
+  fixed \
   "Recovery files were preserved at: $restore_failure_transaction" \
-  "$restore_failure_log" || {
-  print -u2 -- "FAIL: rollback failure did not report the recovery directory"
-  exit 1
-}
+  "$restore_failure_log"
 
 GATEBEAM_APP_DIR="$rollback_source" \
 GATEBEAM_INSTALL_DIR="$rollback_apps" \
@@ -558,10 +688,9 @@ if GATEBEAM_APP_DIR="$fake_source" \
 fi
 assert_exists "$fake_legacy"
 
-if ! rg -U --quiet 'if !isUIValidationMode \{\n\s+LaunchAgentManager\(\)\.migrateLegacyUserState\(\)' \
-  "$ROOT_DIR/Sources/RemoteControlNetwork/AppDelegate.swift"; then
-  print -u2 -- "FAIL: UI validation mode does not guard user-state migration"
-  exit 1
-fi
+assert_adjacent_lines \
+  '^[[:space:]]*if !isUIValidationMode \{$' \
+  '^[[:space:]]+LaunchAgentManager\(\)\.migrateLegacyUserState\(\)$' \
+  "$ROOT_DIR/Sources/RemoteControlNetwork/AppDelegate.swift"
 
 print "All package upgrade fixture tests passed"
