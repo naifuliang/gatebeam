@@ -2,6 +2,10 @@
 set -euo pipefail
 umask 077
 
+GITHUB_API_TOKEN="${GATEBEAM_GITHUB_TOKEN:-}"
+unset GATEBEAM_GITHUB_TOKEN GITHUB_TOKEN GH_TOKEN
+typeset +x GITHUB_API_TOKEN
+
 export PATH="/usr/bin:/bin:/usr/sbin:/sbin"
 
 ROOT_DIR="$(cd -P "$(dirname "$0")/.." && pwd -P)"
@@ -12,6 +16,8 @@ TEST_MODE="${GATEBEAM_RELEASE_TEST_MODE:-0}"
 TEST_FAILURE_POINT="${GATEBEAM_RELEASE_TEST_FAILURE_POINT:-}"
 FIXTURE_MARKER=".gatebeam-release-test-fixture"
 EXPECTED_BUNDLE_ID="io.github.naifuliang.gatebeam"
+EXPECTED_PACKAGE_INSTALL_ROOT="/Applications"
+EXPECTED_INSTALL_APP_PATH="/Applications/Gatebeam.app"
 GITHUB_REPOSITORY="naifuliang/gatebeam"
 GITHUB_API_ROOT="https://api.github.com/repos/$GITHUB_REPOSITORY"
 GITHUB_WEB_ROOT="https://github.com/$GITHUB_REPOSITORY"
@@ -24,7 +30,6 @@ CLEAN_WORKFLOW_EVENT="workflow_dispatch"
 TEMP_ROOT=""
 PUBLISH_STAGING=""
 PUBLISH_LOCK=""
-GITHUB_CURL_CONFIG=""
 PREVIOUS_BUILD_VERSION=""
 PREVIOUS_RELEASE_VERSION=""
 PREVIOUS_RELEASE_TAG=""
@@ -207,15 +212,9 @@ validate_run_id() {
 }
 
 prepare_github_auth() {
-  local token="$GATEBEAM_GITHUB_TOKEN"
-
-  [[ ${#token} -le 255 && "$token" =~ '^[A-Za-z0-9_.=-]+$' ]] ||
+  [[ ${#GITHUB_API_TOKEN} -le 255 &&
+      "$GITHUB_API_TOKEN" =~ '^[A-Za-z0-9_.=-]+$' ]] ||
     fail "GATEBEAM_GITHUB_TOKEN contains unsafe characters"
-  GITHUB_CURL_CONFIG="$TEMP_ROOT/github-auth.conf"
-  print -r -- "header = \"Authorization: Bearer $token\"" \
-    >"$GITHUB_CURL_CONFIG"
-  chmod 0600 "$GITHUB_CURL_CONFIG"
-  unset GATEBEAM_GITHUB_TOKEN GITHUB_TOKEN GH_TOKEN
 }
 
 github_api_json() {
@@ -238,8 +237,8 @@ github_api_json() {
     --max-time 30
     --header 'Accept: application/vnd.github+json'
     --header 'X-GitHub-Api-Version: 2026-03-10'
+    --header "Authorization: Bearer $GITHUB_API_TOKEN"
   )
-  curl_arguments+=(--config "$GITHUB_CURL_CONFIG")
   curl_arguments+=(--output "$output_path" "$url")
 
   if ! "$CURL" "${curl_arguments[@]}"; then
@@ -278,8 +277,8 @@ github_asset_download() {
     --max-time 300
     --header 'Accept: application/octet-stream'
     --header 'X-GitHub-Api-Version: 2026-03-10'
+    --header "Authorization: Bearer $GITHUB_API_TOKEN"
   )
-  curl_arguments+=(--config "$GITHUB_CURL_CONFIG")
   curl_arguments+=(--output "$output_path" "$url")
 
   if ! "$CURL" "${curl_arguments[@]}"; then
@@ -393,6 +392,116 @@ if not isinstance(policy, dict) or policy.get("enabled") is not True:
     fail "GitHub immutable releases are not enabled for the fixed repository"
 }
 
+validate_rollback_component() {
+  local expanded_path="$1"
+  local output_path="$2"
+
+  /usr/bin/python3 -I -E -s -c '
+import os
+import pathlib
+import posixpath
+import re
+import sys
+import xml.etree.ElementTree as ET
+
+root = pathlib.Path(sys.argv[1])
+expected_identifier = sys.argv[2]
+expected_version = sys.argv[3]
+expected_install_root = sys.argv[4]
+expected_app_path = sys.argv[5]
+output_path = pathlib.Path(sys.argv[6])
+
+def regular_file(path):
+    return path.is_file() and not path.is_symlink()
+
+def parse_xml(path):
+    if not regular_file(path) or path.stat().st_size > 1048576:
+        raise ValueError("unsafe package metadata")
+    payload = path.read_bytes()
+    if b"<!DOCTYPE" in payload or b"<!ENTITY" in payload:
+        raise ValueError("unsafe package metadata")
+    return ET.fromstring(payload)
+
+package_infos = [
+    path for path in root.rglob("PackageInfo")
+    if regular_file(path)
+]
+distributions = [
+    path for path in root.rglob("Distribution")
+    if regular_file(path)
+]
+root_info = root / "PackageInfo"
+root_distribution = root / "Distribution"
+
+if regular_file(root_distribution):
+    if distributions != [root_distribution] or regular_file(root_info):
+        raise ValueError("ambiguous package metadata")
+    distribution = parse_xml(root_distribution)
+    component_refs = []
+    for element in distribution.iter():
+        if element.tag.rsplit("}", 1)[-1] != "pkg-ref":
+            continue
+        identifier = element.attrib.get("id")
+        if identifier and identifier != expected_identifier:
+            raise ValueError("wrong distribution identifier")
+        version = element.attrib.get("version")
+        if version and version != expected_version:
+            raise ValueError("wrong distribution version")
+        reference = (element.text or "").strip()
+        if reference.startswith("#"):
+            component_refs.append(reference[1:])
+    if len(component_refs) != 1:
+        raise ValueError("package must contain one component")
+    component_name = component_refs[0]
+    component_parts = pathlib.PurePosixPath(component_name).parts
+    if (
+        len(component_parts) != 1
+        or re.fullmatch(r"[A-Za-z0-9._-]+[.]pkg", component_name) is None
+    ):
+        raise ValueError("unsafe component reference")
+    package_info = root / component_name / "PackageInfo"
+else:
+    if distributions or not regular_file(root_info):
+        raise ValueError("missing package metadata")
+    package_info = root_info
+
+if package_infos != [package_info]:
+    raise ValueError("package must contain one component")
+
+metadata = parse_xml(package_info)
+if metadata.tag.rsplit("}", 1)[-1] != "pkg-info":
+    raise ValueError("invalid PackageInfo")
+if metadata.attrib.get("identifier") != expected_identifier:
+    raise ValueError("wrong package identifier")
+if metadata.attrib.get("version") != expected_version:
+    raise ValueError("wrong package version")
+if metadata.attrib.get("install-location") != expected_install_root:
+    raise ValueError("wrong package install location")
+
+payload_root = package_info.parent / "Payload"
+payload_app = payload_root / "Gatebeam.app"
+if not payload_root.is_dir() or payload_root.is_symlink():
+    raise ValueError("missing component payload")
+payload_entries = list(payload_root.iterdir())
+if (
+    payload_entries != [payload_app]
+    or not payload_app.is_dir()
+    or payload_app.is_symlink()
+):
+    raise ValueError("component payload must contain one Gatebeam app")
+if posixpath.join(expected_install_root, payload_app.name) != expected_app_path:
+    raise ValueError("wrong installed application path")
+
+output_path.write_text(os.fspath(payload_app), encoding="utf-8")
+' \
+    "$expanded_path" \
+    "$EXPECTED_BUNDLE_ID" \
+    "$PREVIOUS_RELEASE_VERSION" \
+    "$EXPECTED_PACKAGE_INSTALL_ROOT" \
+    "$EXPECTED_INSTALL_APP_PATH" \
+    "$output_path"
+}
+
 validate_release_history() {
   local releases_json="$TEMP_ROOT/github-releases.json"
   local latest_json="$TEMP_ROOT/github-latest-release.json"
@@ -404,14 +513,14 @@ validate_release_history() {
   local rollback_path="$TEMP_ROOT/previous-release-rollback.pkg"
   local disk_image_path="$TEMP_ROOT/previous-release-disk-image.dmg"
   local expanded_package_path="$TEMP_ROOT/previous-release-expanded-pkg"
-  local rollback_app_list="$TEMP_ROOT/previous-release-app-paths"
+  local rollback_app_path_file="$TEMP_ROOT/previous-release-app-path"
   local validated_json="$TEMP_ROOT/github-validated-history.json"
   local manifest_id manifest_digest manifest_size
   local checksums_id checksums_digest checksums_size
   local app_archive_id app_archive_digest app_archive_size
   local rollback_id rollback_digest rollback_size
   local disk_image_id disk_image_digest disk_image_size
-  local rollback_app_path rollback_app_count
+  local rollback_app_path
 
   if [[ "$GATEBEAM_RELEASE_BOOTSTRAP" == "1" ]]; then
     github_api_json \
@@ -664,16 +773,11 @@ with open(output_path, "w", encoding="utf-8") as stream:
     fail "previous release rollback package signature did not validate"
   "$PKGUTIL" --expand-full "$rollback_path" "$expanded_package_path" >/dev/null ||
     fail "previous release rollback package could not be expanded"
-  /usr/bin/find \
+  validate_rollback_component \
     "$expanded_package_path" \
-    -type d \
-    -name Gatebeam.app \
-    -prune \
-    -print >"$rollback_app_list"
-  rollback_app_count="$(/usr/bin/wc -l <"$rollback_app_list" | /usr/bin/tr -d '[:space:]')"
-  [[ "$rollback_app_count" == "1" ]] ||
-    fail "previous release rollback package must contain exactly one Gatebeam app"
-  rollback_app_path="$(/usr/bin/head -n 1 "$rollback_app_list")"
+    "$rollback_app_path_file" ||
+    fail "previous release rollback package metadata or payload did not validate"
+  rollback_app_path="$(<"$rollback_app_path_file")"
   /bin/zsh -f "$ROOT_DIR/scripts/verify_release.sh" \
     app-signature \
     "$rollback_app_path" \
@@ -954,7 +1058,8 @@ require_environment GATEBEAM_INSTALLER_SIGN_IDENTITY
 require_environment GATEBEAM_NOTARY_PROFILE
 require_environment GATEBEAM_RELEASE_CI_RUN_ID
 require_environment GATEBEAM_RELEASE_CLEAN_MACHINE_RUN_ID
-require_environment GATEBEAM_GITHUB_TOKEN
+[[ -n "$GITHUB_API_TOKEN" ]] ||
+  fail "GATEBEAM_GITHUB_TOKEN is required for a formal release"
 
 GATEBEAM_RELEASE_BOOTSTRAP="${GATEBEAM_RELEASE_BOOTSTRAP:-0}"
 

@@ -18,8 +18,8 @@ upgrade, or release behavior. State known limitations without including secrets.
 - [ ] `./scripts/test_ui_validation.sh`
 - [ ] `./scripts/test_build_assets.sh`
 - [ ] `./scripts/test_release_pipeline.sh`
-- [ ] `./scripts/test_privacy.sh`
 - [ ] `./scripts/build_app.sh`
+- [ ] `./scripts/test_privacy.sh`
 - [ ] `codesign --verify --deep --strict ./dist/Gatebeam.app`
 - [ ] `git diff --check`
 - [ ] Not applicable checks are explained below.

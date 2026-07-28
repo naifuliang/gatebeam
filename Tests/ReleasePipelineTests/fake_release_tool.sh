@@ -4,6 +4,13 @@ set -euo pipefail
 TOOL_NAME="${0:t}"
 CALL_LOG="${GATEBEAM_FAKE_CALL_LOG:?}"
 
+if [[ "$TOOL_NAME" != "curl" &&
+      ( -n "${GATEBEAM_GITHUB_TOKEN+x}" ||
+        -n "${GITHUB_API_TOKEN+x}" ) ]]; then
+  print -u2 -- "GitHub token leaked to a non-API child process"
+  exit 1
+fi
+
 artifact_kind() {
   local path="$1"
   case "$path" in

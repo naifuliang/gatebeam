@@ -194,10 +194,16 @@ DMG, `release-manifest.json`, and `SHA256SUMS` assets. It resolves the tag
 commit, downloads all five protected assets, and requires the manifest and
 checksum file to describe exactly one ZIP, PKG, and DMG with matching names,
 types, hashes, and byte counts. The rollback PKG is expanded; its internal
-Gatebeam app version, build, Bundle ID, and signature, plus the PKG signature,
-must match the validated previous manifest and signing contract. The new
-`CFBundleVersion` must be greater than that manifest's `buildVersion`;
-rollback metadata is derived from the same immutable release.
+PackageInfo and Distribution must identify exactly one Gatebeam component with
+identifier `io.github.naifuliang.gatebeam`, the previous manifest version, and
+the fixed `/Applications` installation root. Only that component's sole
+`Payload/Gatebeam.app`, installed as `/Applications/Gatebeam.app`, is accepted;
+apps in Scripts, Resources, another component, or another payload location
+cannot satisfy rollback validation. Its version, build, Bundle ID, and
+signature, plus the PKG signature, must match the validated previous manifest
+and signing contract. The new `CFBundleVersion` must be greater than that
+manifest's `buildVersion`; rollback metadata is derived from the same immutable
+release.
 
 The first formal release is the only exception and must be explicit:
 
@@ -213,9 +219,10 @@ as soon as any published release exists.
 `GATEBEAM_GITHUB_TOKEN` is required for every formal release. Use a fine-grained
 token scoped to the fixed `naifuliang/gatebeam` repository with at least
 Administration (read), Actions (read), and Contents (read). The script sends it
-as a Bearer credential on every GitHub API request through a mode-`0600`
-temporary curl config, unsets it before child processes run, and never writes
-the token to logs, the release manifest, or retained release output.
+as a Bearer credential only from a non-exported shell variable on each GitHub
+API request. It copies and unsets `GATEBEAM_GITHUB_TOKEN` before starting any
+child process, never exports the internal value, and never writes the token to
+logs, the release manifest, temporary config, or retained release output.
 
 ## Build and Sign
 

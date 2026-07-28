@@ -432,6 +432,24 @@ test_github_evidence_binding() {
     GATEBEAM_FAKE_GITHUB_SCENARIO=dmg-asset-failure
 
   for scenario label in \
+    scripts-decoy "rollback Scripts app decoy" \
+    resources-decoy "rollback Resources app decoy" \
+    second-payload-app "rollback payload second app" \
+    second-component-package "rollback second component package" \
+    wrong-package-identifier "rollback package wrong identifier" \
+    wrong-package-version "rollback package wrong version" \
+    wrong-install-location "rollback package wrong install location" \
+    wrong-payload "rollback package wrong payload"; do
+    fixture="$(new_fixture "github-$scenario")"
+    expect_failure \
+      "$label" \
+      "$fixture" \
+      "previous release rollback package metadata or payload did not validate" \
+      "GATEBEAM_FAKE_GITHUB_SCENARIO=$scenario"
+  done
+
+  for scenario label in \
+    wrong-internal-bundle-id "rollback app wrong internal bundle identifier" \
     wrong-internal-version "rollback app wrong internal version" \
     wrong-internal-build "rollback app wrong internal build"; do
     fixture="$(new_fixture "github-$scenario")"

@@ -8,6 +8,7 @@ import plistlib
 import subprocess
 import sys
 import zipfile
+import xml.etree.ElementTree as ET
 
 
 REPOSITORY = "naifuliang/gatebeam"
@@ -74,30 +75,116 @@ def previous_package(scenario):
         build_version = "5"
     else:
         build_version = "4"
+    bundle_identifier = (
+        "io.github.naifuliang.decoy"
+        if scenario == "wrong-internal-bundle-id"
+        else "io.github.naifuliang.gatebeam"
+    )
     info_plist = plistlib.dumps(
         {
             "CFBundleExecutable": "Gatebeam",
-            "CFBundleIdentifier": "io.github.naifuliang.gatebeam",
+            "CFBundleIdentifier": bundle_identifier,
             "CFBundleShortVersionString": version,
             "CFBundleVersion": build_version,
             "GatebeamDeveloperTeamIdentifier": "ABCDE12345",
         },
         sort_keys=True,
     )
+    package_identifier = (
+        "io.github.naifuliang.decoy"
+        if scenario == "wrong-package-identifier"
+        else "io.github.naifuliang.gatebeam"
+    )
+    package_version = (
+        "9.9.9" if scenario == "wrong-package-version" else "0.4.0"
+    )
+    install_location = (
+        "/tmp" if scenario == "wrong-install-location" else "/Applications"
+    )
+    components = ["Gatebeam.pkg"]
+    if scenario == "second-component-package":
+        components.append("GatebeamExtras.pkg")
+
+    distribution = ET.Element("installer-gui-script", minSpecVersion="1")
+    for component in components:
+        component_identifier = (
+            package_identifier
+            if component == "Gatebeam.pkg"
+            else "io.github.naifuliang.gatebeam.extras"
+        )
+        reference = ET.SubElement(
+            distribution,
+            "pkg-ref",
+            id=component_identifier,
+            version=package_version,
+        )
+        reference.text = f"#{component}"
+
+    package_info = ET.Element(
+        "pkg-info",
+        identifier=package_identifier,
+        version=package_version,
+        **{"install-location": install_location, "auth": "root"},
+    )
     archive = io.BytesIO()
     with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_STORED) as package:
-        for name, payload, mode in (
+        entries = [
+            ("Distribution", ET.tostring(distribution), 0o100644),
             (
-                "Payload/Gatebeam.app/Contents/Info.plist",
-                info_plist,
+                "Gatebeam.pkg/PackageInfo",
+                ET.tostring(package_info),
                 0o100644,
             ),
-            (
-                "Payload/Gatebeam.app/Contents/MacOS/Gatebeam",
-                b"fixture rollback executable\n",
-                0o100755,
-            ),
-        ):
+        ]
+        app_root = "Gatebeam.pkg/Payload/Gatebeam.app"
+        if scenario == "scripts-decoy":
+            app_root = "Gatebeam.pkg/Scripts/Gatebeam.app"
+        elif scenario == "resources-decoy":
+            app_root = "Resources/Gatebeam.app"
+        elif scenario == "wrong-payload":
+            app_root = "Gatebeam.pkg/WrongPayload/Gatebeam.app"
+        entries.extend(
+            [
+                (
+                    f"{app_root}/Contents/Info.plist",
+                    info_plist,
+                    0o100644,
+                ),
+                (
+                    f"{app_root}/Contents/MacOS/Gatebeam",
+                    b"fixture rollback executable\n",
+                    0o100755,
+                ),
+            ]
+        )
+        if scenario == "second-payload-app":
+            second_app = "Other" + ".app"
+            entries.append(
+                (
+                    f"Gatebeam.pkg/Payload/{second_app}/Contents/Info.plist",
+                    info_plist,
+                    0o100644,
+                )
+            )
+        if scenario == "second-component-package":
+            entries.append(
+                (
+                    "GatebeamExtras.pkg/PackageInfo",
+                    ET.tostring(
+                        ET.Element(
+                            "pkg-info",
+                            identifier="io.github.naifuliang.gatebeam.extras",
+                            version=package_version,
+                            **{
+                                "install-location": "/Applications",
+                                "auth": "root",
+                            },
+                        )
+                    ),
+                    0o100644,
+                )
+            )
+        for name, payload, mode in entries:
             entry = zipfile.ZipInfo(name, date_time=(2026, 1, 1, 0, 0, 0))
             entry.create_system = 3
             entry.external_attr = mode << 16
@@ -365,12 +452,12 @@ def main():
     root = fixture_root()
     scenario = os.environ.get("GATEBEAM_FAKE_GITHUB_SCENARIO", "success")
     arguments = sys.argv[1:]
-    config_path = None
     output_path = None
     url = None
+    headers = []
     for index, argument in enumerate(arguments):
-        if argument == "--config" and index + 1 < len(arguments):
-            config_path = pathlib.Path(arguments[index + 1])
+        if argument == "--header" and index + 1 < len(arguments):
+            headers.append(arguments[index + 1])
         if argument == "--output" and index + 1 < len(arguments):
             output_path = pathlib.Path(arguments[index + 1])
         if argument.startswith("https://"):
@@ -381,16 +468,15 @@ def main():
         "GATEBEAM_FAKE_EXPECTED_GITHUB_TOKEN",
         "fixture_github_token_0123456789",
     )
-    expected_header = (
-        f'header = "Authorization: Bearer {expected_token}"\n'
-    )
-    if (
-        config_path is None
-        or not config_path.is_file()
-        or config_path.is_symlink()
-        or config_path.read_text(encoding="utf-8") != expected_header
-    ):
+    expected_header = f"Authorization: Bearer {expected_token}"
+    authorization_headers = [
+        header for header in headers
+        if header.startswith("Authorization:")
+    ]
+    if authorization_headers != [expected_header]:
         fail("fake GitHub authentication failed")
+    if "GATEBEAM_GITHUB_TOKEN" in os.environ or "GITHUB_API_TOKEN" in os.environ:
+        fail("GitHub token leaked through the API child environment")
     with open(os.environ["GATEBEAM_FAKE_CALL_LOG"], "a", encoding="utf-8") as stream:
         stream.write(f"github {url}\n")
     if scenario == "auth-failure":
