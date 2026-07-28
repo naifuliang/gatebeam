@@ -14,6 +14,7 @@ EXECUTABLE="$MACOS_DIR/Gatebeam"
 BUILT_ICON="$BUILD_DIR/app-assets/AppIcon.icns"
 CODE_SIGN_IDENTITY="${GATEBEAM_CODE_SIGN_IDENTITY:--}"
 DEVELOPER_TEAM_ID="${GATEBEAM_DEVELOPER_TEAM_ID:-}"
+SIGNING_CONTRACT="$ROOT_DIR/scripts/signing_contract.sh"
 
 mkdir -p "$BUILD_DIR" "$MODULE_CACHE_DIR" "$DIST_DIR"
 rm -rf "$APP_DIR"
@@ -36,42 +37,56 @@ cp "$BUILT_ICON" "$RESOURCES_DIR/AppIcon.icns"
 chmod +x "$EXECUTABLE"
 
 if command -v codesign >/dev/null 2>&1; then
+  source "$SIGNING_CONTRACT"
   sign_arguments=(
     --force
-    --deep
     --sign "$CODE_SIGN_IDENTITY"
+    --options runtime
   )
   if [[ "$CODE_SIGN_IDENTITY" != "-" ]]; then
     if [[ -z "$DEVELOPER_TEAM_ID" ]]; then
       print -u2 "GATEBEAM_DEVELOPER_TEAM_ID is required for Developer ID signing."
       exit 1
     fi
-    sign_arguments+=(--options runtime --timestamp)
+    sign_arguments+=(--timestamp)
   fi
 
   /usr/bin/codesign "${sign_arguments[@]}" "$APP_DIR" >/dev/null
   /usr/bin/codesign --verify --deep --strict "$APP_DIR"
 
   designated_requirement="$(/usr/bin/codesign -d -r- "$APP_DIR" 2>&1)"
+  signing_details="$(/usr/bin/codesign -d --verbose=4 "$APP_DIR" 2>&1)"
+  entitlements="$(/usr/bin/codesign -d --entitlements - "$APP_DIR" 2>/dev/null || true)"
+  bundle_identifier="$(
+    /usr/bin/plutil -extract CFBundleIdentifier raw -o - "$CONTENTS_DIR/Info.plist"
+  )"
   if [[ "$CODE_SIGN_IDENTITY" == "-" ]]; then
-    if [[ "$designated_requirement" != *"cdhash "* ||
-          "$designated_requirement" == *"identifier "* ||
-          "$designated_requirement" == *"anchor "* ]]; then
-      print -u2 "Ad-hoc Developer Preview must use the default exact-build cdhash requirement."
+    if ! gatebeam_validate_preview_contract \
+      "$designated_requirement" \
+      "$signing_details" \
+      "$entitlements"; then
       print -u2 "$designated_requirement"
       exit 1
     fi
   else
-    signing_details="$(/usr/bin/codesign -d --verbose=4 "$APP_DIR" 2>&1)"
-    if [[ "$designated_requirement" != *"anchor apple generic"* ||
-          "$designated_requirement" == *" or "* ||
-          "$designated_requirement" != *"certificate leaf[subject.OU] = \"$DEVELOPER_TEAM_ID\""* ]]; then
-      print -u2 "Developer ID designated requirement is missing the Apple anchor or expected Team ID."
+    if ! gatebeam_validate_developer_id_contract \
+      "$designated_requirement" \
+      "$signing_details" \
+      "$entitlements" \
+      "$bundle_identifier" \
+      "$DEVELOPER_TEAM_ID"; then
       print -u2 "$designated_requirement"
       exit 1
     fi
-    if [[ "$signing_details" != *"TeamIdentifier=$DEVELOPER_TEAM_ID"* ]]; then
-      print -u2 "Developer ID signature TeamIdentifier does not match $DEVELOPER_TEAM_ID."
+
+    developer_id_requirement="anchor apple generic and identifier \"$bundle_identifier\" and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = \"$DEVELOPER_TEAM_ID\""
+    if ! /usr/bin/codesign \
+      --verify \
+      --deep \
+      --strict \
+      -R="$developer_id_requirement" \
+      "$APP_DIR"; then
+      print -u2 "Signature does not satisfy the required Developer ID Application certificate chain."
       exit 1
     fi
   fi

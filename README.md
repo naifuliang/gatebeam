@@ -112,7 +112,7 @@ The validation suite is split by contract:
 - `test_backend.sh`: Cloudflare, address-family, router mapping, IPv6, and status behavior.
 - `test_proxy_policy.sh`: system/direct/custom routing, direct-proxy disabling, supported `http://` / `socks5://` forms, invalid proxy rejection, and direct-only LAN control.
 - `test_integration_contract.sh`: configuration normalization, non-Custom proxy URL clearing, injected-store isolation, explicit Keychain migration/failure latching, local-origin status semantics, and stable login-path behavior.
-- `test_keychain_identity.sh`: default designated-requirement validation, exact-build ACL access, and rejection of a different ad-hoc program with the same bundle identifier. It uses and removes an isolated temporary Keychain, never the production service.
+- `test_keychain_identity.sh`: Developer Preview and Developer ID signing-contract validation, exact-build identity rejection, and hardened-runtime library-injection rejection. It does not access any Keychain.
 - `test_upgrade.sh`: migration, rollback, symlink/path safety, and stable LaunchAgent installation behavior.
 - `test_ui_validation.sh`: isolated AppKit validation mode, no network side effects, no Keychain prompts, and UI contract coverage.
 - `test_build_assets.sh`: icon, app bundle, PKG, and DMG staging/build-asset checks.

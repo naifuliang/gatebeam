@@ -478,10 +478,22 @@ final class KeychainStore {
 
     static func isStrongDesignatedRequirement(_ requirement: String) -> Bool {
         let normalized = requirement.lowercased()
-        let exactBuild = normalized.contains("cdhash ")
-            && !normalized.contains("identifier ")
-            && !normalized.contains("anchor ")
+        let exactBuildPattern =
+            #"^\s*cdhash\s+h"[0-9a-f]{40,128}"(?:\s+or\s+cdhash\s+h"[0-9a-f]{40,128}")*\s*$"#
+        let exactBuild = normalized.range(
+            of: exactBuildPattern,
+            options: .regularExpression
+        ) != nil
+        let hasDeveloperIDCA =
+            normalized.contains("certificate 1[field.1.2.840.113635.100.6.2.6] exists")
+            || normalized.contains("certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */")
+        let hasDeveloperIDLeaf =
+            normalized.contains("certificate leaf[field.1.2.840.113635.100.6.1.13] exists")
+            || normalized.contains("certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */")
         let developerID = normalized.contains("anchor apple generic")
+            && normalized.contains("identifier ")
+            && hasDeveloperIDCA
+            && hasDeveloperIDLeaf
             && normalized.contains("certificate leaf[subject.ou]")
             && !normalized.contains(" or ")
         return exactBuild || developerID

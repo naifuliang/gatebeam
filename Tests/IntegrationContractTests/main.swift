@@ -1249,14 +1249,38 @@ func testKeychainRequirementClassificationRejectsWeakAlternatives() throws {
         "A cdhash requirement with a weak identifier alternative must be rejected"
     )
     try expect(
-        KeychainStore.isStrongDesignatedRequirement(
-            #"identifier "com.local.RemoteControlNetwork" and anchor apple generic and certificate leaf[subject.OU] = "TEAMID1234""#
+        !KeychainStore.isStrongDesignatedRequirement(
+            #"true or cdhash H"1111111111111111111111111111111111111111""#
         ),
-        "An Apple-anchored Team-ID-qualified Developer ID requirement must be accepted"
+        "A cdhash requirement with a permissive alternative must be rejected"
+    )
+    try expect(
+        KeychainStore.isStrongDesignatedRequirement(
+            #"identifier "com.local.RemoteControlNetwork" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = TEAMID1234"#
+        ),
+        "A canonical TN3127 Developer ID Application requirement must be accepted"
     )
     try expect(
         !KeychainStore.isStrongDesignatedRequirement(
-            #"identifier "com.local.RemoteControlNetwork" or (anchor apple generic and certificate leaf[subject.OU] = "TEAMID1234")"#
+            #"identifier "com.local.RemoteControlNetwork" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.1] exists and certificate leaf[subject.OU] = "TEAMID1234""#
+        ),
+        "An Apple Development-like requirement must be rejected"
+    )
+    try expect(
+        !KeychainStore.isStrongDesignatedRequirement(
+            #"identifier "com.local.RemoteControlNetwork" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.14] exists and certificate leaf[subject.OU] = "TEAMID1234""#
+        ),
+        "A Developer ID Installer-like requirement must be rejected"
+    )
+    try expect(
+        !KeychainStore.isStrongDesignatedRequirement(
+            #"identifier "com.local.RemoteControlNetwork" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] and certificate leaf[field.1.2.840.113635.100.6.1.13] and certificate leaf[subject.OU] = "TEAMID1234""#
+        ),
+        "Certificate OID fields without existence constraints must be rejected"
+    )
+    try expect(
+        !KeychainStore.isStrongDesignatedRequirement(
+            #"identifier "com.local.RemoteControlNetwork" or (anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = "TEAMID1234")"#
         ),
         "A Developer ID requirement with a weak OR alternative must be rejected"
     )
