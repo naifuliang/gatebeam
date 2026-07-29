@@ -105,6 +105,10 @@ Requirements: macOS with Xcode Command Line Tools or Xcode installed.
 ./scripts/test_ui_validation.sh
 ./scripts/test_build_assets.sh
 ./scripts/test_release_pipeline.sh
+./scripts/test_final_artifact_contract.sh
+./scripts/test_final_candidate_validator.sh
+./scripts/test_formal_publish.sh
+./scripts/test_release_workflow_contract.sh
 ./scripts/build_app.sh
 ./scripts/test_privacy.sh
 ```
@@ -120,9 +124,27 @@ The validation suite is split by contract:
 - `test_ui_validation.sh`: isolated AppKit validation mode, no network side effects, no Keychain prompts, and UI contract coverage.
 - `test_build_assets.sh`: icon, app bundle, PKG, and DMG staging/build-asset checks.
 - `test_release_pipeline.sh`: fixture-based, fail-closed validation of the formal release pipeline and its publication gates.
+- `test_final_artifact_contract.sh`: exact-byte candidate and attestation binding, descriptor-bound extraction under path replacement, safe extraction, replay prevention, and linked-path rejection.
+- `test_final_candidate_validator.sh`: actual validator behavior for exact APP/ZIP/flat-PKG/DMG allowlists, productsign RSA/CMS XAR structure, XAR/cpio and sparse-file budgets, signing gates, install/upgrade/rollback/uninstall failures, and no-attestation failure semantics.
+- `test_formal_publish.sh`: trusted GitHub Actions evidence, complete SemVer 2.0 immutable history, the POST/upload/PATCH by 401/403/404/5xx mutation matrix, response-loss recovery, concurrent remote draft ownership, exact API asset upload, immutable publication, and atomic failure cases.
+- `test_release_workflow_contract.sh`: pinned Actions, job ordering, signing-secret isolation, and no-rebuild publication policy.
 - `test_privacy.sh`: credentials, email addresses, bare domains, IPv4/IPv6 literals, user-specific paths, and built-binary private material against explicit fixture allowlists.
 
 Automated tests use injected stores or signing fixtures and do not access a contributor's login Keychain.
+
+Formal releases use a three-stage, fail-closed path: the tagged workflow signs,
+notarizes, staples, and freezes one candidate; a second clean macOS job validates
+those exact bytes and emits a hash-bound attestation without signing secrets;
+`release_formal.sh` then creates the GitHub draft, uploads and verifies the
+seven exact frozen assets, rechecks all evidence, and publishes only that
+attested candidate as an immutable release without rebuilding or rewriting it.
+The publisher is the third job of the same globally serialized tagged workflow;
+there is no manual upload or publish handoff.
+Every GitHub mutation is assigned an exact byte identity and publication nonce;
+if a POST, upload, or PATCH response is lost, the publisher paginates remote
+state and resumes only from one exact matching draft, asset, or immutable
+release.
+See [Releasing Gatebeam](docs/RELEASING.md).
 
 The built app is written to `dist/Gatebeam.app`. `test_ui_validation.sh` is a UI contract check; the final preview should also be visually inspected from rendered screenshots for both Aqua and Dark Aqua states.
 

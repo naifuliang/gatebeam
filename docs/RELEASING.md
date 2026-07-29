@@ -129,6 +129,10 @@ Run the complete repository suite:
 ./scripts/test_ui_validation.sh
 ./scripts/test_build_assets.sh
 ./scripts/test_release_pipeline.sh
+./scripts/test_final_artifact_contract.sh
+./scripts/test_final_candidate_validator.sh
+./scripts/test_formal_publish.sh
+./scripts/test_release_workflow_contract.sh
 ./scripts/build_app.sh
 ./scripts/test_privacy.sh
 codesign --verify --deep --strict ./dist/Gatebeam.app
@@ -143,10 +147,9 @@ each image for alignment, clipping, overlap, disabled state, scroll reachability
 and legibility. Record which IPv4-only, IPv6-only, dual-stack, proxy, VPN/TUN,
 and router environments were exercised. Keep all environment details redacted.
 
-If a reviewed formal-pipeline script is present in the exact tagged release
-commit, it may automate the manual stages below. Do not use or document a
-working-tree-only or unmerged script as release infrastructure. The script must
-fail closed unless:
+The tagged `.github/workflows/release-validation.yml` workflow is the production
+entry point for candidate creation. Do not use a working-tree-only or unmerged
+script as release infrastructure. The workflow and publisher fail closed unless:
 
 - The worktree is clean, `HEAD` has exactly two parents, and the annotated
   release tag resolves exactly to `HEAD`.
@@ -159,20 +162,91 @@ fail closed unless:
 - Checksums and the manifest are generated only from the final stapled
   artifacts, and output publication is atomic.
 
-`release_formal.sh` accepts only the numeric run IDs for the two GitHub Actions
-evidence records:
+Create a protected GitHub environment named `formal-release`. Restrict who can
+approve it and configure these environment values:
+
+| Kind | Name | Value |
+| --- | --- | --- |
+| Secret | `GATEBEAM_DEVELOPER_ID_P12_BASE64` | Base64-encoded Developer ID Application and Installer identities exported together as PKCS#12. |
+| Secret | `GATEBEAM_DEVELOPER_ID_P12_PASSWORD` | Password for that PKCS#12 export. |
+| Secret | `GATEBEAM_NOTARY_PRIVATE_KEY_BASE64` | Base64-encoded App Store Connect API private key. |
+| Secret | `GATEBEAM_NOTARY_KEY_ID` | App Store Connect API key ID. |
+| Secret | `GATEBEAM_NOTARY_ISSUER_ID` | App Store Connect issuer ID. |
+| Variable | `GATEBEAM_CODE_SIGN_IDENTITY` | Exact Developer ID Application common name. |
+| Variable | `GATEBEAM_INSTALLER_SIGN_IDENTITY` | Exact Developer ID Installer common name. |
+| Variable | `GATEBEAM_DEVELOPER_TEAM_ID` | Ten-character Apple Team ID. |
+
+`build-candidate` and `publish-release` enter this protected environment, but
+only `build-candidate` references signing or notarization secrets. It imports
+credentials into an ephemeral Keychain, removes source key files immediately,
+and deletes the Keychain in an `always()` cleanup step. `clean-machine` has no
+environment and receives no signing or notarization secret. The publisher gets
+only its job-scoped `contents: write` token through a private 0600 file.
+
+After a successful push CI run for the tagged commit, dispatch:
 
 ```sh
-export GATEBEAM_RELEASE_CI_RUN_ID='CI_RUN_ID'
-export GATEBEAM_RELEASE_CLEAN_MACHINE_RUN_ID='CLEAN_MACHINE_RUN_ID'
-GATEBEAM_GITHUB_TOKEN_FILE="$(mktemp /private/tmp/gatebeam-token.XXXXXX)"
-chmod 600 "$GATEBEAM_GITHUB_TOKEN_FILE"
-read -r -s 'GITHUB_TOKEN?GitHub token: '
-print -rn -- "$GITHUB_TOKEN" >"$GATEBEAM_GITHUB_TOKEN_FILE"
-unset GITHUB_TOKEN
-export GATEBEAM_GITHUB_TOKEN_FILE
-trap 'rm -f -- "$GATEBEAM_GITHUB_TOKEN_FILE"' EXIT
+gh workflow run release-validation.yml \
+  --ref vVERSION \
+  -f ci_run_id=CI_RUN_ID \
+  -f bootstrap=false
 ```
+
+Use `bootstrap=true` only for the first formal release. The workflow has three
+trust stages:
+
+1. `build-candidate` validates the tag, CI evidence, immutable release history,
+   and rollback package; builds, signs, notarizes, staples, and verifies the app,
+   PKG, and DMG; writes `SHA256SUMS`, schema 4 `release-manifest.json`, and
+   `candidate-envelope.json`; then uploads that frozen directory once.
+2. `clean-machine` downloads that artifact by the exact artifact ID. On a fresh
+   `macos-14` runner it validates the envelope and all file hashes, Developer ID
+   signatures, notarization tickets, Gatekeeper, full ZIP/flat-PKG/DMG
+   structural allowlists and the exact Gatebeam path/type/mode closure, matching
+   app tree hashes, fresh install, upgrade, previous-version rollback, injected
+   transaction rollback, reinstall, and uninstall. Only then does it upload
+   `clean-machine-attestation.json`.
+3. `publish-release` starts only after both upstream jobs succeed and invokes
+   `release_formal.sh` inside the same repository-wide workflow concurrency
+   group. It downloads the candidate and attestation from the current run and
+   validates repository/run/event/HEAD/workflow/job/step
+   provenance, artifact IDs and protected SHA-256 digests, safe archive paths,
+   the complete byte inventory, current immutable history, and the attestation.
+   It cannot build, sign, notarize, staple, or rewrite a candidate. Under one
+   repository-wide local lock and one remote draft-release lock, it creates the
+   draft through the GitHub API, uploads the seven frozen assets, verifies every
+   asset ID/name/size/digest, rechecks tag/history/run/job/attestation evidence,
+   publishes the draft, requires `immutable: true`, and only then exposes the
+   same bytes in `dist/release-VERSION`.
+
+The formal PKG must be one flat component. Any `Distribution` package is
+rejected before installation, including packages containing `script`,
+`installation-check`, `volume-check`, an external script reference, or an
+extra component. Before `pkgutil --expand-full`, the validator checks the raw
+XAR TOC and gzip/odc-cpio payload and scripts for exact paths, normalized-name
+collisions, types, modes, ownership, hard links, entry counts, and logical byte
+budgets. The expanded tree is checked again. ZIP and DMG inputs reject sparse
+containers and enforce the same bounded APP closure.
+
+The XAR TOC contract accepts the exact productsign flat-package signature
+shape: SHA-1 TOC range, one RSA signature with an XMLDSIG X.509 chain, and an
+optional contiguous CMS `x-signature` timestamp chain. It still requires
+exactly `Bom`, `Payload`, `Scripts`, and `PackageInfo`, complete member
+checksums/encoding/ranges, non-overlapping heap ranges, and no other root file.
+The committed structural fixture and a locally available Apple-signed flat PKG
+exercise parser compatibility; neither replaces the production Gatebeam
+Developer ID Installer signature and trusted-timestamp E2E gate.
+
+Candidate and attestation transport ZIPs are opened once with `O_NOFOLLOW`.
+The same descriptor is hashed, rewound, extracted, and checked again for
+device, inode, mode, link count, size, mtime, and ctime stability. The app ZIP
+uses the same descriptor-bound pattern and also binds extraction to its
+manifest SHA-256. A path replacement after hashing cannot select new bytes.
+
+Do not run stage 3 manually. The public `release_formal.sh` entry is production
+bound to the current `publish-release` Actions job, run attempt, repository ID,
+tag, workflow SHA, and `HEAD`. Candidate creation remains a separate private
+workflow entry.
 
 The script never accepts a repository, evidence URL, previous build number,
 rollback version, rollback URL, or rollback asset from the caller. It uses only
@@ -180,34 +254,59 @@ fixed HTTPS REST endpoints under `api.github.com/repos/naifuliang/gatebeam`,
 with connection and total timeouts, environment proxies disabled, no redirects
 for JSON, and HTTPS-only bounded redirects for protected release-asset bytes.
 Every network, HTTP, JSON, pagination, digest, checksum, and asset failure stops
-the release.
+the release. Mutation transport failures are reconciled rather than guessed:
+401, 403, and 404 are definite rejections; a missing response, 5xx, or malformed
+success body triggers paginated read-back. Draft ownership uses a
+per-publisher nonce. Asset recovery requires one matching name/ID/size/SHA-256
+tuple, and publish recovery requires the exact immutable tag and seven-asset
+byte set. An ambiguous or non-unique read-back fails closed.
+The executable negative matrix covers draft POST, first asset upload, and
+publish PATCH independently under non-executed 401, 403, 404, and 500
+responses, requiring cleanup to leave no draft, asset, local release, or public
+release. Separate cases retain response-loss and server-applied-then-500
+reconciliation.
 
-Before building, the script requires
+Before candidate creation and again before publication, the tooling requires
 `GET /repos/naifuliang/gatebeam/immutable-releases` to return `enabled: true`.
-For both run IDs it fetches the workflow run and its jobs/steps, then verifies
-the public repository, exact workflow path and name, `head_sha == HEAD`,
-`completed/success`, the required job, and every required step. The regular CI
-record must be a `push` run of `.github/workflows/ci.yml`; pull-request and
-merge-ref runs are rejected. The clean-machine record must be a
-`workflow_dispatch` run of `.github/workflows/release-validation.yml`, whose
-isolated test actually runs installation, upgrade, injected-failure rollback,
-and uninstall validation. Only after those machine checks validate may the
-manifest record `Passed`.
+Both evidence runs must belong to the fixed public repository and have the
+exact workflow path/name and `head_sha`. CI must be a completed successful
+`push`. The tag-bound final `workflow_dispatch` must have completed successful
+build and clean-machine jobs plus the one currently executing publisher job;
+the publisher rechecks that exact state immediately before publication.
+Pull-request refs, another repository, run attempt, version, tag, artifact, or
+replayed attestation are rejected.
 
-For every release after the first, the script reads `/releases/latest`, requires
-that published release to be immutable and to contain exactly the ZIP, PKG,
-DMG, `release-manifest.json`, and `SHA256SUMS` assets. It resolves the tag
-commit, downloads all five protected assets, and requires the manifest and
+For every release, the tooling paginates the complete release collection and
+parses strict SemVer 2.0, including prerelease and build metadata. Precedence
+uses SemVer numeric and alphanumeric rules (`alpha.2 < alpha.10`) and ignores
+build metadata; two releases with equal precedence are rejected as ambiguous.
+Legal prereleases are part of history and must agree with GitHub's
+`prerelease` flag. It downloads every immutable formal release manifest,
+requires SemVer precedence and `CFBundleVersion` values to increase in the same
+order, rejects duplicate or forked version/build history, and selects the unique
+highest release for rollback. New schema 4 releases contain the ZIP,
+PKG, DMG, `candidate-envelope.json`, `release-manifest.json`, `SHA256SUMS`, and
+`clean-machine-attestation.json`; reviewed legacy releases remain readable.
+It resolves the tag commit, downloads every protected asset, and requires the
+manifest, attestation, and
 checksum file to describe exactly one ZIP, PKG, and DMG with matching names,
-types, hashes, and byte counts. The rollback PKG is expanded; its internal
-PackageInfo and Distribution must identify exactly one Gatebeam component with
-identifier `io.github.naifuliang.gatebeam`, the previous manifest version, and
-the fixed `/Applications` installation root. Only that component's sole
+types, hashes, and byte counts. The rollback PKG must also be a single flat
+component; every `Distribution` is rejected. Its PackageInfo has a complete
+element and attribute allowlist and must identify Gatebeam with identifier
+`io.github.naifuliang.gatebeam`, the previous manifest version/build, the fixed
+`/Applications` installation root, and only the reviewed postinstall entry.
+Only that component's sole
 `Payload/Gatebeam.app`, installed as `/Applications/Gatebeam.app`, is accepted;
 apps in Scripts, Resources, another component, or another payload location
 cannot satisfy rollback validation. The expanded root, component, Payload, and
 app must remain canonical and contained; every symlink or reparse entry and
 every multiply linked or non-regular file inside the app bundle is rejected.
+The APP is exactly `Contents/Info.plist`, `Contents/MacOS/Gatebeam`,
+`Contents/Resources/AppIcon.icns`, and
+`Contents/_CodeSignature/CodeResources` plus their expected directories and
+modes. There are no permitted nested code objects. Extras such as
+`Contents/unexpected.dylib`, casefold aliases, and NFC/NFD collisions are
+rejected independently in ZIP, PKG, and DMG.
 Its version, build, Bundle ID, and
 signature, plus the PKG signature, must match the validated previous manifest
 and signing contract. The new `CFBundleVersion` must be greater than that
@@ -228,13 +327,19 @@ as soon as any published release exists.
 `GATEBEAM_GITHUB_TOKEN_FILE` is required for every formal release and must name
 a canonical, caller-owned `0600` regular file with one link. Use a fine-grained
 token scoped to the fixed `naifuliang/gatebeam` repository with at least
-Administration (read), Actions (read), and Contents (read). The environment and
+Administration (read), Actions (read), and Contents (write). Contents write is
+used only to create the draft, upload its frozen assets, publish it, and clean
+up this publisher's abandoned draft. The environment and
 curl argv contain only file paths, never the Bearer value. Each request uses a
 private `0600` curl config that is deleted immediately after curl returns; the
 overall cleanup removes any remainder. The token is never written to logs, the
 release manifest, or retained release output. Delete the caller-owned input file
 with the trap above. This boundary does not claim to prevent the same user from
 reading process memory.
+
+Test-only command overrides are accepted only with the explicit test-mode flag
+inside a marked `/private/tmp` fixture. There is no unmarked production
+override for candidate, provenance, attestation, or digest validation.
 
 ## Build and Sign
 
@@ -372,20 +477,30 @@ shasum -a 256 dist/Gatebeam-VERSION.dmg \
   dist/Gatebeam-VERSION.zip
 ```
 
-Dispatch `.github/workflows/release-validation.yml` at the exact release tag.
-The resulting run must remain bound to the release `HEAD` and pass its single
-isolated macOS job. That job:
+The workflow must remain bound to the release `HEAD`. Its first macOS job creates
+the final Developer ID signed, notarized, and stapled candidate; its second
+isolated macOS job downloads that candidate by artifact ID and tests those exact
+bytes. The second job must not rebuild and must not receive the protected
+signing environment. It verifies a real system fresh install, previous-to-current
+upgrade, current-to-previous rollback, re-upgrade, injected-failure restoration,
+and uninstall before writing its attestation.
 
-- Builds the application from the checked-out SHA.
-- Runs the package migration and developer installer fixtures, including fresh
-  install, upgrade, repeated install, and failures injected across the
-  transaction with previous-state restoration checks.
-- Installs into a fresh temporary HOME, verifies the application, removes the
-  application and any owned launch agent, and proves no transaction state
-  remains.
-- Exercise only approved test DNS names and router mappings.
-- Do not publish hostnames, public addresses, tokens, router exports, or
-  screenshots containing them.
+Before any `sudo installer` call, the validator applies a complete container
+allowlist. The app ZIP may extract only `Gatebeam.app` and rejects traversal,
+normalization aliases, duplicates, links, special files, unsafe modes, and
+oversize expansion. The PKG must have exactly one component; PackageInfo,
+install location, BOM, payload, and tagged postinstall script closure must
+match the expected app with no extras. The DMG root may contain only
+`Gatebeam.app` and `Applications -> /Applications`. The complete app tree
+content and mode digest must agree across ZIP, PKG, and DMG.
+
+Candidate transport is accepted only when the GitHub artifact ID, protected
+archive digest, envelope digest, manifest digest, and every contained file hash
+agree. Archive traversal, duplicate entries, symlinks, hard links, special
+files, non-canonical paths, extra files, cross-repository evidence, cross-run
+attempt evidence, and stale attestations all fail closed. Do not publish
+hostnames, public addresses, tokens, router exports, or screenshots containing
+them.
 
 ## Manifest, Tag, and GitHub Release
 
@@ -397,7 +512,8 @@ Create a release manifest containing:
 - `CFBundleShortVersionString` and the monotonically increasing
   `CFBundleVersion`, plus `previousBuildVersion` derived from the latest
   immutable release manifest or `0` in API-proven bootstrap mode.
-- Artifact filenames, byte sizes, and SHA-256 checksums.
+- Artifact filenames, byte sizes, and SHA-256 checksums, including the public
+  `candidate-envelope.json` asset.
 - Bundle ID, Team ID, signing certificate common names and non-secret
   fingerprints.
 - Notary submission IDs and `Accepted` status, with sensitive fields redacted.
@@ -405,31 +521,41 @@ Create a release manifest containing:
   Xcode/Swift toolchain versions.
 - Exact release-suite, TSan, and clean-machine evidence URLs for the release
   commit.
+- Final-artifact repository ID, workflow ref/SHA, run ID/attempt, build and
+  validation job names, candidate and attestation artifact names, and source
+  commit/tag. The separate attestation additionally binds the candidate artifact
+  ID/digest, envelope hash, manifest hash, and every candidate file hash.
 - Known limitations and rollback asset metadata derived from the latest
   immutable release, or an explicit no-history rollback record for bootstrap.
 
-`release_formal.sh` writes these fields from the final stapled artifacts and
-validated inputs. It records byte counts after publication staging, extracts
-leaf-certificate SHA-256 fingerprints from the signed app and DMG, records the
-trusted installer certificate chain, and stores `Accepted` for all three
-notarization records. The Keychain profile name is never a manifest field and
-must not appear in the manifest or retained notary logs.
+`prepare_release_candidate.sh` writes these fields from the final stapled
+artifacts and validated inputs. It records byte counts after candidate staging,
+extracts leaf-certificate SHA-256 fingerprints from the signed app and DMG,
+records the trusted installer certificate chain, and stores `Accepted` for all
+three notarization records. Notary logs are checked inside the protected build
+job and then removed; they are not candidate or release assets. The Keychain
+profile name is never a manifest field or retained output.
 
-Re-run the privacy scan against the tag and release notes. Reconfirm that the
-already-created annotated tag points to the exact merge commit used to build
-the artifacts, then push it once. Follow GitHub's immutable release sequence:
+Re-run the privacy scan against the tag and release notes and push the annotated
+tag once. `release_formal.sh` performs the immutable release sequence itself;
+do not use `gh release create`, `gh release upload`, or a browser to finish it.
+The publisher holds the global remote draft lock, uploads the final ZIP, PKG,
+DMG, `candidate-envelope.json`, `release-manifest.json`, `SHA256SUMS`, and
+`clean-machine-attestation.json`, verifies their API IDs, sizes and SHA-256
+digests, rechecks the remote annotated tag and complete immutable-history
+snapshot immediately before publication, and requires the fresh release API
+response to report `immutable: true`. No production step rebuilds or rewrites
+an asset after clean-machine attestation.
+If a mutation response is lost, the publisher uses its ownership nonce and the
+frozen asset SHA-256 values to paginate and reconcile remote state. It resumes
+only from one exact draft/asset/release match; it never treats a retry response
+or tag-name match alone as proof of success.
 
-1. Create the GitHub Release as a draft for the exact annotated tag.
-2. Upload every intended release asset to the draft: the final ZIP, PKG, DMG,
-   `release-manifest.json`, and `SHA256SUMS`. Verify every local checksum and
-   uploaded asset before publication; do not plan to add or replace an asset
-   later.
-3. Publish the draft. With Immutable Releases enabled, publication locks the
-   release assets and tag and creates GitHub's release attestation.
-4. Require the release API to report `immutable: true`, run
-   `gh release verify vVERSION`, and run `gh release verify-asset vVERSION`
-   against each local uploaded asset. A human statement or screenshot is not
-   release evidence.
+The envelope hashes candidate containers and rollback fixtures, while the
+finalized manifest and `SHA256SUMS` hash the envelope. This acyclic closure lets
+an auditor download public assets, recompute the actual
+`candidateEnvelopeSHA256`, compare it with the manifest, checksums, and
+attestation, and then verify every container byte.
 
 Release notes are derived from `CHANGELOG.md` and must clearly distinguish
 Developer Preview notes from Formal Release notes. See GitHub's

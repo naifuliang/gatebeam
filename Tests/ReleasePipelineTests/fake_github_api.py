@@ -22,6 +22,10 @@ CI_STEPS = [
     "Run integration contract tests",
     "Run integration contract tests with Thread Sanitizer",
     "Run formal release pipeline tests",
+    "Run final artifact contract tests",
+    "Run final candidate validator behavior tests",
+    "Run formal publisher tests",
+    "Validate formal release workflow contract",
     "Verify Keychain and code-signing identity",
     "Run upgrade compatibility tests",
     "Run UI validation isolation tests",
@@ -267,6 +271,179 @@ def previous_release_payloads(root, scenario):
     elif scenario == "mismatched-checksum":
         checksum_lines[2] = f'{"0" * 64}  Gatebeam-0.4.0.dmg'
     checksums = ("\n".join(checksum_lines) + "\n").encode("utf-8")
+    attestation_bytes = None
+    if scenario.startswith("schema4-"):
+        run_id = 999001
+        run_attempt = 2
+        repository_id = 987654321
+        tag = "v0.4.0"
+        workflow_ref = (
+            f"{REPOSITORY}/.github/workflows/"
+            f"release-validation.yml@refs/tags/{tag}"
+        )
+        candidate_name = (
+            f"gatebeam-final-candidate-{tag}-{previous_commit}-"
+            f"run{run_id}-attempt{run_attempt}"
+        )
+        attestation_name = (
+            f"gatebeam-clean-machine-attestation-{tag}-{previous_commit}-"
+            f"run{run_id}-attempt{run_attempt}"
+        )
+        manifest.update(
+            {
+                "schemaVersion": 4,
+                "previousBuildVersion": "3",
+                "teamIdentifier": "ABCDE12345",
+                "testing": {
+                    "finalArtifactValidation": {
+                        "required": True,
+                        "repository": REPOSITORY,
+                        "repositoryId": repository_id,
+                        "workflowName": "Release final-artifact validation",
+                        "workflowPath": ".github/workflows/release-validation.yml",
+                        "workflowRef": workflow_ref,
+                        "workflowSHA": previous_commit,
+                        "runId": run_id,
+                        "runAttempt": run_attempt,
+                        "event": "workflow_dispatch",
+                        "buildJob": "build-candidate",
+                        "validationJob": "clean-machine",
+                        "commit": previous_commit,
+                        "tag": tag,
+                        "candidateArtifactName": candidate_name,
+                        "attestationArtifactName": attestation_name,
+                    }
+                },
+                "rollback": {
+                    "available": True,
+                    "version": "0.3.0",
+                    "assetSHA256": "3" * 64,
+                    "sourceCommit": "3" * 40,
+                },
+            }
+        )
+        manifest_bytes = (
+            json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode("utf-8")
+        file_records = [
+            {
+                "path": entry["name"],
+                "role": entry["type"],
+                "byteCount": entry["byteCount"],
+                "sha256": entry["sha256"],
+            }
+            for entry in manifest["artifacts"]
+        ]
+        file_records.extend(
+            [
+                {
+                    "path": "SHA256SUMS",
+                    "role": "checksums",
+                    "byteCount": len(checksums),
+                    "sha256": sha256(checksums),
+                },
+                {
+                    "path": "release-manifest.json",
+                    "role": "release-manifest",
+                    "byteCount": len(manifest_bytes),
+                    "sha256": sha256(manifest_bytes),
+                },
+                {
+                    "path": "validation/previous-Gatebeam.pkg",
+                    "role": "rollback-package",
+                    "byteCount": 1,
+                    "sha256": "3" * 64,
+                },
+                {
+                    "path": "validation/previous-release-manifest.json",
+                    "role": "rollback-manifest",
+                    "byteCount": 1,
+                    "sha256": "4" * 64,
+                },
+                {
+                    "path": "validation/previous-SHA256SUMS",
+                    "role": "rollback-checksums",
+                    "byteCount": 1,
+                    "sha256": "5" * 64,
+                },
+            ]
+        )
+        validations = [
+            "candidate-contract",
+            "app-developer-id",
+            "app-notarization-ticket",
+            "app-gatekeeper",
+            "pkg-developer-id",
+            "pkg-notarization-ticket",
+            "pkg-gatekeeper",
+            "pkg-payload-app",
+            "dmg-developer-id",
+            "dmg-notarization-ticket",
+            "dmg-gatekeeper",
+            "dmg-contained-app",
+            "fresh-install",
+            "upgrade",
+            "failure-rollback",
+            "published-rollback",
+            "uninstall",
+        ]
+        attestation = {
+            "schemaVersion": 1,
+            "kind": (
+                "io.github.naifuliang.gatebeam.clean-machine-attestation"
+            ),
+            "result": "Passed",
+            "repository": {
+                "fullName": REPOSITORY,
+                "id": repository_id,
+            },
+            "workflow": {
+                "name": "Release final-artifact validation",
+                "path": ".github/workflows/release-validation.yml",
+                "ref": workflow_ref,
+                "sha": previous_commit,
+                "runId": run_id,
+                "runAttempt": run_attempt,
+                "event": "workflow_dispatch",
+                "job": "clean-machine",
+            },
+            "source": {
+                "commit": previous_commit,
+                "tag": tag,
+                "ref": f"refs/tags/{tag}",
+            },
+            "release": {
+                "version": "0.4.0",
+                "buildVersion": build_version,
+                "bundleIdentifier": "io.github.naifuliang.gatebeam",
+                "teamIdentifier": "ABCDE12345",
+                "bootstrap": False,
+            },
+            "candidateArtifact": {
+                "name": candidate_name,
+                "id": 9001,
+                "digest": f"sha256:{'6' * 64}",
+            },
+            "candidateEnvelopeSHA256": "7" * 64,
+            "files": sorted(file_records, key=lambda entry: entry["path"]),
+            "validations": [
+                {"name": name, "passed": True}
+                for name in validations
+            ],
+            "rollbackTested": True,
+            "attestationArtifactName": attestation_name,
+            "releaseManifestSHA256": (
+                "0" * 64
+                if scenario == "schema4-tampered-attestation"
+                else sha256(manifest_bytes)
+            ),
+            "releaseVersion": "0.4.0",
+            "releaseBuildVersion": build_version,
+        }
+        attestation_bytes = (
+            json.dumps(attestation, sort_keys=True, separators=(",", ":"))
+            + "\n"
+        ).encode("utf-8")
     return (
         previous_commit,
         app_archive,
@@ -274,6 +451,7 @@ def previous_release_payloads(root, scenario):
         disk_image,
         manifest_bytes,
         checksums,
+        attestation_bytes,
     )
 
 
@@ -299,6 +477,7 @@ def latest_release(root, scenario):
         disk_image,
         manifest,
         checksums,
+        attestation,
     ) = previous_release_payloads(root, scenario)
     assets = [
         asset(101, "release-manifest.json", manifest),
@@ -307,6 +486,14 @@ def latest_release(root, scenario):
         asset(104, "Gatebeam-0.4.0.pkg", package),
         asset(105, "Gatebeam-0.4.0.dmg", disk_image),
     ]
+    if attestation is not None and scenario != "schema4-missing-attestation":
+        assets.append(
+            asset(
+                106,
+                "clean-machine-attestation.json",
+                attestation,
+            )
+        )
     if scenario == "missing-release-asset":
         assets.pop()
     elif scenario == "duplicate-release-asset":
@@ -417,18 +604,24 @@ def response_for(root, url, scenario):
         disk_image,
         manifest,
         checksums,
+        attestation,
     ) = previous_release_payloads(root, scenario)
     if url == f"{API_ROOT}/immutable-releases":
         return {"enabled": scenario != "immutable-disabled"}, False
-    if url == f"{API_ROOT}/releases?per_page=1":
-        releases = (
-            [latest_release(root, scenario)]
-            if scenario == "bootstrap-existing-release"
-            else []
-        )
+    match = re.fullmatch(re.escape(f"{API_ROOT}/releases?per_page=100&page=") + r"([0-9]+)", url)
+    if match:
+        if int(match.group(1)) != 1:
+            return [], False
+        bootstrap = os.environ.get("GATEBEAM_RELEASE_BOOTSTRAP") == "1"
+        if bootstrap:
+            releases = (
+                [latest_release(root, scenario)]
+                if scenario == "bootstrap-existing-release"
+                else []
+            )
+        else:
+            releases = [latest_release(root, scenario)]
         return releases, False
-    if url == f"{API_ROOT}/releases/latest":
-        return latest_release(root, scenario), False
     if url == f"{API_ROOT}/commits/v0.4.0":
         return {"sha": previous_commit}, False
     for run_id in ("123456", "123457"):
@@ -446,6 +639,8 @@ def response_for(root, url, scenario):
         return package, True
     if url == f"{API_ROOT}/releases/assets/105":
         return disk_image, True
+    if url == f"{API_ROOT}/releases/assets/106" and attestation is not None:
+        return attestation, True
     fail(f"unexpected fake GitHub URL: {url}")
 
 
