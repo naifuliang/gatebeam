@@ -256,7 +256,18 @@ new_fixture() {
     "$fixture/Resources" \
     "$fixture/Tests/ReleasePipelineTests" \
     "$tool_dir"
-  cp "$ROOT_DIR/scripts/release_formal.sh" "$fixture/scripts/release_formal.sh"
+  cp \
+    "$ROOT_DIR/scripts/release_candidate_internal.sh" \
+    "$fixture/scripts/release_candidate_internal.sh"
+  cp \
+    "$ROOT_DIR/scripts/prepare_release_candidate.sh" \
+    "$fixture/scripts/prepare_release_candidate.sh"
+  cp \
+    "$ROOT_DIR/scripts/release_artifact_contract.py" \
+    "$fixture/scripts/release_artifact_contract.py"
+  cp \
+    "$ROOT_DIR/scripts/release_history_contract.py" \
+    "$fixture/scripts/release_history_contract.py"
   cp "$ROOT_DIR/scripts/verify_release.sh" "$fixture/scripts/verify_release.sh"
   cp "$ROOT_DIR/scripts/signing_contract.sh" "$fixture/scripts/signing_contract.sh"
   cp "$FIXTURE_SOURCE/fake_build_app.sh" "$fixture/scripts/build_app.sh"
@@ -342,14 +353,27 @@ run_release() {
     GATEBEAM_INSTALLER_SIGN_IDENTITY="Developer ID Installer: Gatebeam Tests (ABCDE12345)" \
     GATEBEAM_NOTARY_PROFILE="fixture profile" \
     GATEBEAM_RELEASE_CI_RUN_ID=123456 \
-    GATEBEAM_RELEASE_CLEAN_MACHINE_RUN_ID=123457 \
     GATEBEAM_GITHUB_TOKEN_FILE="$token_file" \
     GATEBEAM_FAKE_EXPECTED_GITHUB_TOKEN_FILE="$token_file" \
     GATEBEAM_RELEASE_TEST_MODE=1 \
     GATEBEAM_RELEASE_TEST_TOOL_DIR="$tool_dir" \
     GATEBEAM_FAKE_CALL_LOG="$fixture/calls.log" \
+    GITHUB_ACTIONS=true \
+    GITHUB_REPOSITORY=naifuliang/gatebeam \
+    GITHUB_REPOSITORY_ID=987654321 \
+    GITHUB_WORKFLOW="Release final-artifact validation" \
+    GITHUB_WORKFLOW_REF="naifuliang/gatebeam/.github/workflows/release-validation.yml@refs/tags/v0.5.0" \
+    GITHUB_WORKFLOW_SHA="$(/usr/bin/git -C "$fixture" rev-parse HEAD)" \
+    GITHUB_RUN_ID=123457 \
+    GITHUB_RUN_ATTEMPT=1 \
+    GITHUB_EVENT_NAME=workflow_dispatch \
+    GITHUB_JOB=build-candidate \
+    GITHUB_REF=refs/tags/v0.5.0 \
+    GITHUB_REF_TYPE=tag \
+    GITHUB_REF_NAME=v0.5.0 \
+    GITHUB_SHA="$(/usr/bin/git -C "$fixture" rev-parse HEAD)" \
     "$@" \
-    /bin/zsh -f "$fixture/scripts/release_formal.sh"
+    /bin/zsh -f "$fixture/scripts/prepare_release_candidate.sh"
 }
 
 expect_failure() {
@@ -379,7 +403,7 @@ test_missing_environment() {
   if env \
     GATEBEAM_RELEASE_TEST_MODE=1 \
     GATEBEAM_RELEASE_TEST_TOOL_DIR="$fixture/fake tools" \
-    /bin/zsh -f "$fixture/scripts/release_formal.sh" >"$output" 2>&1; then
+    /bin/zsh -f "$fixture/scripts/prepare_release_candidate.sh" >"$output" 2>&1; then
     fail_test "missing environment unexpectedly succeeded"
   elif /usr/bin/grep -Fq "GATEBEAM_CODE_SIGN_IDENTITY is required" "$output"; then
     pass "missing environment"
@@ -500,19 +524,19 @@ test_release_metadata_inputs() {
     "must be a positive GitHub Actions run ID" \
     GATEBEAM_RELEASE_CI_RUN_ID="https://github.com/attacker/gatebeam/actions/runs/1"
 
-  fixture="$(new_fixture missing-clean-machine-run)"
+  fixture="$(new_fixture missing-actions-run)"
   expect_failure \
-    "missing clean-machine run ID" \
+    "missing current Actions run ID" \
     "$fixture" \
-    "GATEBEAM_RELEASE_CLEAN_MACHINE_RUN_ID is required" \
-    GATEBEAM_RELEASE_CLEAN_MACHINE_RUN_ID=
+    "GitHub Actions run ID must be a positive GitHub Actions run ID" \
+    GITHUB_RUN_ID=
 
-  fixture="$(new_fixture unsafe-clean-machine-run)"
+  fixture="$(new_fixture unsafe-actions-attempt)"
   expect_failure \
-    "unsafe clean-machine run ID" \
+    "unsafe current Actions run attempt" \
     "$fixture" \
-    "must be a positive GitHub Actions run ID" \
-    GATEBEAM_RELEASE_CLEAN_MACHINE_RUN_ID=latest
+    "GitHub Actions run attempt must be a positive decimal integer without leading zeroes" \
+    GITHUB_RUN_ATTEMPT=latest
 
   fixture="$(new_fixture unsafe-bootstrap-mode)"
   expect_failure \
@@ -553,12 +577,12 @@ test_github_evidence_binding() {
     "GitHub ci workflow evidence did not satisfy the release contract" \
     GATEBEAM_FAKE_GITHUB_SCENARIO=pull-request-merge-ref
 
-  fixture="$(new_fixture github-clean-wrong-event)"
+  fixture="$(new_fixture current-workflow-wrong-event)"
   expect_failure \
-    "GitHub clean-machine wrong event" \
+    "current final-artifact workflow wrong event" \
     "$fixture" \
-    "GitHub clean-machine workflow evidence did not satisfy the release contract" \
-    GATEBEAM_FAKE_GITHUB_SCENARIO=wrong-clean-event
+    "formal candidate preparation has the wrong workflow, event, or job" \
+    GITHUB_EVENT_NAME=push
 
   fixture="$(new_fixture github-wrong-conclusion)"
   expect_failure \
@@ -592,7 +616,7 @@ test_github_evidence_binding() {
   expect_failure \
     "GitHub mutable previous release" \
     "$fixture" \
-    "latest GitHub release is not a complete immutable formal release" \
+    "formal release history contains an invalid immutable state" \
     GATEBEAM_FAKE_GITHUB_SCENARIO=mutable-release
 
   fixture="$(new_fixture github-rollback-mismatch)"
@@ -601,6 +625,32 @@ test_github_evidence_binding() {
     "$fixture" \
     "previous immutable release manifest, checksum, build, or rollback asset did not validate" \
     GATEBEAM_FAKE_GITHUB_SCENARIO=rollback-mismatch
+
+  fixture="$(new_fixture github-schema4-history)"
+  if run_release \
+       "$fixture" \
+       GATEBEAM_FAKE_GITHUB_SCENARIO=schema4-valid \
+       >"$fixture/test-output.log" 2>&1; then
+    pass "schema 4 immutable release and clean-machine attestation history"
+  else
+    fail_test \
+      "schema 4 immutable release and clean-machine attestation history" \
+      "$fixture/test-output.log"
+  fi
+
+  fixture="$(new_fixture github-schema4-missing-attestation)"
+  expect_failure \
+    "schema 4 history missing clean-machine attestation" \
+    "$fixture" \
+    "previous immutable release manifest, checksum, build, or rollback asset did not validate" \
+    GATEBEAM_FAKE_GITHUB_SCENARIO=schema4-missing-attestation
+
+  fixture="$(new_fixture github-schema4-tampered-attestation)"
+  expect_failure \
+    "schema 4 history with stale clean-machine attestation" \
+    "$fixture" \
+    "previous release clean-machine attestation did not validate" \
+    GATEBEAM_FAKE_GITHUB_SCENARIO=schema4-tampered-attestation
 
   local scenario
   local label
@@ -1100,7 +1150,7 @@ test_wrong_identity() {
     GATEBEAM_GITHUB_TOKEN_FILE="$fixture/github-token" \
     GATEBEAM_RELEASE_TEST_MODE=1 \
     GATEBEAM_RELEASE_TEST_TOOL_DIR="$fixture/fake tools" \
-    /bin/zsh -f "$fixture/scripts/release_formal.sh" >"$output" 2>&1; then
+    /bin/zsh -f "$fixture/scripts/prepare_release_candidate.sh" >"$output" 2>&1; then
     fail_test "wrong identity unexpectedly succeeded"
   elif /usr/bin/grep -Fq "Developer ID Application identity has the wrong class" "$output"; then
     pass "wrong identity"
@@ -1459,9 +1509,10 @@ test_success_and_order() {
     "$release_dir/Gatebeam-0.5.0.dmg" \
     "$release_dir/SHA256SUMS" \
     "$release_dir/release-manifest.json" \
-    "$release_dir/notary-logs/app.json" \
-    "$release_dir/notary-logs/pkg.json" \
-    "$release_dir/notary-logs/dmg.json"
+    "$release_dir/candidate-envelope.json" \
+    "$release_dir/validation/previous-Gatebeam.pkg" \
+    "$release_dir/validation/previous-release-manifest.json" \
+    "$release_dir/validation/previous-SHA256SUMS"
   do
     [[ -s "$artifact_path" ]] || {
       fail_test "successful release omitted ${artifact_path:t}"
@@ -1517,7 +1568,9 @@ test_success_and_order() {
       "$(/usr/bin/plutil -extract platform.name raw -o - "$manifest")" == "macOS" &&
       "$(/usr/bin/plutil -extract platform.supportedMacOSVersionRange raw -o - "$manifest")" == "13.0 or later" &&
       "$(/usr/bin/plutil -extract testing.status raw -o - "$manifest")" == "Passed" &&
-      "$(/usr/bin/plutil -extract testing.cleanMachineStatus raw -o - "$manifest")" == "Passed" &&
+      "$(/usr/bin/plutil -extract testing.cleanMachineStatus raw -o - "$manifest")" == "RequiresAttestation" &&
+      "$(/usr/bin/plutil -extract testing.finalArtifactValidation.runId raw -o - "$manifest")" == "123457" &&
+      "$(/usr/bin/plutil -extract testing.finalArtifactValidation.runAttempt raw -o - "$manifest")" == "1" &&
       -n "$(/usr/bin/plutil -extract toolchain.xcodeVersion raw -o - "$manifest")" &&
       -n "$(/usr/bin/plutil -extract toolchain.swiftVersion raw -o - "$manifest")" ]] || {
     fail_test "successful release manifest is incomplete"
@@ -1546,7 +1599,8 @@ test_success_and_order() {
     fail_test "successful release manifest omitted required gate evidence"
     return
   }
-  if /usr/bin/grep -Fq "fixture profile" "$manifest" "$release_dir"/notary-logs/*.json; then
+  if [[ -e "$release_dir/notary-logs" ]] ||
+     /usr/bin/grep -R -Fq "fixture profile" "$release_dir"; then
     fail_test "successful release leaked the notary profile"
     return
   fi
@@ -1733,7 +1787,7 @@ test_override_restriction() {
     GATEBEAM_GITHUB_TOKEN_FILE="$TEST_ROOT/override-token" \
     GATEBEAM_RELEASE_TEST_MODE=1 \
     GATEBEAM_RELEASE_TEST_TOOL_DIR="$TEST_ROOT/not-used" \
-    /bin/zsh -f "$ROOT_DIR/scripts/release_formal.sh" >"$output" 2>&1; then
+    /bin/zsh -f "$ROOT_DIR/scripts/prepare_release_candidate.sh" >"$output" 2>&1; then
     fail_test "non-fixture command override unexpectedly succeeded"
   elif /usr/bin/grep -Fq "restricted to marked /private/tmp fixtures" "$output"; then
     pass "command override restriction"
@@ -1746,7 +1800,8 @@ test_legacy_notary_tool_is_absent() {
   local forbidden_tool="al""tool"
   if /usr/bin/grep -Fq \
     "$forbidden_tool" \
-    "$ROOT_DIR/scripts/release_formal.sh" \
+    "$ROOT_DIR/scripts/prepare_release_candidate.sh" \
+    "$ROOT_DIR/scripts/release_candidate_internal.sh" \
     "$ROOT_DIR/scripts/verify_release.sh"; then
     fail_test "legacy notary tool is present"
   else
@@ -1757,7 +1812,10 @@ test_legacy_notary_tool_is_absent() {
 test_manifest_validation_is_portable() {
   if /usr/bin/grep -Fq \
     "/usr/bin/plutil -p" \
-    "$ROOT_DIR/scripts/release_formal.sh"; then
+    "$ROOT_DIR/scripts/release_formal.sh" \
+    "$ROOT_DIR/scripts/release_candidate_internal.sh" \
+    "$ROOT_DIR/scripts/publish_validated_release.sh" \
+    "$ROOT_DIR/scripts/release_artifact_contract.py"; then
     fail_test "release manifest validation still depends on host plutil JSON behavior"
   else
     pass "release manifest validation is independent of host plutil JSON behavior"

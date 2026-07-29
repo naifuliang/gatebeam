@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<xar>
+  <toc>
+    <checksum style="sha1"><size>20</size><offset>0</offset></checksum>
+    <creation-time>2026-01-01T00:00:00Z</creation-time>
+    <signature style="RSA">
+      <offset>20</offset><size>256</size>
+      <KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+        <X509Data><X509Certificate>MAMCAQA=</X509Certificate></X509Data>
+      </KeyInfo>
+    </signature>
+    <x-signature style="CMS">
+      <offset>276</offset><size>1024</size>
+      <KeyInfo xmlns="http://www.w3.org/2000/09/xmldsig#">
+        <X509Data><X509Certificate>MAMCAQA=</X509Certificate></X509Data>
+      </KeyInfo>
+    </x-signature>
+    <file id="1">
+      <data>
+        <extracted-checksum style="sha1">0000000000000000000000000000000000000000</extracted-checksum>
+        <archived-checksum style="sha1">0000000000000000000000000000000000000000</archived-checksum>
+        <encoding style="application/octet-stream"/>
+        <size>100</size><offset>1300</offset><length>1</length>
+      </data>
+      <gid>0</gid><uid>0</uid><mode>0664</mode><inode>0</inode>
+      <type>file</type><name>Payload</name>
+    </file>
+    <file id="2">
+      <data>
+        <extracted-checksum style="sha1">0000000000000000000000000000000000000000</extracted-checksum>
+        <archived-checksum style="sha1">0000000000000000000000000000000000000000</archived-checksum>
+        <encoding style="application/octet-stream"/>
+        <size>100</size><offset>1301</offset><length>1</length>
+      </data>
+      <gid>0</gid><uid>0</uid><mode>0664</mode><inode>0</inode>
+      <type>file</type><name>Bom</name>
+    </file>
+    <file id="3">
+      <data>
+        <extracted-checksum style="sha1">0000000000000000000000000000000000000000</extracted-checksum>
+        <archived-checksum style="sha1">0000000000000000000000000000000000000000</archived-checksum>
+        <encoding style="application/octet-stream"/>
+        <size>100</size><offset>1302</offset><length>1</length>
+      </data>
+      <gid>0</gid><uid>0</uid><mode>0664</mode><inode>0</inode>
+      <type>file</type><name>Scripts</name>
+    </file>
+    <file id="4">
+      <data>
+        <extracted-checksum style="sha1">0000000000000000000000000000000000000000</extracted-checksum>
+        <archived-checksum style="sha1">0000000000000000000000000000000000000000</archived-checksum>
+        <encoding style="application/octet-stream"/>
+        <size>100</size><offset>1303</offset><length>1</length>
+      </data>
+      <gid>0</gid><uid>0</uid><mode>0664</mode><inode>0</inode>
+      <type>file</type><name>PackageInfo</name>
+    </file>
+  </toc>
+</xar>
