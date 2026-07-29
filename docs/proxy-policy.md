@@ -1,6 +1,6 @@
 # Proxy Policy
 
-This document defines the intended network-path contract for Gatebeam. It is useful both for implementation and for diagnosing why a DDNS record may not reflect the address that outside clients can reach.
+This document defines the network-path contract for Gatebeam. For a first-time setup and router guidance, see [Networking and remote access](networking.md).
 
 ## Principles
 
@@ -9,7 +9,7 @@ This document defines the intended network-path contract for Gatebeam. It is use
 3. Allow Cloudflare API requests to use the system proxy or a validated custom proxy when a managed network requires it.
 4. Make the selected path visible in the status UI. The status popover may show complete connection addresses and URLs for copying. Gatebeam 0.5.0 has no diagnostic export and does not persist a diagnostic log; any future implementation must redact hostnames, public addresses, and credentials by default.
 5. Treat packet-level VPNs and transparent interception as outside the control of URLSession proxy settings.
-6. Clear the stored custom proxy URL whenever neither Cloudflare nor public-address discovery uses Custom mode.
+6. The current build has independent mode selections but one shared Custom URL. Every operation set to Custom uses that same URL.
 
 Use a system-managed proxy for authenticated deployments. Do not embed proxy usernames or passwords in a custom proxy URL because regular configuration storage is not a Keychain substitute. Custom mode accepts only `http://host:port` and `socks5://host:port`; credentials, paths, queries, fragments, and other schemes are rejected.
 
@@ -17,8 +17,8 @@ Use a system-managed proxy for authenticated deployments. Do not embed proxy use
 
 | Operation | Path | User choice | Failure guidance |
 | --- | --- | --- | --- |
-| Cloudflare API | System proxy by default | System proxy, direct, or custom `http://` / `socks5://` proxy | Switch to direct if the proxy rewrites or blocks API traffic; use a system or validated custom proxy on managed networks that require it. |
-| IPv4/IPv6 public-address probe | Direct by default | Direct, system proxy, or custom `http://` / `socks5://` proxy | Direct is recommended. A proxy result may be the proxy exit, not the router's WAN address. The probe is still not an external reachability test. |
+| Cloudflare API | System proxy by default | System proxy, Direct, or Custom `http://` / `socks5://` proxy | Switch to Direct if the proxy rewrites or blocks API traffic; use System or Custom on managed networks that require it. |
+| IPv4/IPv6 public-address probe | Direct by default | Direct, System proxy, or Custom `http://` / `socks5://` proxy | Direct is recommended. A proxy result may be the proxy exit, not the router's WAN address. The probe is still not an external reachability test. |
 | Router WAN address query | LAN direct | None | Confirm the selected gateway and check for CGNAT/private WAN addressing. |
 | PCP/NAT-PMP/UPnP | LAN direct | None | Confirm that the Mac is on the expected LAN/VLAN and that the router allows the protocol. |
 | Local-origin TCP check | LAN/loopback direct | None | Confirms only that the Mac's local service listener responds. It is not evidence that a public client can connect. |
@@ -30,6 +30,7 @@ Use a system-managed proxy for authenticated deployments. Do not embed proxy use
 - Treat RFC 1918 and carrier-grade NAT ranges as a warning for public IPv4 reachability.
 - Prefer a globally routable IPv6 address on a physical interface.
 - Hard-exclude tunnel and virtual interfaces from IPv6 DDNS selection even when they own the default route. Also exclude loopback, link-local, ULA, temporary, deprecated, and detached IPv6 addresses.
+- The `AAAA` record uses the selected stable global IPv6 address on this Mac. The public IPv6 probe is diagnostic only and does not supply the DNS value.
 - Renew AAAA records and IPv6 pinholes when a selected IPv6 address changes.
 
 ## Privacy

@@ -4,10 +4,14 @@ import Foundation
 private enum PopoverLayout {
     static let width: CGFloat = 430
     static let contentWidth: CGFloat = 394
+    static let heroContentWidth: CGFloat = 362
     static let tileWidth: CGFloat = 192
-    static let tileHeight: CGFloat = 64
-    static let singleURLHeight: CGFloat = 528
-    static let dualURLHeight: CGFloat = 556
+    static let tileHeight: CGFloat = 72
+    static let connectionRowHeight: CGFloat = 28
+    static let singleConnectionHeight: CGFloat = 36
+    static let dualConnectionHeight: CGFloat = 64
+    static let singleURLHeight: CGFloat = 544
+    static let dualURLHeight: CGFloat = 572
 }
 
 final class StatusPopoverViewController: NSViewController {
@@ -23,6 +27,9 @@ final class StatusPopoverViewController: NSViewController {
     private let secondaryConnectionLabel = NSTextField(labelWithString: "")
     private let secondaryConnectionFamilyLabel = NSTextField(labelWithString: "IPv6")
     private let secondaryConnectionRow = NSStackView()
+    private var connectionCardHeightConstraint: NSLayoutConstraint?
+    private weak var primaryCopyButton: NSButton?
+    private weak var secondaryCopyButton: NSButton?
     private let lastCheckedLabel = NSTextField(labelWithString: "Not checked yet")
     private let accessSwitch = NSSwitch()
     private let accessStateLabel = NSTextField(labelWithString: "Off")
@@ -42,6 +49,8 @@ final class StatusPopoverViewController: NSViewController {
     private let ipv6PortLabel = ValueLabel(title: "IPv6 Port")
     private let ddnsProxyRoute = ProxyRouteView(title: "DDNS path", symbol: "globe")
     private let publicIPProxyRoute = ProxyRouteView(title: "IP probe", symbol: "location.magnifyingglass")
+    private var remoteAccessEnabled = false
+    private var latestStatus = AppStatus.initial
 
     init(agent: NetworkAgent, openSettings: @escaping () -> Void, quit: @escaping () -> Void) {
         self.agent = agent
@@ -56,7 +65,10 @@ final class StatusPopoverViewController: NSViewController {
     }
 
     override func loadView() {
-        let effect = NSVisualEffectView()
+        let effect = PopoverAppearanceTrackingView()
+        effect.onEffectiveAppearanceChanged = { [weak self] in
+            self?.refreshAppearance()
+        }
         effect.material = .popover
         effect.blendingMode = .behindWindow
         effect.state = .active
@@ -86,39 +98,23 @@ final class StatusPopoverViewController: NSViewController {
 
         update(config: agent.config)
         update(status: agent.status)
+        refreshAppearance()
     }
 
     func update(config: AppConfig) {
+        remoteAccessEnabled = config.remoteAccessEnabled
         accessSwitch.state = config.remoteAccessEnabled ? .on : .off
         accessStateLabel.stringValue = config.remoteAccessEnabled ? "On" : "Off"
         ddnsProxyRoute.update(proxyPresentation(for: config.ddnsProxyMode, customURL: config.customProxyURL))
         publicIPProxyRoute.update(proxyPresentation(for: config.publicIPProxyMode, customURL: config.customProxyURL))
+        renderHero(latestStatus)
+        refreshConnectionPresentation(latestStatus)
     }
 
     func update(status: AppStatus) {
+        latestStatus = status
         renderHero(status)
-        let hasDistinctURLs = status.connectionURLIPv4 != nil
-            && status.connectionURLIPv6 != nil
-            && status.connectionURLIPv4 != status.connectionURLIPv6
-        preferredContentSize = NSSize(
-            width: PopoverLayout.width,
-            height: hasDistinctURLs ? PopoverLayout.dualURLHeight : PopoverLayout.singleURLHeight
-        )
-        if hasDistinctURLs {
-            connectionFamilyLabel.stringValue = "IPv4"
-            connectionLabel.stringValue = status.connectionURLIPv4 ?? "-"
-            connectionLabel.toolTip = status.connectionURLIPv4
-            secondaryConnectionFamilyLabel.stringValue = "IPv6 URL"
-            secondaryConnectionLabel.stringValue = status.connectionURLIPv6 ?? "-"
-            secondaryConnectionLabel.toolTip = status.connectionURLIPv6
-            secondaryConnectionRow.isHidden = false
-        } else {
-            connectionFamilyLabel.stringValue = status.connectionURLIPv6 != nil && status.connectionURLIPv4 == nil ? "IPv6 URL" : "URL"
-            connectionLabel.stringValue = status.connectionURL ?? "No connection URL yet"
-            connectionLabel.toolTip = status.connectionURL
-            secondaryConnectionLabel.toolTip = nil
-            secondaryConnectionRow.isHidden = true
-        }
+        refreshConnectionPresentation(status)
         lastCheckedLabel.stringValue = status.lastCheckedAt.map { "Checked \(DateFormatter.popoverTime.string(from: $0))" } ?? "Not checked yet"
 
         ddnsTile.update(status.ddnsStatus)
@@ -187,11 +183,12 @@ final class StatusPopoverViewController: NSViewController {
 
     private func makeHeroCard() -> NSView {
         let card = CardView()
+        card.identifier = NSUserInterfaceItemIdentifier("hero-card")
         card.widthAnchor.constraint(equalToConstant: PopoverLayout.contentWidth).isActive = true
         let stack = NSStackView()
         stack.orientation = .vertical
         stack.spacing = 8
-        stack.edgeInsets = NSEdgeInsets(top: 11, left: 14, bottom: 11, right: 14)
+        stack.edgeInsets = NSEdgeInsets(top: 11, left: 16, bottom: 11, right: 16)
         stack.translatesAutoresizingMaskIntoConstraints = false
         card.addSubview(stack)
 
@@ -210,12 +207,19 @@ final class StatusPopoverViewController: NSViewController {
         let text = NSStackView()
         text.orientation = .vertical
         text.spacing = 3
+        text.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        text.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        headlineLabel.identifier = NSUserInterfaceItemIdentifier("hero-headline")
         headlineLabel.font = NSFont.systemFont(ofSize: 19, weight: .semibold)
+        headlineLabel.maximumNumberOfLines = 1
+        headlineLabel.usesSingleLineMode = true
         headlineLabel.lineBreakMode = .byTruncatingTail
+        detailLabel.identifier = NSUserInterfaceItemIdentifier("hero-detail")
         detailLabel.font = NSFont.systemFont(ofSize: 12, weight: .regular)
         detailLabel.textColor = .secondaryLabelColor
         detailLabel.maximumNumberOfLines = 1
-        detailLabel.lineBreakMode = .byWordWrapping
+        detailLabel.usesSingleLineMode = true
+        detailLabel.lineBreakMode = .byTruncatingTail
         text.addArrangedSubview(headlineLabel)
         text.addArrangedSubview(detailLabel)
 
@@ -228,14 +232,24 @@ final class StatusPopoverViewController: NSViewController {
         switchStack.orientation = .vertical
         switchStack.alignment = .centerX
         switchStack.spacing = 4
+        switchStack.setContentHuggingPriority(.required, for: .horizontal)
+        switchStack.setContentCompressionResistancePriority(.required, for: .horizontal)
         switchStack.addArrangedSubview(accessSwitch)
         switchStack.addArrangedSubview(accessStateLabel)
 
         top.addArrangedSubview(text)
         top.addArrangedSubview(switchStack)
+        top.widthAnchor.constraint(equalToConstant: PopoverLayout.heroContentWidth).isActive = true
         stack.addArrangedSubview(top)
 
         let urlCard = RoundedFieldView()
+        urlCard.identifier = NSUserInterfaceItemIdentifier("connection-address-container")
+        urlCard.widthAnchor.constraint(equalToConstant: PopoverLayout.heroContentWidth).isActive = true
+        let connectionCardHeightConstraint = urlCard.heightAnchor.constraint(
+            equalToConstant: PopoverLayout.singleConnectionHeight
+        )
+        connectionCardHeightConstraint.isActive = true
+        self.connectionCardHeightConstraint = connectionCardHeightConstraint
         let urlStack = NSStackView()
         urlStack.orientation = .vertical
         urlStack.spacing = 0
@@ -244,9 +258,11 @@ final class StatusPopoverViewController: NSViewController {
         urlCard.addSubview(urlStack)
 
         let urlRow = NSStackView()
+        urlRow.identifier = NSUserInterfaceItemIdentifier("primary-connection-row")
         urlRow.orientation = .horizontal
         urlRow.alignment = .centerY
         urlRow.spacing = 8
+        urlRow.heightAnchor.constraint(equalToConstant: PopoverLayout.connectionRowHeight).isActive = true
 
         NSLayoutConstraint.activate([
             urlStack.leadingAnchor.constraint(equalTo: urlCard.leadingAnchor),
@@ -260,18 +276,31 @@ final class StatusPopoverViewController: NSViewController {
         linkIcon.contentTintColor = .secondaryLabelColor
         linkIcon.widthAnchor.constraint(equalToConstant: 16).isActive = true
         linkIcon.heightAnchor.constraint(equalToConstant: 16).isActive = true
+        linkIcon.setContentHuggingPriority(.required, for: .horizontal)
+        linkIcon.setContentCompressionResistancePriority(.required, for: .horizontal)
 
+        connectionLabel.identifier = NSUserInterfaceItemIdentifier("primary-connection-url")
         connectionLabel.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .medium)
+        connectionLabel.maximumNumberOfLines = 1
+        connectionLabel.usesSingleLineMode = true
         connectionLabel.lineBreakMode = .byTruncatingMiddle
+        connectionLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        connectionLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         connectionFamilyLabel.font = NSFont.systemFont(ofSize: 10, weight: .semibold)
         connectionFamilyLabel.textColor = .secondaryLabelColor
         connectionFamilyLabel.widthAnchor.constraint(equalToConstant: 46).isActive = true
+        connectionFamilyLabel.setContentHuggingPriority(.required, for: .horizontal)
+        connectionFamilyLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
 
         let copy = iconOnlyButton(
             symbol: "doc.on.doc",
             toolTip: "Copy connection URL",
             action: #selector(copyURL)
         )
+        copy.identifier = NSUserInterfaceItemIdentifier("copy-primary-connection-url")
+        copy.setContentHuggingPriority(.required, for: .horizontal)
+        copy.setContentCompressionResistancePriority(.required, for: .horizontal)
+        primaryCopyButton = copy
         urlRow.addArrangedSubview(linkIcon)
         urlRow.addArrangedSubview(connectionFamilyLabel)
         urlRow.addArrangedSubview(connectionLabel)
@@ -279,20 +308,35 @@ final class StatusPopoverViewController: NSViewController {
         urlStack.addArrangedSubview(urlRow)
 
         secondaryConnectionRow.orientation = .horizontal
+        secondaryConnectionRow.identifier = NSUserInterfaceItemIdentifier("secondary-connection-row")
         secondaryConnectionRow.alignment = .centerY
         secondaryConnectionRow.spacing = 8
+        secondaryConnectionRow.heightAnchor.constraint(equalToConstant: PopoverLayout.connectionRowHeight).isActive = true
         let secondaryIndent = NSView()
         secondaryIndent.widthAnchor.constraint(equalToConstant: 16).isActive = true
+        secondaryIndent.setContentHuggingPriority(.required, for: .horizontal)
+        secondaryIndent.setContentCompressionResistancePriority(.required, for: .horizontal)
         secondaryConnectionFamilyLabel.font = NSFont.systemFont(ofSize: 10, weight: .semibold)
         secondaryConnectionFamilyLabel.textColor = .secondaryLabelColor
         secondaryConnectionFamilyLabel.widthAnchor.constraint(equalToConstant: 46).isActive = true
+        secondaryConnectionFamilyLabel.setContentHuggingPriority(.required, for: .horizontal)
+        secondaryConnectionFamilyLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+        secondaryConnectionLabel.identifier = NSUserInterfaceItemIdentifier("secondary-connection-url")
         secondaryConnectionLabel.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .medium)
+        secondaryConnectionLabel.maximumNumberOfLines = 1
+        secondaryConnectionLabel.usesSingleLineMode = true
         secondaryConnectionLabel.lineBreakMode = .byTruncatingMiddle
+        secondaryConnectionLabel.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        secondaryConnectionLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         let copyIPv6 = iconOnlyButton(
             symbol: "doc.on.doc",
             toolTip: "Copy IPv6 connection URL",
             action: #selector(copyIPv6URL)
         )
+        copyIPv6.identifier = NSUserInterfaceItemIdentifier("copy-secondary-connection-url")
+        copyIPv6.setContentHuggingPriority(.required, for: .horizontal)
+        copyIPv6.setContentCompressionResistancePriority(.required, for: .horizontal)
+        secondaryCopyButton = copyIPv6
         secondaryConnectionRow.addArrangedSubview(secondaryIndent)
         secondaryConnectionRow.addArrangedSubview(secondaryConnectionFamilyLabel)
         secondaryConnectionRow.addArrangedSubview(secondaryConnectionLabel)
@@ -305,6 +349,7 @@ final class StatusPopoverViewController: NSViewController {
         actions.orientation = .horizontal
         actions.spacing = 8
         actions.distribution = .fillEqually
+        actions.widthAnchor.constraint(equalToConstant: PopoverLayout.heroContentWidth).isActive = true
         actions.addArrangedSubview(actionButton(title: "Check", symbol: "arrow.clockwise", action: #selector(checkNow)))
         actions.addArrangedSubview(actionButton(title: "30 min", symbol: "timer", action: #selector(openForThirtyMinutes)))
         stack.addArrangedSubview(actions)
@@ -316,6 +361,7 @@ final class StatusPopoverViewController: NSViewController {
             [ddnsTile, routerTile],
             [desktopTile, reachabilityTile]
         ])
+        grid.identifier = NSUserInterfaceItemIdentifier("connection-health-grid")
         grid.rowSpacing = 8
         grid.columnSpacing = 10
         grid.xPlacement = .fill
@@ -333,6 +379,7 @@ final class StatusPopoverViewController: NSViewController {
 
     private func makeNetworkCard() -> NSView {
         let card = CardView()
+        card.identifier = NSUserInterfaceItemIdentifier("network-card")
         card.widthAnchor.constraint(equalToConstant: PopoverLayout.contentWidth).isActive = true
         let stack = NSStackView()
         stack.orientation = .vertical
@@ -425,8 +472,7 @@ final class StatusPopoverViewController: NSViewController {
     }
 
     private func renderHero(_ status: AppStatus) {
-        let config = agent.config
-        if !config.remoteAccessEnabled {
+        if !remoteAccessEnabled {
             headlineLabel.stringValue = "Remote access is off"
             detailLabel.stringValue = "DDNS and router mappings are paused."
             statusPill.update(text: "Off", state: .disabled)
@@ -486,16 +532,78 @@ final class StatusPopoverViewController: NSViewController {
     }
 
     @objc private func copyURL() {
-        let url = agent.status.connectionURLIPv4 ?? agent.status.connectionURL
-        guard let url else { return }
+        guard let url = RemoteConnectionURLPolicy.primaryCopyURL(
+            remoteAccessEnabled: agent.config.remoteAccessEnabled,
+            status: agent.status
+        ) else {
+            return
+        }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(url, forType: .string)
     }
 
     @objc private func copyIPv6URL() {
-        guard let url = agent.status.connectionURLIPv6 else { return }
+        guard let url = RemoteConnectionURLPolicy.ipv6CopyURL(
+            remoteAccessEnabled: agent.config.remoteAccessEnabled,
+            status: agent.status
+        ) else {
+            return
+        }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(url, forType: .string)
+    }
+
+    private func refreshConnectionPresentation(_ status: AppStatus) {
+        let hasDistinctURLs = remoteAccessEnabled
+            && status.connectionURLIPv4 != nil
+            && status.connectionURLIPv6 != nil
+            && status.connectionURLIPv4 != status.connectionURLIPv6
+        preferredContentSize = NSSize(
+            width: PopoverLayout.width,
+            height: hasDistinctURLs ? PopoverLayout.dualURLHeight : PopoverLayout.singleURLHeight
+        )
+        connectionCardHeightConstraint?.constant = hasDistinctURLs
+            ? PopoverLayout.dualConnectionHeight
+            : PopoverLayout.singleConnectionHeight
+
+        if hasDistinctURLs {
+            connectionFamilyLabel.stringValue = "IPv4"
+            connectionLabel.stringValue = status.connectionURLIPv4 ?? "-"
+            connectionLabel.toolTip = status.connectionURLIPv4
+            secondaryConnectionFamilyLabel.stringValue = "IPv6 URL"
+            secondaryConnectionLabel.stringValue = status.connectionURLIPv6 ?? "-"
+            secondaryConnectionLabel.toolTip = status.connectionURLIPv6
+            secondaryConnectionRow.isHidden = false
+        } else {
+            connectionFamilyLabel.stringValue = remoteAccessEnabled
+                && status.connectionURLIPv6 != nil
+                && status.connectionURLIPv4 == nil ? "IPv6 URL" : "URL"
+            connectionLabel.stringValue = RemoteConnectionURLPolicy.displayURL(
+                remoteAccessEnabled: remoteAccessEnabled,
+                status: status
+            )
+            connectionLabel.toolTip = remoteAccessEnabled ? status.connectionURL : nil
+            secondaryConnectionLabel.stringValue = ""
+            secondaryConnectionLabel.toolTip = nil
+            secondaryConnectionRow.isHidden = true
+        }
+
+        primaryCopyButton?.isEnabled = RemoteConnectionURLPolicy.primaryCopyURL(
+            remoteAccessEnabled: remoteAccessEnabled,
+            status: status
+        ) != nil
+        secondaryCopyButton?.isEnabled = RemoteConnectionURLPolicy.ipv6CopyURL(
+            remoteAccessEnabled: remoteAccessEnabled,
+            status: status
+        ) != nil
+    }
+
+    func refreshAppearance() {
+        dispatchPrecondition(condition: .onQueue(.main))
+        for candidate in popoverDescendants(of: view) {
+            (candidate as? PopoverAppearanceRefreshing)?.refreshAppearanceLayers()
+        }
+        view.needsDisplay = true
     }
 
     @objc private func openSettings() {
@@ -507,35 +615,71 @@ final class StatusPopoverViewController: NSViewController {
     }
 }
 
-private class CardView: NSView {
+private class CardView: NSView, PopoverAppearanceRefreshing {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
         layer?.cornerRadius = 8
         layer?.cornerCurve = .continuous
-        layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor
-        layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.45).cgColor
         layer?.borderWidth = 1
+        applyCardAppearance()
     }
 
     required init?(coder: NSCoder) {
         nil
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        dispatchPrecondition(condition: .onQueue(.main))
+        refreshAppearanceLayers()
+    }
+
+    func refreshAppearanceLayers() {
+        applyCardAppearance()
+    }
+
+    private func applyCardAppearance() {
+        layer?.backgroundColor = NSColor.resolvedCGColor(
+            .controlBackgroundColor,
+            for: self
+        )
+        layer?.borderColor = NSColor.resolvedCGColor(
+            .separatorColor.withAlphaComponent(0.45),
+            for: self
+        )
     }
 }
 
-private final class RoundedFieldView: NSView {
+private final class RoundedFieldView: NSView, PopoverAppearanceRefreshing {
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
         wantsLayer = true
         layer?.cornerRadius = 8
         layer?.cornerCurve = .continuous
-        layer?.backgroundColor = NSColor.textBackgroundColor.cgColor
-        layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.5).cgColor
         layer?.borderWidth = 1
+        refreshAppearanceLayers()
     }
 
     required init?(coder: NSCoder) {
         nil
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        dispatchPrecondition(condition: .onQueue(.main))
+        refreshAppearanceLayers()
+    }
+
+    func refreshAppearanceLayers() {
+        layer?.backgroundColor = NSColor.resolvedCGColor(
+            .textBackgroundColor,
+            for: self
+        )
+        layer?.borderColor = NSColor.resolvedCGColor(
+            .separatorColor.withAlphaComponent(0.5),
+            for: self
+        )
     }
 }
 
@@ -543,10 +687,14 @@ private final class StatusTile: CardView {
     private let dot = NSView()
     private let titleLabel = NSTextField(labelWithString: "")
     private let messageLabel = NSTextField(labelWithString: "")
+    private var currentState: CheckState = .unknown
 
     init(title: String, symbol: String) {
         super.init(frame: .zero)
         translatesAutoresizingMaskIntoConstraints = false
+        identifier = NSUserInterfaceItemIdentifier(
+            "status-tile-\(title.lowercased().replacingOccurrences(of: " ", with: "-"))"
+        )
 
         let stack = NSStackView()
         stack.orientation = .vertical
@@ -574,11 +722,17 @@ private final class StatusTile: CardView {
         icon.heightAnchor.constraint(equalToConstant: 16).isActive = true
 
         dot.wantsLayer = true
+        dot.identifier = NSUserInterfaceItemIdentifier(
+            "status-dot-\(title.lowercased().replacingOccurrences(of: " ", with: "-"))"
+        )
         dot.layer?.cornerRadius = 4
         dot.widthAnchor.constraint(equalToConstant: 8).isActive = true
         dot.heightAnchor.constraint(equalToConstant: 8).isActive = true
 
         titleLabel.stringValue = title
+        titleLabel.identifier = NSUserInterfaceItemIdentifier(
+            "status-title-\(title.lowercased().replacingOccurrences(of: " ", with: "-"))"
+        )
         titleLabel.font = NSFont.systemFont(ofSize: 12, weight: .semibold)
         let spacer = NSView()
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
@@ -588,10 +742,14 @@ private final class StatusTile: CardView {
         row.addArrangedSubview(dot)
 
         messageLabel.font = NSFont.systemFont(ofSize: 10.5, weight: .regular)
+        messageLabel.identifier = NSUserInterfaceItemIdentifier(
+            "status-message-\(title.lowercased().replacingOccurrences(of: " ", with: "-"))"
+        )
         messageLabel.textColor = .secondaryLabelColor
         messageLabel.maximumNumberOfLines = 2
-        messageLabel.lineBreakMode = .byWordWrapping
+        messageLabel.lineBreakMode = .byTruncatingTail
         messageLabel.preferredMaxLayoutWidth = PopoverLayout.tileWidth - 20
+        messageLabel.heightAnchor.constraint(equalToConstant: 27).isActive = true
 
         stack.addArrangedSubview(row)
         stack.addArrangedSubview(messageLabel)
@@ -605,7 +763,16 @@ private final class StatusTile: CardView {
     func update(_ status: ComponentStatus) {
         messageLabel.stringValue = status.message
         messageLabel.toolTip = status.message
-        dot.layer?.backgroundColor = NSColor.statusColor(for: status.state).cgColor
+        currentState = status.state
+        refreshAppearanceLayers()
+    }
+
+    override func refreshAppearanceLayers() {
+        super.refreshAppearanceLayers()
+        dot.layer?.backgroundColor = NSColor.resolvedCGColor(
+            .statusColor(for: currentState),
+            for: dot
+        )
     }
 }
 
@@ -731,9 +898,12 @@ private final class ValueLabel: NSView {
     }
 }
 
-private final class PillLabel: NSTextField {
+private final class PillLabel: NSTextField, PopoverAppearanceRefreshing {
+    private var currentState: CheckState = .disabled
+
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
+        identifier = NSUserInterfaceItemIdentifier("status-pill")
         isEditable = false
         isSelectable = false
         isBordered = false
@@ -754,30 +924,47 @@ private final class PillLabel: NSTextField {
 
     func update(text: String, state: CheckState) {
         stringValue = text
-        if state == .disabled {
+        currentState = state
+        refreshAppearanceLayers()
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        dispatchPrecondition(condition: .onQueue(.main))
+        refreshAppearanceLayers()
+    }
+
+    func refreshAppearanceLayers() {
+        if currentState == .disabled {
             textColor = .labelColor
-            layer?.backgroundColor = NSColor.separatorColor.withAlphaComponent(0.24).cgColor
+            layer?.backgroundColor = NSColor.resolvedCGColor(
+                .separatorColor.withAlphaComponent(0.24),
+                for: self
+            )
             return
         }
 
-        let base = NSColor.statusColor(for: state)
+        let base = NSColor.statusColor(for: currentState)
         textColor = base
-        layer?.backgroundColor = base.withAlphaComponent(0.14).cgColor
+        layer?.backgroundColor = NSColor.resolvedCGColor(
+            base.withAlphaComponent(0.14),
+            for: self
+        )
     }
 }
 
-private final class SymbolBadgeView: NSView {
+private final class SymbolBadgeView: NSView, PopoverAppearanceRefreshing {
     private let imageView = NSImageView()
 
     init(symbol: String) {
         super.init(frame: .zero)
+        identifier = NSUserInterfaceItemIdentifier("gatebeam-symbol-badge")
         translatesAutoresizingMaskIntoConstraints = false
         wantsLayer = true
         layer?.cornerRadius = 8
         layer?.cornerCurve = .continuous
-        layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor
-        layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.35).cgColor
         layer?.borderWidth = 1
+        refreshAppearanceLayers()
 
         imageView.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
         imageView.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 15, weight: .semibold)
@@ -796,9 +983,52 @@ private final class SymbolBadgeView: NSView {
     required init?(coder: NSCoder) {
         nil
     }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        dispatchPrecondition(condition: .onQueue(.main))
+        refreshAppearanceLayers()
+    }
+
+    func refreshAppearanceLayers() {
+        layer?.backgroundColor = NSColor.resolvedCGColor(
+            .controlBackgroundColor,
+            for: self
+        )
+        layer?.borderColor = NSColor.resolvedCGColor(
+            .separatorColor.withAlphaComponent(0.35),
+            for: self
+        )
+    }
+}
+
+private protocol PopoverAppearanceRefreshing: AnyObject {
+    func refreshAppearanceLayers()
+}
+
+private final class PopoverAppearanceTrackingView: NSVisualEffectView {
+    var onEffectiveAppearanceChanged: (() -> Void)?
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        dispatchPrecondition(condition: .onQueue(.main))
+        onEffectiveAppearanceChanged?()
+    }
+}
+
+private func popoverDescendants(of root: NSView) -> [NSView] {
+    root.subviews.flatMap { [$0] + popoverDescendants(of: $0) }
 }
 
 private extension NSColor {
+    static func resolvedCGColor(_ color: NSColor, for view: NSView) -> CGColor {
+        var resolved = color.cgColor
+        view.effectiveAppearance.performAsCurrentDrawingAppearance {
+            resolved = color.cgColor
+        }
+        return resolved
+    }
+
     static func statusColor(for state: CheckState) -> NSColor {
         switch state {
         case .ok: return .systemGreen
