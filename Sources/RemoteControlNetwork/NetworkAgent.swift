@@ -18,6 +18,16 @@ enum NetworkAgentError: Error, LocalizedError {
     }
 }
 
+private struct DDNSMappingProofValidationError: Error, LocalizedError {
+    let family: RouterMappingAddressFamily
+    let reason: String
+    let expired: Bool
+
+    var errorDescription: String? {
+        "\(family.displayName) mapping proof is no longer valid: \(reason)"
+    }
+}
+
 final class NetworkAgentScheduledTimer {
     private let lock = NSLock()
     private var cancelHandler: (() -> Void)?
@@ -240,8 +250,11 @@ final class NetworkAgent {
     )
     private let sideEffectsEnabled: Bool
     private let checkExecutionObserver: (() -> Void)?
+    private let checkCompletionObserver: (() -> Void)?
     private let sideEffectWillStartObserver: ((String) -> Void)?
     private let nowProvider: () -> Date
+    private let monotonicUptimeProvider: () -> TimeInterval
+    private let bootIdentifierProvider: () -> String
     private let performInitialCheckOnStart: Bool
     private let periodicTimerScheduler:
         ((TimeInterval, @escaping () -> Void) -> NetworkAgentScheduledTimer)?
@@ -249,7 +262,8 @@ final class NetworkAgent {
         (Date, @escaping () -> Void) -> NetworkAgentScheduledTimer
     private var timer: NetworkAgentScheduledTimer?
     private var expirationTimer: NetworkAgentScheduledTimer?
-    private var expirationRetryNotBefore: Date?
+    private var expirationRetryNotBeforeUptime: TimeInterval?
+    private var nextPeriodicCheckUptime: TimeInterval?
     private var isRunning = false
     private var cachedCloudflareToken: String?
     private var keychainReadFailure: Error?
@@ -298,6 +312,7 @@ final class NetworkAgent {
         initialConfig: AppConfig? = nil,
         sideEffectsEnabled: Bool = true,
         checkExecutionObserver: (() -> Void)? = nil,
+        checkCompletionObserver: (() -> Void)? = nil,
         sideEffectWillStartObserver: ((String) -> Void)? = nil,
         loginItemSetter: ((Bool) -> Result<Void, LaunchAgentManagerError>)? = nil,
         localNetworkService: LocalNetworkServicing = LocalNetworkService(),
@@ -306,6 +321,12 @@ final class NetworkAgent {
         emergencyMappingJournal: EmergencyMappingJournal? = nil,
         fallbackMappingJournal: EmergencyMappingJournal? = nil,
         nowProvider: @escaping () -> Date = Date.init,
+        monotonicUptimeProvider: @escaping () -> TimeInterval = {
+            ProcessInfo.processInfo.systemUptime
+        },
+        bootIdentifierProvider: @escaping () -> String = {
+            RouterMappingService.systemBootIdentifier
+        },
         performInitialCheckOnStart: Bool = true,
         periodicTimerScheduler:
             ((TimeInterval, @escaping () -> Void) -> NetworkAgentScheduledTimer)? = nil,
@@ -321,8 +342,11 @@ final class NetworkAgent {
         self.keychain = keychain
         self.sideEffectsEnabled = sideEffectsEnabled
         self.checkExecutionObserver = checkExecutionObserver
+        self.checkCompletionObserver = checkCompletionObserver
         self.sideEffectWillStartObserver = sideEffectWillStartObserver
         self.nowProvider = nowProvider
+        self.monotonicUptimeProvider = monotonicUptimeProvider
+        self.bootIdentifierProvider = bootIdentifierProvider
         self.performInitialCheckOnStart = performInitialCheckOnStart
         self.periodicTimerScheduler = periodicTimerScheduler
         self.expirationTimerScheduler = expirationTimerScheduler
@@ -403,6 +427,15 @@ final class NetworkAgent {
                 contentsOf: recoveryMappings.filter { !trackedIDs.contains($0.identifier) }
             )
         }
+        if initialConfig == nil {
+            Self.restoreRuntimeDeadlines(
+                config: &loadedConfig,
+                recoveryMappings: &recoveryMappings,
+                now: nowProvider(),
+                uptime: monotonicUptimeProvider(),
+                bootIdentifier: bootIdentifierProvider()
+            )
+        }
         self.storedConfig = loadedConfig
         self.mappingRecoveryMappings = recoveryMappings
         self.recoveryStateUnknown = loadedRecoveryStateUnknown
@@ -435,24 +468,70 @@ final class NetworkAgent {
         withState {
             isRunning = true
             restartTimerOnStateQueue()
-            restartExpirationTimerOnStateQueue()
+            if periodicTimerScheduler != nil {
+                restartExpirationTimerOnStateQueue()
+            }
         }
     }
 
     func stop() {
-        sideEffectGate.sync {
-            withState {
-                timer?.cancel()
-                timer = nil
-                expirationTimer?.cancel()
-                expirationTimer = nil
-                expirationRetryNotBefore = nil
-                isRunning = false
-                configRevision &+= 1
-                activeConfigMutationRevision = nil
-                checkPending = false
-                pendingCheckRetriesKeychain = false
+        routerMappingService.cancelCurrentOperations()
+        withState {
+            timer?.cancel()
+            timer = nil
+            expirationTimer?.cancel()
+            expirationTimer = nil
+            expirationRetryNotBeforeUptime = nil
+            nextPeriodicCheckUptime = nil
+            isRunning = false
+            configRevision &+= 1
+            activeConfigMutationRevision = nil
+            checkPending = false
+            pendingCheckRetriesKeychain = false
+        }
+    }
+
+    func stopAndWaitUntilIdle(
+        timeout: TimeInterval = 3
+    ) -> Bool {
+        stop()
+        let deadline = ProcessInfo.processInfo.systemUptime
+            + max(0.01, timeout)
+
+        // Two fence rounds catch work that was already running when the
+        // first round enqueued follow-up work on another agent queue.
+        for _ in 0..<2 {
+            let group = DispatchGroup()
+            let enqueueFence: (DispatchQueue) -> Void = { queue in
+                group.enter()
+                queue.async {
+                    group.leave()
+                }
             }
+            enqueueFence(workQueue)
+            enqueueFence(transactionQueue)
+            enqueueFence(keychainQueue)
+            enqueueFence(sideEffectGate)
+            enqueueFence(stateQueue)
+            group.enter()
+            keychainReadQueue.async(flags: .barrier) {
+                group.leave()
+            }
+
+            let remaining = deadline
+                - ProcessInfo.processInfo.systemUptime
+            guard remaining > 0,
+                  group.wait(
+                    timeout: .now() + remaining
+                  ) == .success else {
+                return false
+            }
+        }
+
+        return withState {
+            !checkInFlight
+                && activeConfigMutationRevision == nil
+                && !checkPending
         }
     }
 
@@ -753,14 +832,24 @@ final class NetworkAgent {
         next.remoteAccessEnabled = enabled
         if !enabled {
             next.accessExpiresAt = nil
+            next.accessExpiresUptime = nil
+            next.accessBootIdentifier = nil
+            next.accessAnchorWallTime = nil
+            next.accessRemainingAtAnchor = nil
         }
         saveConfig(next)
     }
 
     func setTemporaryAccess(minutes: Int) {
         var next = config
+        let duration = TimeInterval(minutes * 60)
+        let now = nowProvider()
         next.remoteAccessEnabled = true
-        next.accessExpiresAt = nowProvider().addingTimeInterval(TimeInterval(minutes * 60))
+        next.accessExpiresAt = now.addingTimeInterval(duration)
+        next.accessExpiresUptime = monotonicUptimeProvider() + duration
+        next.accessBootIdentifier = bootIdentifierProvider()
+        next.accessAnchorWallTime = now
+        next.accessRemainingAtAnchor = duration
         saveConfig(next)
     }
 
@@ -1093,6 +1182,100 @@ final class NetworkAgent {
         }
     }
 
+    private func persistCheckState(
+        _ config: AppConfig,
+        checkpointedMappingIDs: Set<String>,
+        revision: UInt64
+    ) throws -> UInt64 {
+        let retainedRecoveryMappings = withState {
+            mappingRecoveryMappings.filter {
+                !checkpointedMappingIDs.contains($0.identifier)
+            }
+        }
+        return try persistCheckState(
+            config,
+            recoveryMappings: retainedRecoveryMappings,
+            revision: revision
+        )
+    }
+
+    private func persistCheckState(
+        _ config: AppConfig,
+        recoveryMappings: [ActiveRouterMapping],
+        revision: UInt64
+    ) throws -> UInt64 {
+        try requireCurrentRevision(revision)
+        let retainedRecoveryMappings =
+            deduplicatedRouterMappings(recoveryMappings)
+        var committedRevision: UInt64?
+        try withTransaction {
+            try self.requireCurrentRevision(revision)
+            try self.configStore.save(config)
+            try self.requireCurrentRevision(revision)
+            var journalErrors: [String] = []
+            do {
+                try self.configStore.saveMappingRecoveryJournal(
+                    retainedRecoveryMappings
+                )
+            } catch {
+                journalErrors.append(
+                    "Primary journal: \(error.localizedDescription)"
+                )
+            }
+            do {
+                try self.emergencyMappingJournal.save(
+                    retainedRecoveryMappings
+                )
+            } catch {
+                journalErrors.append(
+                    "Emergency journal: \(error.localizedDescription)"
+                )
+            }
+            do {
+                try self.fallbackMappingJournal.save(
+                    retainedRecoveryMappings
+                )
+            } catch {
+                journalErrors.append(
+                    "Fallback journal: \(error.localizedDescription)"
+                )
+            }
+            guard journalErrors.isEmpty else {
+                throw NetworkAgentError.transactionFailed(
+                    journalErrors.joined(separator: "\n")
+                )
+            }
+            try self.requireCurrentRevision(revision)
+            let committed = self.withState {
+                guard self.configRevision == revision else {
+                    return false
+                }
+                self.mappingRecoveryMappings =
+                    retainedRecoveryMappings
+                self.configPersistenceErrorMessage = nil
+                self.commitConfigOnStateQueue(config)
+                committedRevision = self.configRevision
+                return true
+            }
+            guard committed else {
+                throw NetworkAgentError.superseded
+            }
+        }
+        guard let committedRevision else {
+            throw NetworkAgentError.superseded
+        }
+        return committedRevision
+    }
+
+    private func deduplicatedRouterMappings(
+        _ mappings: [ActiveRouterMapping]
+    ) -> [ActiveRouterMapping] {
+        var identifiers = Set<String>()
+        return mappings.filter {
+            identifiers.insert($0.identifier).inserted
+        }
+    }
+
     private static func unknownRecoveryStateMessage(detail: String) -> String {
         [
             "Router recovery state could not be verified. Gatebeam will not create a new mapping.",
@@ -1132,6 +1315,7 @@ final class NetworkAgent {
     ) {
         guard sideEffectsEnabled, isCurrentRevision(revision) else { return }
         checkExecutionObserver?()
+        defer { checkCompletionObserver?() }
 
         var next = AppStatus.initial
         next.settingsErrorMessage = withState { settingsErrorMessage }
@@ -1167,6 +1351,179 @@ final class NetworkAgent {
                 return
             }
         }
+
+        if !workingConfig.remoteAccessEnabled {
+            let cleanupMappings = deduplicatedRouterMappings(
+                recoveredMappings
+                    + workingConfig.activeRouterMappings
+            )
+            if !cleanupMappings.isEmpty {
+                do {
+                    try requireCurrentRevision(revision)
+                    try saveAllRecoveryJournals(cleanupMappings)
+                    withState {
+                        guard configRevision == revision else { return }
+                        mappingRecoveryMappings = cleanupMappings
+                        restartExpirationTimerOnStateQueue()
+                    }
+                    try requireCurrentRevision(revision)
+                    let report = try withCurrentCheckSideEffect(
+                        revision: revision,
+                        label: "router.recovery.delete"
+                    ) {
+                        routerMappingService.removeMappings(
+                            cleanupMappings
+                        )
+                    }
+                    let remainingMappings =
+                        deduplicatedRouterMappings(
+                            report.remainingMappings
+                        )
+                    workingConfig.activeRouterMappings =
+                        remainingMappings
+                    workingConfig.ipv6PinholeID =
+                        remainingMappings.first {
+                            $0.addressFamily == .ipv6
+                                && $0.transport == .upnp
+                        }?.pinholeID
+                    let expectedRevision = try persistCheckState(
+                        workingConfig,
+                        recoveryMappings: remainingMappings,
+                        revision: revision
+                    )
+
+                    guard report.allSucceeded,
+                          remainingMappings.isEmpty,
+                          workingConfig.activeRouterMappings.isEmpty else {
+                        let detail = [
+                            "Recovered router mappings still need cleanup.",
+                            report.failureDescription,
+                            "Gatebeam retained every unresolved identity in the main configuration and all recovery journals."
+                        ]
+                        .filter { !$0.isEmpty }
+                        .joined(separator: "\n")
+                        next.ddnsStatus = .disabled(
+                            "Waiting for router cleanup"
+                        )
+                        next.routerStatus = .failed(
+                            "Router cleanup failed",
+                            detail: detail
+                        )
+                        next.remoteDesktopStatus = .warning(
+                            "A router rule may still be open",
+                            detail: "Gatebeam will retry safe deletion or wait for its finite lease to expire."
+                        )
+                        next.externalReachabilityStatus = .disabled(
+                            "Waiting for router cleanup"
+                        )
+                        next.lastCheckedAt = nowProvider()
+                        withState {
+                            guard configRevision == expectedRevision else {
+                                return
+                            }
+                            routerMappingErrorMessage = detail
+                            next.settingsErrorMessage = settingsErrorMessage
+                            publishOnStateQueue(next)
+                        }
+                        return
+                    }
+
+                    next.ddnsStatus = .disabled(
+                        "Remote access is off"
+                    )
+                    next.routerStatus = .disabled(
+                        "Remote access is off"
+                    )
+                    next.remoteDesktopStatus = .disabled(
+                        "Remote access is off"
+                    )
+                    next.externalReachabilityStatus = .disabled(
+                        "Remote access is off"
+                    )
+                    next.lastCheckedAt = nowProvider()
+                    withState {
+                        guard configRevision == expectedRevision else {
+                            return
+                        }
+                        routerMappingErrorMessage = nil
+                        next.settingsErrorMessage = settingsErrorMessage
+                        publishOnStateQueue(next)
+                    }
+                    return
+                } catch {
+                    guard !isSuperseded(error) else { return }
+                    var retainedConfig = workingConfig
+                    retainedConfig.activeRouterMappings =
+                        cleanupMappings
+                    retainedConfig.ipv6PinholeID =
+                        cleanupMappings.first {
+                            $0.addressFamily == .ipv6
+                                && $0.transport == .upnp
+                        }?.pinholeID
+                    var retentionErrors: [String] = []
+                    do {
+                        try configStore.save(retainedConfig)
+                    } catch {
+                        retentionErrors.append(
+                            "Main configuration: "
+                                + error.localizedDescription
+                        )
+                    }
+                    do {
+                        try saveAllRecoveryJournals(
+                            cleanupMappings
+                        )
+                    } catch {
+                        retentionErrors.append(
+                            "Recovery journals: "
+                                + error.localizedDescription
+                        )
+                    }
+                    let detail = (
+                        [error.localizedDescription]
+                            + retentionErrors
+                            + [
+                                "Gatebeam retained the unresolved mapping identity and will retry cleanup."
+                            ]
+                    ).joined(separator: "\n")
+                    withState {
+                        guard configRevision == revision else { return }
+                        mappingRecoveryMappings = cleanupMappings
+                        configPersistenceErrorMessage =
+                            retentionErrors.isEmpty
+                                ? nil
+                                : retentionErrors.joined(
+                                    separator: "\n"
+                                )
+                        routerMappingErrorMessage = detail
+                        commitConfigOnStateQueue(retainedConfig)
+                        let expectedRevision = configRevision
+                        next.ddnsStatus = .disabled(
+                            "Waiting for router cleanup"
+                        )
+                        next.routerStatus = .failed(
+                            "Router cleanup could not be committed",
+                            detail: detail
+                        )
+                        next.remoteDesktopStatus = .warning(
+                            "A router rule may still be open",
+                            detail: "Gatebeam will retry safe deletion or wait for its finite lease to expire."
+                        )
+                        next.externalReachabilityStatus = .disabled(
+                            "Waiting for router cleanup"
+                        )
+                        next.lastCheckedAt = nowProvider()
+                        guard configRevision == expectedRevision else {
+                            return
+                        }
+                        next.settingsErrorMessage = settingsErrorMessage
+                        publishOnStateQueue(next)
+                    }
+                    return
+                }
+            }
+        }
+
         if !recoveredMappings.isEmpty {
             do {
                 let report = try withCurrentCheckSideEffect(
@@ -1234,7 +1591,9 @@ final class NetworkAgent {
             }
         }
 
-        if let expiresAt = workingConfig.accessExpiresAt, expiresAt <= nowProvider() {
+        if workingConfig.accessExpiresAt != nil,
+           let expiresUptime = accessExpiryUptime(workingConfig),
+           expiresUptime <= monotonicUptimeProvider() {
             do {
                 workingConfig = try withTransaction {
                     try self.requireCurrentRevision(revision)
@@ -1245,6 +1604,10 @@ final class NetworkAgent {
                 }
                 workingConfig.remoteAccessEnabled = false
                 workingConfig.accessExpiresAt = nil
+                workingConfig.accessExpiresUptime = nil
+                workingConfig.accessBootIdentifier = nil
+                workingConfig.accessAnchorWallTime = nil
+                workingConfig.accessRemainingAtAnchor = nil
                 configChanged = true
             } catch {
                 next.ddnsStatus = .disabled("Temporary access expired")
@@ -1275,6 +1638,83 @@ final class NetworkAgent {
             configChanged = true
         }
 
+        if !workingConfig.remoteAccessEnabled {
+            var expectedRevision = revision
+            if configChanged {
+                do {
+                    expectedRevision = try persistCheckState(
+                        workingConfig,
+                        checkpointedMappingIDs: [],
+                        revision: revision
+                    )
+                } catch {
+                    guard !isSuperseded(error) else { return }
+                    let remainingRecoveryMappings = withState {
+                        mappingRecoveryMappings
+                    }
+                    var persistenceErrors = [error.localizedDescription]
+                    do {
+                        try configStore.save(initialConfig)
+                    } catch {
+                        persistenceErrors.append(
+                            "Fallback config: \(error.localizedDescription)"
+                        )
+                    }
+                    do {
+                        try saveAllRecoveryJournals(
+                            remainingRecoveryMappings
+                        )
+                    } catch {
+                        persistenceErrors.append(
+                            "Fallback recovery journals: "
+                                + error.localizedDescription
+                        )
+                    }
+                    let detail = persistenceErrors.joined(separator: "\n")
+                    withState {
+                        guard configRevision == revision else { return }
+                        configPersistenceErrorMessage = detail
+                        commitConfigOnStateQueue(initialConfig)
+                        expectedRevision = configRevision
+                    }
+                    next.ddnsStatus = .disabled(
+                        "DDNS skipped because closed state was not committed"
+                    )
+                    next.routerStatus = .failed(
+                        "Closed router state was not committed",
+                        detail: detail
+                    )
+                    next.remoteDesktopStatus = .disabled(
+                        "Remote access check stopped"
+                    )
+                    next.externalReachabilityStatus = .disabled(
+                        "Remote access check stopped"
+                    )
+                    next.lastCheckedAt = nowProvider()
+                    withState {
+                        guard configRevision == expectedRevision else {
+                            return
+                        }
+                        next.settingsErrorMessage = settingsErrorMessage
+                        publishOnStateQueue(next)
+                    }
+                    return
+                }
+            }
+
+            next.ddnsStatus = .disabled("Remote access is off")
+            next.routerStatus = .disabled("Remote access is off")
+            next.remoteDesktopStatus = .disabled("Remote access is off")
+            next.externalReachabilityStatus = .disabled("Remote access is off")
+            next.lastCheckedAt = nowProvider()
+            withState {
+                guard configRevision == expectedRevision else { return }
+                next.settingsErrorMessage = settingsErrorMessage
+                publishOnStateQueue(next)
+            }
+            return
+        }
+
         let localIPv4 = localNetworkService.localIPv4Address()
         let gatewayIPv4 = localNetworkService.defaultGatewayIPv4()
         let localIPv6 = localNetworkService.globalIPv6Address()
@@ -1297,66 +1737,9 @@ final class NetworkAgent {
             )
         }
 
-        var ddnsIPv4: String?
-        var ipv4Issue: String?
-        if workingConfig.preferredAddressFamily.usesIPv4 {
+        var mappingOutcome: RouterMappingOutcome?
+        if workingConfig.remoteAccessEnabled {
             do {
-                let discovery = try currentPublicIPv4(
-                    config: workingConfig,
-                    gatewayAddress: gatewayIPv4,
-                    revision: revision
-                )
-                next.publicAddress = discovery.publicAddress
-                if let routerAddress = discovery.routerWANAddress,
-                   discovery.blocksDDNS {
-                    ipv4Issue = "Router WAN address \(routerAddress) is not publicly routable. Internet-facing address: \(discovery.publicAddress)."
-                } else {
-                    ddnsIPv4 = discovery.publicAddress
-                }
-            } catch {
-                if isSuperseded(error) { return }
-                ipv4Issue = error.localizedDescription
-            }
-        }
-
-        var ddnsIPv6: String?
-        var ipv6Issue: String?
-        if workingConfig.preferredAddressFamily.usesIPv6 {
-            if let localIPv6 {
-                ddnsIPv6 = localIPv6
-                let probedIPv6 = try? withCurrentCheckSideEffect(
-                    revision: revision,
-                    label: "public-ip.ipv6"
-                ) {
-                    try makePublicIPService(config: workingConfig).currentIPv6()
-                }
-                if let internetIPv6 = probedIPv6 {
-                    next.publicIPv6Address = internetIPv6
-                    if PublicIPService.normalizedIPv6(internetIPv6) != PublicIPService.normalizedIPv6(localIPv6) {
-                        ipv6Issue = "The internet IPv6 path differs from this Mac's physical global IPv6; using \(localIPv6) for direct access."
-                    }
-                } else {
-                    next.publicIPv6Address = localIPv6
-                }
-            } else {
-                ipv6Issue = "No global IPv6 address was found on a physical network interface."
-            }
-        }
-
-        if !workingConfig.remoteAccessEnabled {
-            next.ddnsStatus = .disabled("Remote access is off")
-            next.routerStatus = .disabled("Remote access is off")
-        } else {
-            do {
-                next.ddnsStatus = try updateDDNS(
-                    config: workingConfig,
-                    tokenResult: tokenResult,
-                    ipv4Address: ddnsIPv4,
-                    ipv6Address: ddnsIPv6,
-                    ipv4Issue: ipv4Issue,
-                    ipv6Issue: ipv6Issue,
-                    revision: revision
-                )
                 let mapping = try ensureRouterMappings(
                     config: workingConfig,
                     localIPv4: localIPv4,
@@ -1369,6 +1752,9 @@ final class NetworkAgent {
                 uncheckpointedMappings = mapping.activeMappings.filter {
                     !initialConfig.activeRouterMappings.contains($0)
                 }
+                next.routerStatus = mapping.status
+                if let port = mapping.ipv4Port { next.externalPort = port }
+                next.ipv6ExternalPort = mapping.ipv6Port
                 if !uncheckpointedMappings.isEmpty {
                     try configStore.saveMappingRecoveryJournal(uncheckpointedMappings)
                     withState {
@@ -1376,17 +1762,15 @@ final class NetworkAgent {
                         restartExpirationTimerOnStateQueue()
                     }
                 }
-            next.routerStatus = mapping.status
-            if let port = mapping.ipv4Port { next.externalPort = port }
-            next.ipv6ExternalPort = mapping.ipv6Port
-            if mapping.pinholeID != workingConfig.ipv6PinholeID {
-                workingConfig.ipv6PinholeID = mapping.pinholeID
-                configChanged = true
-            }
-            if mapping.activeMappings != workingConfig.activeRouterMappings {
-                workingConfig.activeRouterMappings = mapping.activeMappings
-                configChanged = true
-            }
+                mappingOutcome = mapping
+                if mapping.pinholeID != workingConfig.ipv6PinholeID {
+                    workingConfig.ipv6PinholeID = mapping.pinholeID
+                    configChanged = true
+                }
+                if mapping.activeMappings != workingConfig.activeRouterMappings {
+                    workingConfig.activeRouterMappings = mapping.activeMappings
+                    configChanged = true
+                }
             } catch {
                 guard !isSuperseded(error) else {
                     compensateUncheckpointedMappings(
@@ -1409,51 +1793,45 @@ final class NetworkAgent {
                     workingConfig.activeRouterMappings = fallback.activeRouterMappings
                     configChanged = true
                 }
-                next.routerStatus = .failed("Router access failed", detail: error.localizedDescription)
+                let retainedDetail = withState {
+                    routerMappingErrorMessage
+                }
+                next.routerStatus = .failed(
+                    "Router access failed",
+                    detail: [
+                        Optional(next.routerStatus.detail),
+                        retainedDetail,
+                        Optional(error.localizedDescription)
+                    ]
+                    .compactMap { $0 }
+                    .filter { !$0.isEmpty }
+                    .reduce(into: [String]()) { values, value in
+                        if !values.contains(value) {
+                            values.append(value)
+                        }
+                    }
+                    .joined(separator: "\n")
+                )
             }
+        } else {
+            next.routerStatus = .disabled("Remote access is off")
         }
-
-        buildConnectionURLs(config: workingConfig, status: &next)
-        next.externalReachabilityStatus = verifyLocalOriginTCPConnection(config: workingConfig, status: next)
-        next.lastCheckedAt = Date()
 
         var expectedRevision = revision
         if configChanged {
             do {
-                try requireCurrentRevision(revision)
-                try withTransaction {
-                    try self.requireCurrentRevision(revision)
-                    try self.configStore.save(workingConfig)
-                    try self.requireCurrentRevision(revision)
-                    var journalErrors: [String] = []
-                    do {
-                        try self.configStore.saveMappingRecoveryJournal([])
-                    } catch {
-                        journalErrors.append("Primary journal: \(error.localizedDescription)")
-                    }
-                    do {
-                        try self.emergencyMappingJournal.save([])
-                    } catch {
-                        journalErrors.append("Emergency journal: \(error.localizedDescription)")
-                    }
-                    do {
-                        try self.fallbackMappingJournal.save([])
-                    } catch {
-                        journalErrors.append("Fallback journal: \(error.localizedDescription)")
-                    }
-                    guard journalErrors.isEmpty else {
-                        throw NetworkAgentError.transactionFailed(
-                            journalErrors.joined(separator: "\n")
-                        )
-                    }
-                    self.withState {
-                        guard self.configRevision == revision else { return }
-                        self.mappingRecoveryMappings = []
-                        self.configPersistenceErrorMessage = nil
-                        self.commitConfigOnStateQueue(workingConfig)
-                        expectedRevision = self.configRevision
-                    }
-                }
+                let checkpointedMappingIDs = Set(
+                    mappingOutcome?.currentCheckProofs.compactMap {
+                        $0.hasVerifiedMappingEvidence
+                            ? $0.identity.mappingIdentifier
+                            : nil
+                    } ?? []
+                )
+                expectedRevision = try persistCheckState(
+                    workingConfig,
+                    checkpointedMappingIDs: checkpointedMappingIDs,
+                    revision: revision
+                )
             } catch {
                 if isSuperseded(error) {
                     compensateUncheckpointedMappings(
@@ -1470,16 +1848,223 @@ final class NetworkAgent {
                     initialConfig: initialConfig,
                     underlyingError: error
                 )
+                var fallbackPersistenceErrors: [String] = []
+                do {
+                    try configStore.save(fallback)
+                } catch {
+                    fallbackPersistenceErrors.append(
+                        "Compensated config: \(error.localizedDescription)"
+                    )
+                }
+                let remainingRecoveryMappings = withState {
+                    mappingRecoveryMappings
+                }
+                do {
+                    try saveAllRecoveryJournals(
+                        remainingRecoveryMappings
+                    )
+                } catch {
+                    fallbackPersistenceErrors.append(
+                        "Compensated recovery journals: "
+                            + error.localizedDescription
+                    )
+                }
+                let persistenceDetail = (
+                    [error.localizedDescription]
+                        + fallbackPersistenceErrors
+                ).joined(separator: "\n")
+                let recoveryDetail = withState {
+                    routerMappingErrorMessage
+                }
+                let routerFailureDetail = [
+                    Optional(next.routerStatus.detail),
+                    recoveryDetail,
+                    Optional(persistenceDetail)
+                ]
+                .compactMap { $0 }
+                .filter { !$0.isEmpty }
+                .reduce(into: [String]()) { values, value in
+                    if !values.contains(value) {
+                        values.append(value)
+                    }
+                }
+                .joined(separator: "\n")
                 withState {
                     guard configRevision == revision else { return }
-                    configPersistenceErrorMessage = error.localizedDescription
+                    configPersistenceErrorMessage = persistenceDetail
                     commitConfigOnStateQueue(fallback)
                     expectedRevision = configRevision
                     next.settingsErrorMessage = settingsErrorMessage
                     publishCurrentSettingsErrorOnStateQueue()
                 }
+                next.routerStatus = .failed(
+                    "Router state was not committed",
+                    detail: routerFailureDetail
+                )
+                next.ddnsStatus = .failed(
+                    "DDNS skipped because router state was not committed",
+                    detail: "No Cloudflare request was sent."
+                )
+                buildConnectionURLs(
+                    config: fallback,
+                    status: &next
+                )
+                next.externalReachabilityStatus =
+                    verifyLocalOriginTCPConnection(
+                        config: fallback,
+                        status: next
+                    )
+                next.lastCheckedAt = Date()
+                withState {
+                    guard configRevision == expectedRevision else {
+                        return
+                    }
+                    next.settingsErrorMessage = settingsErrorMessage
+                    publishOnStateQueue(next)
+                }
+                return
             }
         }
+        mappingOutcome = mappingOutcome?.checkpointed(
+            generation: expectedRevision
+        )
+
+        var ddnsIPv4: String?
+        var ddnsIPv4Proof: RouterMappingCurrentCheckProof?
+        var ipv4Issue: String?
+        if workingConfig.preferredAddressFamily.usesIPv4 {
+            let mappingRequired =
+                workingConfig.mappingProtocolPreference != .disabled
+            if mappingRequired,
+               let proof = mappingOutcome?.verifiedProof(for: .ipv4) {
+                ddnsIPv4Proof = proof
+                next.publicAddress = proof.boundWANAddress
+                if PublicIPService.isPublicIPv4(
+                    proof.boundWANAddress
+                ) {
+                    ddnsIPv4 = proof.boundWANAddress
+                } else {
+                    let internetAddress = try? withCurrentCheckSideEffect(
+                        revision: expectedRevision,
+                        label: "public-ip.ipv4"
+                    ) {
+                        try makePublicIPService(
+                            config: workingConfig
+                        ).currentIPv4()
+                    }
+                    next.publicAddress =
+                        internetAddress ?? proof.boundWANAddress
+                    ipv4Issue =
+                        "\(proof.transport.displayName) mapping is bound to "
+                        + "non-public router WAN address "
+                        + "\(proof.boundWANAddress)."
+                }
+            } else if mappingRequired {
+                next.publicAddress = try? withCurrentCheckSideEffect(
+                    revision: expectedRevision,
+                    label: "public-ip.ipv4"
+                ) {
+                    try makePublicIPService(
+                        config: workingConfig
+                    ).currentIPv4()
+                }
+                ipv4Issue =
+                    "No checkpointed IPv4 mapping proof was verified "
+                    + "during this check; the A record was not updated."
+            } else {
+                do {
+                    let address = try withCurrentCheckSideEffect(
+                        revision: expectedRevision,
+                        label: "public-ip.ipv4"
+                    ) {
+                        try makePublicIPService(
+                            config: workingConfig
+                        ).currentIPv4()
+                    }
+                    next.publicAddress = address
+                    ddnsIPv4 = address
+                } catch {
+                    if isSuperseded(error) { return }
+                    ipv4Issue = error.localizedDescription
+                }
+            }
+        }
+
+        var ddnsIPv6: String?
+        var ddnsIPv6Proof: RouterMappingCurrentCheckProof?
+        var ipv6Issue: String?
+        if workingConfig.preferredAddressFamily.usesIPv6 {
+            let mappingRequired =
+                workingConfig.mappingProtocolPreference != .disabled
+            if mappingRequired,
+               let proof = mappingOutcome?.verifiedProof(for: .ipv6),
+               PublicIPService.isGlobalIPv6(
+                   proof.boundWANAddress
+               ) {
+                ddnsIPv6Proof = proof
+                ddnsIPv6 = proof.boundWANAddress
+                next.publicIPv6Address = proof.boundWANAddress
+            } else if mappingRequired {
+                next.publicIPv6Address = try? withCurrentCheckSideEffect(
+                    revision: expectedRevision,
+                    label: "public-ip.ipv6"
+                ) {
+                    try makePublicIPService(
+                        config: workingConfig
+                    ).currentIPv6()
+                }
+                ipv6Issue =
+                    "No checkpointed IPv6 mapping proof was verified "
+                    + "during this check; the AAAA record was not updated."
+            } else if let localIPv6 {
+                ddnsIPv6 = localIPv6
+                let probedIPv6 = try? withCurrentCheckSideEffect(
+                    revision: expectedRevision,
+                    label: "public-ip.ipv6"
+                ) {
+                    try makePublicIPService(config: workingConfig).currentIPv6()
+                }
+                if let internetIPv6 = probedIPv6 {
+                    next.publicIPv6Address = internetIPv6
+                    if PublicIPService.normalizedIPv6(internetIPv6) != PublicIPService.normalizedIPv6(localIPv6) {
+                        ipv6Issue = "The internet IPv6 path differs from this Mac's physical global IPv6; using \(localIPv6) for direct access."
+                    }
+                } else {
+                    next.publicIPv6Address = localIPv6
+                }
+            } else {
+                ipv6Issue = "No global IPv6 address was found on a physical network interface."
+            }
+        }
+
+        if !workingConfig.remoteAccessEnabled {
+            next.ddnsStatus = .disabled("Remote access is off")
+        } else {
+            do {
+                next.ddnsStatus = try updateDDNS(
+                    config: workingConfig,
+                    tokenResult: tokenResult,
+                    ipv4Address: ddnsIPv4,
+                    ipv6Address: ddnsIPv6,
+                    ipv4Proof: ddnsIPv4Proof,
+                    ipv6Proof: ddnsIPv6Proof,
+                    ipv4Issue: ipv4Issue,
+                    ipv6Issue: ipv6Issue,
+                    revision: expectedRevision
+                )
+            } catch {
+                guard !isSuperseded(error) else { return }
+                next.ddnsStatus = .failed(
+                    "DDNS update failed",
+                    detail: error.localizedDescription
+                )
+            }
+        }
+
+        buildConnectionURLs(config: workingConfig, status: &next)
+        next.externalReachabilityStatus = verifyLocalOriginTCPConnection(config: workingConfig, status: next)
+        next.lastCheckedAt = Date()
+
         withState {
             guard configRevision == expectedRevision else { return }
             next.settingsErrorMessage = settingsErrorMessage
@@ -1492,6 +2077,8 @@ final class NetworkAgent {
         tokenResult: Result<String, Error>,
         ipv4Address: String?,
         ipv6Address: String?,
+        ipv4Proof: RouterMappingCurrentCheckProof?,
+        ipv6Proof: RouterMappingCurrentCheckProof?,
         ipv4Issue: String?,
         ipv6Issue: String?,
         revision: UInt64
@@ -1529,7 +2116,16 @@ final class NetworkAgent {
                 do {
                     let result = try withCurrentCheckSideEffect(
                         revision: revision,
-                        label: "cloudflare.upsert-a"
+                        label: "cloudflare.upsert-a",
+                        preflight: {
+                            try self.validateDDNSMappingProof(
+                                ipv4Proof,
+                                family: .ipv4,
+                                address: ipv4Address,
+                                config: config,
+                                generation: revision
+                            )
+                        }
                     ) {
                         try dnsProvider.upsertARecord(
                             zoneID: config.cloudflareZoneID,
@@ -1541,6 +2137,12 @@ final class NetworkAgent {
                     successes.append(result.message)
                 } catch {
                     if isSuperseded(error) { throw error }
+                    if (error as? DDNSMappingProofValidationError)?
+                        .expired == true {
+                        withState {
+                            restartExpirationTimerOnStateQueue()
+                        }
+                    }
                     failures.append("A: \(error.localizedDescription)")
                 }
             } else {
@@ -1552,7 +2154,16 @@ final class NetworkAgent {
                 do {
                     let result = try withCurrentCheckSideEffect(
                         revision: revision,
-                        label: "cloudflare.upsert-aaaa"
+                        label: "cloudflare.upsert-aaaa",
+                        preflight: {
+                            try self.validateDDNSMappingProof(
+                                ipv6Proof,
+                                family: .ipv6,
+                                address: ipv6Address,
+                                config: config,
+                                generation: revision
+                            )
+                        }
                     ) {
                         try dnsProvider.upsertAAAARecord(
                             zoneID: config.cloudflareZoneID,
@@ -1565,6 +2176,12 @@ final class NetworkAgent {
                     if let ipv6Issue { notes.append("IPv6 note: \(ipv6Issue)") }
                 } catch {
                     if isSuperseded(error) { throw error }
+                    if (error as? DDNSMappingProofValidationError)?
+                        .expired == true {
+                        withState {
+                            restartExpirationTimerOnStateQueue()
+                        }
+                    }
                     failures.append("AAAA: \(error.localizedDescription)")
                 }
             } else {
@@ -1583,26 +2200,95 @@ final class NetworkAgent {
         return .ok("Cloudflare \(family) record is current", detail: detail)
     }
 
+    private func validateDDNSMappingProof(
+        _ proof: RouterMappingCurrentCheckProof?,
+        family: RouterMappingAddressFamily,
+        address: String,
+        config: AppConfig,
+        generation: UInt64
+    ) throws {
+        guard config.mappingProtocolPreference != .disabled else {
+            return
+        }
+        guard let proof else {
+            throw DDNSMappingProofValidationError(
+                family: family,
+                reason: "this check has no protocol-bound proof",
+                expired: false
+            )
+        }
+        guard proof.family == family,
+              proof.boundWANAddress == address,
+              proof.hasVerifiedMappingEvidence,
+              proof.checkpointed,
+              proof.checkpointGeneration == generation,
+              config.activeRouterMappings.contains(where: {
+                  $0.identifier == proof.identity.mappingIdentifier
+              }) else {
+            throw DDNSMappingProofValidationError(
+                family: family,
+                reason:
+                    "the mapping identity, WAN evidence, or durable "
+                    + "checkpoint generation changed",
+                expired: false
+            )
+        }
+        let currentUptime = monotonicUptimeProvider()
+        guard currentUptime < proof.sideEffectDeadlineUptime else {
+            throw DDNSMappingProofValidationError(
+                family: family,
+                reason:
+                    "its monotonic lease safety deadline "
+                    + "\(proof.sideEffectDeadlineUptime) has passed "
+                    + "at \(currentUptime); renewal or recovery is required",
+                expired: true
+            )
+        }
+    }
+
     func currentPublicIPv4(
         config: AppConfig,
         gatewayAddress: String?,
-        revision: UInt64
+        revision: UInt64,
+        verifiedRouterWANAddress: String? = nil
     ) throws -> PublicIPv4Discovery {
-        var routerWANAddress: String?
-        if let gatewayAddress {
+        var routerWANAddress = verifiedRouterWANAddress.flatMap {
+            PublicIPService.looksLikeIPv4($0) ? $0 : nil
+        }
+        var routerWANVerified = routerWANAddress != nil
+        if let routerWANAddress,
+           PublicIPService.isPublicIPv4(routerWANAddress) {
+            return PublicIPv4Discovery(
+                publicAddress: routerWANAddress,
+                routerWANAddress: routerWANAddress,
+                routerWANVerified: true,
+                blocksDDNS: false
+            )
+        }
+        if !routerWANVerified, let gatewayAddress {
             do {
                 let routerAddress = try withCurrentCheckSideEffect(
                     revision: revision,
                     label: "router.wan-ipv4"
                 ) {
-                    try routerMappingService.externalIPv4Address(gatewayAddress: gatewayAddress)
+                    if config.mappingProtocolPreference == .automatic {
+                        return try routerMappingService
+                            .externalIPv4AddressForAutomaticMapping(
+                                gatewayAddress: gatewayAddress
+                            )
+                    }
+                    return try routerMappingService.externalIPv4Address(
+                        gatewayAddress: gatewayAddress
+                    )
                 }
                 if PublicIPService.looksLikeIPv4(routerAddress) {
                     routerWANAddress = routerAddress
+                    routerWANVerified = true
                     if PublicIPService.isPublicIPv4(routerAddress) {
                         return PublicIPv4Discovery(
                             publicAddress: routerAddress,
                             routerWANAddress: routerAddress,
+                            routerWANVerified: true,
                             blocksDDNS: false
                         )
                     }
@@ -1620,7 +2306,18 @@ final class NetworkAgent {
         return PublicIPv4Discovery(
             publicAddress: probedAddress,
             routerWANAddress: routerWANAddress,
-            blocksDDNS: routerWANAddress.map { !PublicIPService.isPublicIPv4($0) } ?? false
+            routerWANVerified: routerWANVerified,
+            blocksDDNS:
+                config.mappingProtocolPreference == .automatic
+                    ? (
+                        !routerWANVerified
+                            || routerWANAddress.map {
+                                !PublicIPService.isPublicIPv4($0)
+                            } ?? true
+                    )
+                    : routerWANAddress.map {
+                        !PublicIPService.isPublicIPv4($0)
+                    } ?? false
         )
     }
 
@@ -1684,8 +2381,61 @@ final class NetworkAgent {
         var failures: [String] = []
         var ipv4Port: UInt16?
         var ipv6Port: UInt16?
+        var currentCheckProofs: [RouterMappingCurrentCheckProof] = []
         var activeMappings = config.activeRouterMappings
         let now = nowProvider()
+        let nowUptime = monotonicUptimeProvider()
+        let clockContinuityMappings = activeMappings.filter {
+            $0.recoveryState == .wallClockRollback
+                || $0.recoveryState == .clockContinuityUnverified
+        }
+        let epochCandidates = activeMappings.filter {
+            $0.recoveryState != .wallClockRollback
+                && $0.recoveryState != .clockContinuityUnverified
+        }
+
+        let epochReport = try withCurrentCheckSideEffect(
+            revision: revision,
+            label: "router.mapping.epoch-health"
+        ) {
+            try routerMappingService.verifyMappingsForCurrentCheck(
+                epochCandidates
+            )
+        }
+        activeMappings = epochReport.refreshedMappings
+            + clockContinuityMappings
+        let addressInvalidations = epochReport.invalidations.compactMap {
+            invalidation -> ActiveRouterMapping? in
+            guard case .effectiveClientAddressChanged(let replacement) =
+                    invalidation.reason else {
+                return nil
+            }
+            var orphan = invalidation.mapping
+            orphan.recoveryState = .effectiveClientAddressChanged
+            orphan.replacementLocalAddress = replacement
+            return orphan
+        }
+        activeMappings.append(contentsOf: addressInvalidations)
+        let stateLossInvalidations = epochReport.invalidations.filter {
+            if case .routerStateLost = $0.reason { return true }
+            return false
+        }
+        if !stateLossInvalidations.isEmpty {
+            let protocols = Set(
+                stateLossInvalidations.map {
+                    $0.mapping.transport.displayName
+                }
+            ).sorted().joined(separator: ", ")
+            successes.append(
+                "\(protocols) router restart or state loss detected; rebuilding mappings now"
+            )
+        }
+        if !epochReport.errors.isEmpty {
+            failures.append(
+                "Router Epoch health check: "
+                    + epochReport.errors.joined(separator: "\n")
+            )
+        }
 
         func removeTrackedMappings(
             _ mappings: [ActiveRouterMapping],
@@ -1733,6 +2483,74 @@ final class NetworkAgent {
             }
         }
 
+        var replacementBlockedFamilies: Set<RouterMappingAddressFamily> = []
+        for rollbackMapping in clockContinuityMappings {
+            let report = try withCurrentCheckSideEffect(
+                revision: revision,
+                label: "router.mapping.clock-rollback-cleanup"
+            ) {
+                routerMappingService.removeMappings([rollbackMapping])
+            }
+            if report.allSucceeded {
+                activeMappings.removeAll {
+                    $0.identifier == rollbackMapping.identifier
+                }
+                successes.append(
+                    "\(rollbackMapping.addressFamily.displayName): "
+                        + "removed the pre-rollback "
+                        + "\(rollbackMapping.transport.displayName) mapping"
+                )
+            } else {
+                replacementBlockedFamilies.insert(
+                    rollbackMapping.addressFamily
+                )
+                failures.append(
+                    "\(rollbackMapping.addressFamily.displayName): wall clock "
+                        + "rollback made the persisted lease unsafe; replacement "
+                        + "is blocked until cleanup is confirmed. "
+                        + report.failureDescription
+                )
+            }
+        }
+        for orphan in addressInvalidations {
+            if mappingHasExpired(orphan, atUptime: nowUptime) {
+                activeMappings.removeAll {
+                    $0.identifier == orphan.identifier
+                }
+                successes.append(
+                    "\(orphan.addressFamily.displayName): old "
+                        + "\(orphan.transport.displayName) lease for "
+                        + "\(orphan.localAddress) expired; replacement may proceed"
+                )
+                continue
+            }
+            let report = try withCurrentCheckSideEffect(
+                revision: revision,
+                label: "router.mapping.address-change-cleanup"
+            ) {
+                routerMappingService.removeMappings([orphan])
+            }
+            if report.allSucceeded {
+                activeMappings.removeAll {
+                    $0.identifier == orphan.identifier
+                }
+                successes.append(
+                    "\(orphan.addressFamily.displayName): confirmed deletion of "
+                        + "the old \(orphan.transport.displayName) identity "
+                        + "\(orphan.localAddress)"
+                )
+            } else {
+                replacementBlockedFamilies.insert(orphan.addressFamily)
+                failures.append(
+                    "\(orphan.addressFamily.displayName): effective address changed "
+                        + "from \(orphan.localAddress) to "
+                        + "\(orphan.replacementLocalAddress ?? "unknown"); "
+                        + "replacement is blocked until the old lease is deleted "
+                        + "or expires. \(report.failureDescription)"
+                )
+            }
+        }
+
         let undesiredMappings = activeMappings.filter {
             ($0.addressFamily == .ipv4 && !config.preferredAddressFamily.usesIPv4)
                 || ($0.addressFamily == .ipv6 && !config.preferredAddressFamily.usesIPv6)
@@ -1747,6 +2565,9 @@ final class NetworkAgent {
         ) throws {
             let familyName = family.displayName
             let tracked = activeMappings.filter { $0.addressFamily == family }
+            if replacementBlockedFamilies.contains(family) {
+                return
+            }
             guard let localAddress, let gatewayAddress else {
                 _ = try removeTrackedMappings(
                     tracked,
@@ -1780,9 +2601,33 @@ final class NetworkAgent {
             }
 
             if let compatible {
-                let remaining = max(0, Int(compatible.leaseExpiresAt.timeIntervalSince(now)))
-                if now < compatible.renewAfter || !config.autoRenewMapping {
-                    if now >= compatible.leaseExpiresAt {
+                let remaining = max(
+                    0,
+                    Int(
+                        mappingExpiryUptime(
+                            compatible,
+                            now: now,
+                            uptime: nowUptime
+                        ) - nowUptime
+                    )
+                )
+                if mappingHasExpired(compatible, atUptime: nowUptime),
+                   !config.autoRenewMapping {
+                    activeMappings.removeAll {
+                        $0.identifier == compatible.identifier
+                    }
+                    failures.append(
+                        "\(familyName): the \(compatible.transport.displayName) lease expired while Auto Renew was off"
+                    )
+                    return
+                }
+                if nowUptime < mappingRenewUptime(
+                    compatible,
+                    now: now,
+                    uptime: nowUptime
+                )
+                    || !config.autoRenewMapping {
+                    if mappingHasExpired(compatible, atUptime: nowUptime) {
                         failures.append(
                             "\(familyName): the \(compatible.transport.displayName) lease expired; turn on Auto Renew or save settings to create a new lease"
                         )
@@ -1796,6 +2641,13 @@ final class NetworkAgent {
                         } else {
                             ipv6Port = compatible.externalPort
                         }
+                        if let proof = epochReport
+                            .currentCheckProofs.first(where: {
+                                $0.identity.mappingIdentifier
+                                    == compatible.identifier
+                            }) {
+                            currentCheckProofs.append(proof)
+                        }
                     }
                     return
                 }
@@ -1806,23 +2658,37 @@ final class NetworkAgent {
                 renewalConfig.ipv6PinholeID = compatible.pinholeID
                 do {
                     let result = try executeEnsure(label: "router.mapping.renew") {
-                        try ensure(renewalConfig, localAddress, gatewayAddress)
+                        try routerMappingService.renewMapping(
+                            config: renewalConfig,
+                            mapping: compatible
+                        )
                     }
+                    let renewedMapping = result.activeMapping
                     activeMappings.removeAll { $0.identifier == compatible.identifier }
-                    activeMappings.append(result.activeMapping)
+                    activeMappings.append(renewedMapping)
                     successes.append("\(familyName): renewed \(result.message) via \(result.protocolName)")
                     if family == .ipv4 {
                         ipv4Port = result.externalPort
                     } else {
                         ipv6Port = result.externalPort
                     }
+                    currentCheckProofs.append(
+                        result.currentCheckProof
+                    )
                 } catch {
                     if isSuperseded(error) { throw error }
                     if let recovery = error as? RouterMappingRecoveryRequiredError {
                         retainRecoveryMapping(recovery)
-                        throw recovery
+                        failures.append(
+                            "\(familyName) renewal requires recovery: "
+                                + recovery.localizedDescription
+                        )
+                        return
                     }
-                    if now < compatible.leaseExpiresAt {
+                    if !mappingHasExpired(
+                        compatible,
+                        atUptime: monotonicUptimeProvider()
+                    ) {
                         successes.append(
                             "\(familyName): the existing \(compatible.transport.displayName) lease remains active for about \(remaining)s"
                         )
@@ -1841,18 +2707,26 @@ final class NetworkAgent {
                 let result = try executeEnsure(label: "router.mapping.create") {
                     try ensure(config, localAddress, gatewayAddress)
                 }
-                activeMappings.append(result.activeMapping)
+                let createdMapping = result.activeMapping
+                activeMappings.append(createdMapping)
                 successes.append("\(familyName): \(result.message) via \(result.protocolName)")
                 if family == .ipv4 {
                     ipv4Port = result.externalPort
                 } else {
                     ipv6Port = result.externalPort
                 }
+                currentCheckProofs.append(
+                    result.currentCheckProof
+                )
             } catch {
                 if isSuperseded(error) { throw error }
                 if let recovery = error as? RouterMappingRecoveryRequiredError {
                     retainRecoveryMapping(recovery)
-                    throw recovery
+                    failures.append(
+                        "\(familyName) mapping requires recovery: "
+                            + recovery.localizedDescription
+                    )
+                    return
                 }
                 failures.append("\(familyName): \(error.localizedDescription)")
             }
@@ -1911,7 +2785,8 @@ final class NetworkAgent {
             ipv4Port: ipv4Port,
             ipv6Port: ipv6Port,
             pinholeID: pinholeID,
-            activeMappings: activeMappings
+            activeMappings: activeMappings,
+            currentCheckProofs: currentCheckProofs
         )
     }
 
@@ -2234,9 +3109,19 @@ final class NetworkAgent {
         guard previous.remoteAccessEnabled || !previous.activeRouterMappings.isEmpty else {
             return false
         }
-        let temporaryDeadlineRequiresShorterLease = requested.accessExpiresAt.map { deadline in
+        let now = nowProvider()
+        let uptime = monotonicUptimeProvider()
+        let temporaryDeadlineRequiresShorterLease = accessExpiryUptime(
+            requested,
+            now: now,
+            uptime: uptime
+        ).map { deadline in
             previous.activeRouterMappings.contains {
-                $0.leaseExpiresAt > deadline
+                mappingExpiryUptime(
+                    $0,
+                    now: now,
+                    uptime: uptime
+                ) > deadline
             }
         } ?? false
         return !requested.remoteAccessEnabled
@@ -2431,7 +3316,8 @@ final class NetworkAgent {
     }
 
     private func beginConfigMutation() -> UInt64 {
-        sideEffectGate.sync {
+        routerMappingService.cancelCurrentOperations()
+        return sideEffectGate.sync {
             withState {
                 configRevision &+= 1
                 activeConfigMutationRevision = configRevision
@@ -2478,6 +3364,7 @@ final class NetworkAgent {
     private func withCurrentCheckSideEffect<T>(
         revision: UInt64,
         label: String,
+        preflight: () throws -> Void = {},
         _ body: () throws -> T
     ) throws -> T {
         try sideEffectGate.sync {
@@ -2486,6 +3373,7 @@ final class NetworkAgent {
                     throw NetworkAgentError.superseded
                 }
             }
+            try preflight()
             sideEffectWillStartObserver?(label)
             return try body()
         }
@@ -2612,6 +3500,14 @@ final class NetworkAgent {
     private func finishScheduledCheck() {
         let pendingRetry: Bool? = withState {
             checkInFlight = false
+            if periodicTimerScheduler == nil, isRunning {
+                nextPeriodicCheckUptime = monotonicUptimeProvider() + (
+                    AppConfig.normalizedCheckInterval(
+                        storedConfig.checkIntervalSeconds
+                    )
+                )
+                restartExpirationTimerOnStateQueue()
+            }
             guard checkPending else { return nil }
             let retry = pendingCheckRetriesKeychain
             checkPending = false
@@ -2633,27 +3529,145 @@ final class NetworkAgent {
     private func restartTimerOnStateQueue() {
         guard sideEffectsEnabled else { return }
         timer?.cancel()
+        timer = nil
         let interval = AppConfig.normalizedCheckInterval(storedConfig.checkIntervalSeconds)
         let handler: () -> Void = { [weak self] in
             guard let self else { return }
             self.scheduleCheck(retryKeychainAfterFailure: false)
         }
         if let periodicTimerScheduler {
+            nextPeriodicCheckUptime = nil
             timer = periodicTimerScheduler(interval, handler)
             return
         }
+        nextPeriodicCheckUptime = monotonicUptimeProvider() + interval
+        restartExpirationTimerOnStateQueue()
+    }
 
-        let source = DispatchSource.makeTimerSource(queue: stateQueue)
-        source.schedule(
-            deadline: .now() + interval,
-            repeating: interval
-        )
-        source.setEventHandler(handler: handler)
-        source.resume()
-        timer = NetworkAgentScheduledTimer {
-            source.setEventHandler {}
-            source.cancel()
+    private func mappingExpiryUptime(
+        _ mapping: ActiveRouterMapping,
+        now: Date? = nil,
+        uptime: TimeInterval? = nil
+    ) -> TimeInterval {
+        if mapping.leaseBootIdentifier == bootIdentifierProvider(),
+           let deadline = mapping.leaseExpiresUptime {
+            return deadline
         }
+        let currentNow = now ?? nowProvider()
+        let currentUptime = uptime ?? monotonicUptimeProvider()
+        return currentUptime
+            + max(0, mapping.leaseExpiresAt.timeIntervalSince(currentNow))
+    }
+
+    private func mappingRenewUptime(
+        _ mapping: ActiveRouterMapping,
+        now: Date? = nil,
+        uptime: TimeInterval? = nil
+    ) -> TimeInterval {
+        if mapping.leaseBootIdentifier == bootIdentifierProvider(),
+           let deadline = mapping.renewAfterUptime {
+            return deadline
+        }
+        let currentNow = now ?? nowProvider()
+        let currentUptime = uptime ?? monotonicUptimeProvider()
+        return currentUptime
+            + max(0, mapping.renewAfter.timeIntervalSince(currentNow))
+    }
+
+    private func accessExpiryUptime(
+        _ config: AppConfig,
+        now: Date? = nil,
+        uptime: TimeInterval? = nil
+    ) -> TimeInterval? {
+        guard let wallDeadline = config.accessExpiresAt else { return nil }
+        if config.accessBootIdentifier == bootIdentifierProvider(),
+           let deadline = config.accessExpiresUptime {
+            return deadline
+        }
+        let currentNow = now ?? nowProvider()
+        let currentUptime = uptime ?? monotonicUptimeProvider()
+        return currentUptime
+            + max(0, wallDeadline.timeIntervalSince(currentNow))
+    }
+
+    private func mappingHasExpired(
+        _ mapping: ActiveRouterMapping,
+        atUptime uptime: TimeInterval
+    ) -> Bool {
+        uptime >= mappingExpiryUptime(mapping)
+    }
+
+    private static func restoreRuntimeDeadlines(
+        config: inout AppConfig,
+        recoveryMappings: inout [ActiveRouterMapping],
+        now: Date,
+        uptime: TimeInterval,
+        bootIdentifier: String
+    ) {
+        func restore(_ mapping: ActiveRouterMapping) -> ActiveRouterMapping {
+            if mapping.leaseBootIdentifier == bootIdentifier,
+               mapping.leaseExpiresUptime != nil,
+               mapping.renewAfterUptime != nil {
+                return mapping
+            }
+            var restored = mapping
+            let recoveryWait = min(
+                86_400,
+                max(
+                    0,
+                    mapping.leaseRemainingAtAnchor ?? 86_400
+                )
+            )
+            restored.leaseExpiresUptime = uptime
+            restored.renewAfterUptime = uptime
+            restored.leaseBootIdentifier = bootIdentifier
+            restored.leaseAnchorWallTime = now
+            restored.leaseRemainingAtAnchor = recoveryWait
+            restored.renewRemainingAtAnchor = 0
+            restored.recoveryState = .clockContinuityUnverified
+            restored.replacementLocalAddress = nil
+            restored.recoverySafeAfterUptime = uptime + recoveryWait
+            restored.recoveryBootIdentifier = bootIdentifier
+            restored.leaseExpiresAt = now
+            restored.renewAfter = now
+            if restored.transport == .pcp
+                || restored.transport == .natpmp {
+                restored.routerEpochHealthCheckAfter = now
+                restored.routerEpochHealthCheckUptime = uptime
+            }
+            return restored
+        }
+
+        config.activeRouterMappings = config.activeRouterMappings.map(restore)
+        recoveryMappings = recoveryMappings.map(restore)
+
+        guard config.remoteAccessEnabled,
+              config.accessExpiresAt != nil else {
+            config.accessExpiresUptime = nil
+            config.accessBootIdentifier = nil
+            config.accessAnchorWallTime = nil
+            config.accessRemainingAtAnchor = nil
+            return
+        }
+        if config.accessBootIdentifier == bootIdentifier,
+           config.accessExpiresUptime != nil {
+            return
+        }
+        var knownRecoveryIDs = Set(
+            recoveryMappings.map(\.identifier)
+        )
+        recoveryMappings.append(
+            contentsOf: config.activeRouterMappings.filter {
+                knownRecoveryIDs.insert($0.identifier).inserted
+            }
+        )
+        config.activeRouterMappings = []
+        config.remoteAccessEnabled = false
+        config.accessExpiresAt = nil
+        config.accessExpiresUptime = nil
+        config.accessBootIdentifier = nil
+        config.accessAnchorWallTime = nil
+        config.accessRemainingAtAnchor = nil
     }
 
     private func restartExpirationTimerOnStateQueue() {
@@ -2661,36 +3675,105 @@ final class NetworkAgent {
         expirationTimer = nil
         guard sideEffectsEnabled, isRunning else { return }
 
-        var deadlines: [Date] = []
-        if storedConfig.remoteAccessEnabled, let accessExpiresAt = storedConfig.accessExpiresAt {
-            deadlines.append(accessExpiresAt)
+        let now = nowProvider()
+        let nowUptime = monotonicUptimeProvider()
+        var deadlines: [TimeInterval] = []
+        if periodicTimerScheduler == nil {
+            if nextPeriodicCheckUptime == nil {
+                nextPeriodicCheckUptime = nowUptime + (
+                    AppConfig.normalizedCheckInterval(
+                        storedConfig.checkIntervalSeconds
+                    )
+                )
+            }
+            if let nextPeriodicCheckUptime {
+                deadlines.append(nextPeriodicCheckUptime)
+            }
+        }
+        if storedConfig.remoteAccessEnabled,
+           let accessExpiresUptime = accessExpiryUptime(
+               storedConfig,
+               now: now,
+               uptime: nowUptime
+           ) {
+            deadlines.append(accessExpiresUptime)
         }
         let recoveryCandidates = storedConfig.activeRouterMappings + mappingRecoveryMappings
+        if storedConfig.remoteAccessEnabled {
+            if storedConfig.autoRenewMapping {
+                deadlines.append(
+                    contentsOf: recoveryCandidates.map {
+                        mappingRenewUptime(
+                            $0,
+                            now: now,
+                            uptime: nowUptime
+                        )
+                    }
+                )
+            }
+            deadlines.append(
+                contentsOf: recoveryCandidates.compactMap { mapping in
+                    guard mapping.transport == .pcp
+                            || mapping.transport == .natpmp else {
+                        return nil
+                    }
+                    if mapping.routerEpochBootIdentifier
+                            == bootIdentifierProvider(),
+                       let deadline =
+                            mapping.routerEpochHealthCheckUptime {
+                        return deadline
+                    }
+                    if let wallDeadline =
+                            mapping.routerEpochHealthCheckAfter {
+                        return nowUptime + max(
+                            0,
+                            wallDeadline.timeIntervalSince(now)
+                        )
+                    }
+                    return nowUptime
+                }
+            )
+        }
         deadlines.append(
             contentsOf: recoveryCandidates.compactMap { mapping in
                 guard mapping.addressFamily == .ipv6,
-                      mapping.transport == .upnp,
-                      mapping.pinholeID == nil else {
+                      mapping.transport == .upnp else {
                     return nil
                 }
-                return mapping.leaseExpiresAt
+                return mappingExpiryUptime(
+                    mapping,
+                    now: now,
+                    uptime: nowUptime
+                )
+            }
+        )
+        deadlines.append(
+            contentsOf: recoveryCandidates.compactMap { mapping in
+                guard mapping.recoveryBootIdentifier
+                        == bootIdentifierProvider() else {
+                    return nil
+                }
+                return mapping.recoverySafeAfterUptime
             }
         )
         guard let safetyDeadline = deadlines.min() else {
-            expirationRetryNotBefore = nil
+            expirationRetryNotBeforeUptime = nil
             return
         }
 
-        let now = nowProvider()
-        let scheduledDeadline: Date
-        if safetyDeadline > now {
-            expirationRetryNotBefore = nil
-            scheduledDeadline = safetyDeadline
-        } else if let expirationRetryNotBefore, expirationRetryNotBefore > now {
-            scheduledDeadline = expirationRetryNotBefore
+        let scheduledUptime: TimeInterval
+        if safetyDeadline > nowUptime {
+            expirationRetryNotBeforeUptime = nil
+            scheduledUptime = safetyDeadline
+        } else if let retry = expirationRetryNotBeforeUptime,
+                  retry > nowUptime {
+            scheduledUptime = retry
         } else {
-            scheduledDeadline = now.addingTimeInterval(0.05)
+            scheduledUptime = nowUptime + 0.05
         }
+        let scheduledDeadline = now.addingTimeInterval(
+            max(0, scheduledUptime - nowUptime)
+        )
         expirationTimer = expirationTimerScheduler(scheduledDeadline) { [weak self] in
             self?.handleExpirationTimerFired()
         }
@@ -2699,17 +3782,22 @@ final class NetworkAgent {
     private func handleExpirationTimerFired() {
         transactionQueue.async {
             guard self.sideEffectsEnabled else { return }
-            let now = self.nowProvider()
+            let nowUptime = self.monotonicUptimeProvider()
             self.withState {
-                self.expirationRetryNotBefore = now.addingTimeInterval(30)
+                self.expirationRetryNotBeforeUptime = nowUptime + 30
             }
             let snapshot = self.config
             if snapshot.remoteAccessEnabled,
                let expiresAt = snapshot.accessExpiresAt,
-               expiresAt <= now {
+               let expiresUptime = self.accessExpiryUptime(
+                   snapshot,
+                   now: self.nowProvider(),
+                   uptime: nowUptime
+               ),
+               expiresUptime <= nowUptime {
                 self.expireTemporaryAccessOnTransactionQueue(
                     expectedExpiration: expiresAt,
-                    now: now
+                    nowUptime: nowUptime
                 )
             } else {
                 self.scheduleCheck(retryKeychainAfterFailure: false)
@@ -2722,15 +3810,21 @@ final class NetworkAgent {
 
     private func expireTemporaryAccessOnTransactionQueue(
         expectedExpiration: Date,
-        now: Date
+        nowUptime: TimeInterval
     ) {
         let mutationRevision = beginConfigMutation()
         defer { endConfigMutation(mutationRevision) }
         var previousConfig = config
         guard previousConfig.remoteAccessEnabled,
               let currentExpiration = previousConfig.accessExpiresAt,
+              let currentExpirationUptime =
+                accessExpiryUptime(
+                    previousConfig,
+                    now: nowProvider(),
+                    uptime: nowUptime
+                ),
               currentExpiration == expectedExpiration,
-              currentExpiration <= now else {
+              currentExpirationUptime <= nowUptime else {
             return
         }
 
@@ -2740,6 +3834,10 @@ final class NetworkAgent {
                 var disabled = previousConfig
                 disabled.remoteAccessEnabled = false
                 disabled.accessExpiresAt = nil
+                disabled.accessExpiresUptime = nil
+                disabled.accessBootIdentifier = nil
+                disabled.accessAnchorWallTime = nil
+                disabled.accessRemainingAtAnchor = nil
                 return disabled
             }()) {
                 previousConfig = try revokeMappingsBeforeConfigChange(
@@ -2750,6 +3848,10 @@ final class NetworkAgent {
             expiredConfig = previousConfig
             expiredConfig.remoteAccessEnabled = false
             expiredConfig.accessExpiresAt = nil
+            expiredConfig.accessExpiresUptime = nil
+            expiredConfig.accessBootIdentifier = nil
+            expiredConfig.accessAnchorWallTime = nil
+            expiredConfig.accessRemainingAtAnchor = nil
             expiredConfig.activeRouterMappings = []
             expiredConfig.ipv6PinholeID = nil
             try persistConfigOnly(
@@ -2929,10 +4031,33 @@ private struct RouterMappingOutcome {
     var ipv6Port: UInt16? = nil
     var pinholeID: UInt16? = nil
     var activeMappings: [ActiveRouterMapping] = []
+    var currentCheckProofs: [RouterMappingCurrentCheckProof] = []
+
+    func checkpointed(
+        generation: UInt64
+    ) -> RouterMappingOutcome {
+        var result = self
+        result.currentCheckProofs = currentCheckProofs.map {
+            var proof = $0
+            proof.checkpointed = true
+            proof.checkpointGeneration = generation
+            return proof
+        }
+        return result
+    }
+
+    func verifiedProof(
+        for family: RouterMappingAddressFamily
+    ) -> RouterMappingCurrentCheckProof? {
+        currentCheckProofs.first {
+            $0.family == family && $0.isVerified
+        }
+    }
 }
 
 struct PublicIPv4Discovery {
     let publicAddress: String
     let routerWANAddress: String?
+    let routerWANVerified: Bool
     let blocksDDNS: Bool
 }

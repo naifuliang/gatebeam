@@ -145,6 +145,16 @@ final class HTTPClient: HTTPRequesting {
     }
 
     func request(_ request: HTTPRequest) throws -> HTTPResponse {
+        try self.request(
+            request,
+            cancellationHandler: { false }
+        )
+    }
+
+    func request(
+        _ request: HTTPRequest,
+        cancellationHandler: () -> Bool
+    ) throws -> HTTPResponse {
         var urlRequest = URLRequest(
             url: request.url,
             cachePolicy: .reloadIgnoringLocalCacheData,
@@ -169,11 +179,30 @@ final class HTTPClient: HTTPRequesting {
         }
         task.resume()
 
-        if semaphore.wait(timeout: .now() + request.timeout + 2) == .timedOut {
-            task.cancel()
-            throw NetworkError.timeout
+        let deadline = ProcessInfo.processInfo.systemUptime
+            + request.timeout + 2
+        while true {
+            if cancellationHandler() {
+                task.cancel()
+                throw NetworkError.cancelled
+            }
+            let remaining = deadline
+                - ProcessInfo.processInfo.systemUptime
+            if remaining <= 0 {
+                task.cancel()
+                throw NetworkError.timeout
+            }
+            if semaphore.wait(
+                timeout: .now() + min(0.05, remaining)
+            ) == .success {
+                break
+            }
         }
 
+        if cancellationHandler() {
+            task.cancel()
+            throw NetworkError.cancelled
+        }
         if let responseError {
             throw responseError
         }
@@ -191,6 +220,7 @@ enum NetworkError: Error, LocalizedError {
     case invalidResponse(String)
     case invalidProxyURL(String)
     case timeout
+    case cancelled
 
     var errorDescription: String? {
         switch self {
@@ -202,6 +232,8 @@ enum NetworkError: Error, LocalizedError {
             return "Invalid proxy URL: \(value)"
         case .timeout:
             return "Request timed out"
+        case .cancelled:
+            return "Request cancelled"
         }
     }
 }
