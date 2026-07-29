@@ -251,7 +251,6 @@ github_curl() {
   /bin/chmod 600 "$config_path" ||
     fail "could not protect private GitHub request config"
   {
-    print -r -- 'disable'
     print -r -- 'silent'
     print -r -- 'show-error'
     print -r -- 'fail'
@@ -274,7 +273,7 @@ github_curl() {
     print -r -- "output = \"$output_path\""
     print -r -- "url = \"$url\""
   } >"$config_path"
-  "$CURL" --config "$config_path" || curl_status=$?
+  "$CURL" --disable --config "$config_path" || curl_status=$?
   rm -f -- "$config_path"
   return "$curl_status"
 }
@@ -976,154 +975,274 @@ codesign_certificate_sha256() {
 
 write_manifest() {
   local output_path="$1"
-  local plist_path="$TEMP_ROOT/release-manifest.plist"
   local app_name="${APP_ARCHIVE:t}"
   local pkg_name="${SIGNED_PKG:t}"
   local dmg_name="${SIGNED_DMG:t}"
-  local notary_app_key="notarization"".app"
 
-  /usr/bin/plutil -create xml1 "$plist_path"
-  /usr/bin/plutil -insert schemaVersion -integer 3 "$plist_path"
-  /usr/bin/plutil -insert product -string Gatebeam "$plist_path"
-  /usr/bin/plutil -insert commit -string "$HEAD_COMMIT" "$plist_path"
-  /usr/bin/plutil -insert tag -string "$RELEASE_TAG" "$plist_path"
-  /usr/bin/plutil -insert version -string "$VERSION" "$plist_path"
-  /usr/bin/plutil -insert buildVersion -string "$BUILD_VERSION" "$plist_path"
-  /usr/bin/plutil -insert previousBuildVersion -string \
-    "$PREVIOUS_BUILD_VERSION" "$plist_path"
-  /usr/bin/plutil -insert bundleIdentifier -string "$BUNDLE_ID" "$plist_path"
-  /usr/bin/plutil -insert teamIdentifier -string "$GATEBEAM_DEVELOPER_TEAM_ID" "$plist_path"
-  /usr/bin/plutil -insert source -json '{}' "$plist_path"
-  /usr/bin/plutil -insert source.mergeCommit -string "$HEAD_COMMIT" "$plist_path"
-  /usr/bin/plutil -insert source.annotatedTag -string "$RELEASE_TAG" "$plist_path"
-  /usr/bin/plutil -insert source.mergeParents -json '[]' "$plist_path"
-  /usr/bin/plutil -insert source.mergeParents.0 -string "$MERGE_PARENT_ONE" "$plist_path"
-  /usr/bin/plutil -insert source.mergeParents.1 -string "$MERGE_PARENT_TWO" "$plist_path"
+  if ! /usr/bin/python3 -I -E -s - \
+    "$output_path" \
+    "$HEAD_COMMIT" \
+    "$RELEASE_TAG" \
+    "$VERSION" \
+    "$BUILD_VERSION" \
+    "$PREVIOUS_BUILD_VERSION" \
+    "$BUNDLE_ID" \
+    "$GATEBEAM_DEVELOPER_TEAM_ID" \
+    "$MERGE_PARENT_ONE" \
+    "$MERGE_PARENT_TWO" \
+    "$app_name" \
+    "$APP_BYTE_COUNT" \
+    "$APP_SHA256" \
+    "$APP_CERTIFICATE_NAME" \
+    "$APP_CERTIFICATE_SHA256" \
+    "$APP_CDHASH" \
+    "$pkg_name" \
+    "$PKG_BYTE_COUNT" \
+    "$PKG_SHA256" \
+    "$PKG_CERTIFICATE_NAME" \
+    "$PKG_CERTIFICATE_SHA256" \
+    "$dmg_name" \
+    "$DMG_BYTE_COUNT" \
+    "$DMG_SHA256" \
+    "$DMG_CERTIFICATE_NAME" \
+    "$DMG_CERTIFICATE_SHA256" \
+    "$DMG_CDHASH" \
+    "$APP_SUBMISSION_ID" \
+    "$PKG_SUBMISSION_ID" \
+    "$DMG_SUBMISSION_ID" \
+    "$PLATFORM_VERSION" \
+    "$PLATFORM_ARCHITECTURE" \
+    "$MINIMUM_SYSTEM_VERSION" \
+    "${(j:,:)SUPPORTED_ARCHITECTURES}" \
+    "$XCODE_VERSION" \
+    "$XCODE_BUILD_VERSION" \
+    "$SWIFT_VERSION" \
+    "$SWIFT_TARGET" \
+    "$RELEASE_TEST_EVIDENCE_URL" \
+    "$RELEASE_CLEAN_MACHINE_EVIDENCE_URL" \
+    "$CI_WORKFLOW_PATH" \
+    "$CI_WORKFLOW_NAME" \
+    "$CLEAN_WORKFLOW_PATH" \
+    "$CLEAN_WORKFLOW_NAME" \
+    "$ROLLBACK_AVAILABLE" \
+    "$PREVIOUS_RELEASE_VERSION" \
+    "$PREVIOUS_RELEASE_TAG" \
+    "$PREVIOUS_RELEASE_URL" \
+    "$ROLLBACK_ASSET_NAME" \
+    "$ROLLBACK_ASSET_SHA256" \
+    "$PREVIOUS_RELEASE_COMMIT" \
+    "$GITHUB_WEB_ROOT" <<'PY'
+import json
+import os
+import sys
 
-  /usr/bin/plutil -insert artifacts -json '[]' "$plist_path"
-  /usr/bin/plutil -insert artifacts.0 -json '{}' "$plist_path"
-  /usr/bin/plutil -insert artifacts.0.name -string "$app_name" "$plist_path"
-  /usr/bin/plutil -insert artifacts.0.type -string app-archive "$plist_path"
-  /usr/bin/plutil -insert artifacts.0.byteCount -integer "$APP_BYTE_COUNT" "$plist_path"
-  /usr/bin/plutil -insert artifacts.0.sha256 -string "$APP_SHA256" "$plist_path"
-  /usr/bin/plutil -insert artifacts.0.signingCertificateName -string \
-    "$APP_CERTIFICATE_NAME" "$plist_path"
-  /usr/bin/plutil -insert artifacts.0.signingCertificateSHA256 -string \
-    "$APP_CERTIFICATE_SHA256" "$plist_path"
-  /usr/bin/plutil -insert artifacts.0.cdhash -string "$APP_CDHASH" "$plist_path"
+(
+    output_path,
+    head_commit,
+    release_tag,
+    version,
+    build_version,
+    previous_build_version,
+    bundle_id,
+    team_id,
+    merge_parent_one,
+    merge_parent_two,
+    app_name,
+    app_byte_count,
+    app_sha256,
+    app_certificate_name,
+    app_certificate_sha256,
+    app_cdhash,
+    pkg_name,
+    pkg_byte_count,
+    pkg_sha256,
+    pkg_certificate_name,
+    pkg_certificate_sha256,
+    dmg_name,
+    dmg_byte_count,
+    dmg_sha256,
+    dmg_certificate_name,
+    dmg_certificate_sha256,
+    dmg_cdhash,
+    app_submission_id,
+    pkg_submission_id,
+    dmg_submission_id,
+    platform_version,
+    platform_architecture,
+    minimum_system_version,
+    supported_architectures,
+    xcode_version,
+    xcode_build_version,
+    swift_version,
+    swift_target,
+    test_evidence_url,
+    clean_machine_evidence_url,
+    ci_workflow_path,
+    ci_workflow_name,
+    clean_workflow_path,
+    clean_workflow_name,
+    rollback_available,
+    previous_release_version,
+    previous_release_tag,
+    previous_release_url,
+    rollback_asset_name,
+    rollback_asset_sha256,
+    previous_release_commit,
+    github_web_root,
+) = sys.argv[1:]
 
-  /usr/bin/plutil -insert artifacts.1 -json '{}' "$plist_path"
-  /usr/bin/plutil -insert artifacts.1.name -string "$pkg_name" "$plist_path"
-  /usr/bin/plutil -insert artifacts.1.type -string installer-package "$plist_path"
-  /usr/bin/plutil -insert artifacts.1.byteCount -integer "$PKG_BYTE_COUNT" "$plist_path"
-  /usr/bin/plutil -insert artifacts.1.sha256 -string "$PKG_SHA256" "$plist_path"
-  /usr/bin/plutil -insert artifacts.1.signingCertificateName -string \
-    "$PKG_CERTIFICATE_NAME" "$plist_path"
-  /usr/bin/plutil -insert artifacts.1.signingCertificateSHA256 -string \
-    "$PKG_CERTIFICATE_SHA256" "$plist_path"
+rollback = {
+    "available": rollback_available == "1",
+    "procedure": "docs/RELEASING.md#rollback-and-revocation",
+}
+if rollback["available"]:
+    rollback.update(
+        {
+            "version": previous_release_version,
+            "releaseURL": previous_release_url,
+            "assetName": rollback_asset_name,
+            "assetSHA256": rollback_asset_sha256,
+            "sourceCommit": previous_release_commit,
+            "sourceManifestURL": (
+                f"{github_web_root}/releases/download/"
+                f"{previous_release_tag}/release-manifest.json"
+            ),
+            "sourceChecksumsURL": (
+                f"{github_web_root}/releases/download/"
+                f"{previous_release_tag}/SHA256SUMS"
+            ),
+        }
+    )
+else:
+    rollback["bootstrap"] = True
 
-  /usr/bin/plutil -insert artifacts.2 -json '{}' "$plist_path"
-  /usr/bin/plutil -insert artifacts.2.name -string "$dmg_name" "$plist_path"
-  /usr/bin/plutil -insert artifacts.2.type -string disk-image "$plist_path"
-  /usr/bin/plutil -insert artifacts.2.byteCount -integer "$DMG_BYTE_COUNT" "$plist_path"
-  /usr/bin/plutil -insert artifacts.2.sha256 -string "$DMG_SHA256" "$plist_path"
-  /usr/bin/plutil -insert artifacts.2.signingCertificateName -string \
-    "$DMG_CERTIFICATE_NAME" "$plist_path"
-  /usr/bin/plutil -insert artifacts.2.signingCertificateSHA256 -string \
-    "$DMG_CERTIFICATE_SHA256" "$plist_path"
-  /usr/bin/plutil -insert artifacts.2.cdhash -string "$DMG_CDHASH" "$plist_path"
+manifest = {
+    "schemaVersion": 3,
+    "product": "Gatebeam",
+    "commit": head_commit,
+    "tag": release_tag,
+    "version": version,
+    "buildVersion": build_version,
+    "previousBuildVersion": previous_build_version,
+    "bundleIdentifier": bundle_id,
+    "teamIdentifier": team_id,
+    "source": {
+        "mergeCommit": head_commit,
+        "annotatedTag": release_tag,
+        "mergeParents": [merge_parent_one, merge_parent_two],
+    },
+    "artifacts": [
+        {
+            "name": app_name,
+            "type": "app-archive",
+            "byteCount": int(app_byte_count),
+            "sha256": app_sha256,
+            "signingCertificateName": app_certificate_name,
+            "signingCertificateSHA256": app_certificate_sha256,
+            "cdhash": app_cdhash,
+        },
+        {
+            "name": pkg_name,
+            "type": "installer-package",
+            "byteCount": int(pkg_byte_count),
+            "sha256": pkg_sha256,
+            "signingCertificateName": pkg_certificate_name,
+            "signingCertificateSHA256": pkg_certificate_sha256,
+        },
+        {
+            "name": dmg_name,
+            "type": "disk-image",
+            "byteCount": int(dmg_byte_count),
+            "sha256": dmg_sha256,
+            "signingCertificateName": dmg_certificate_name,
+            "signingCertificateSHA256": dmg_certificate_sha256,
+            "cdhash": dmg_cdhash,
+        },
+    ],
+    "notarization": {
+        "app": {
+            "submissionId": app_submission_id,
+            "status": "Accepted",
+            "log": "notary-logs/app.json",
+        },
+        "pkg": {
+            "submissionId": pkg_submission_id,
+            "status": "Accepted",
+            "log": "notary-logs/pkg.json",
+        },
+        "dmg": {
+            "submissionId": dmg_submission_id,
+            "status": "Accepted",
+            "log": "notary-logs/dmg.json",
+        },
+    },
+    "platform": {
+        "name": "macOS",
+        "buildHostVersion": platform_version,
+        "architecture": platform_architecture,
+        "minimumSystemVersion": minimum_system_version,
+        "supportedMacOSVersionRange": f"{minimum_system_version} or later",
+        "supportedArchitectures": supported_architectures.split(","),
+    },
+    "toolchain": {
+        "xcodeVersion": xcode_version,
+        "xcodeBuildVersion": xcode_build_version,
+        "swiftVersion": swift_version,
+        "swiftTarget": swift_target,
+    },
+    "testing": {
+        "evidenceURL": test_evidence_url,
+        "cleanMachineEvidenceURL": clean_machine_evidence_url,
+        "workflow": ci_workflow_path,
+        "workflowName": ci_workflow_name,
+        "cleanMachineWorkflow": clean_workflow_path,
+        "cleanMachineWorkflowName": clean_workflow_name,
+        "commit": head_commit,
+        "cleanMachineCommit": head_commit,
+        "status": "Passed",
+        "cleanMachineStatus": "Passed",
+        "gates": [
+            "test_backend",
+            "test_proxy_policy",
+            "test_integration_contract",
+            "test_integration_tsan",
+            "test_keychain_identity",
+            "test_upgrade",
+            "test_ui_validation",
+            "test_build_assets",
+            "test_release_pipeline",
+            "test_privacy",
+            "build_app",
+            "codesign_verify",
+            "diff_check",
+            "test_clean_machine_validation",
+        ],
+    },
+    "rollback": rollback,
+    "knownLimitations": [
+        "Local-origin diagnostics do not prove public reachability.",
+        "Router protocol compatibility varies by device and firmware.",
+    ],
+}
 
-  /usr/bin/plutil -insert notarization -json '{}' "$plist_path"
-  /usr/bin/plutil -insert "$notary_app_key" -json '{}' "$plist_path"
-  /usr/bin/plutil -insert "$notary_app_key.submissionId" -string \
-    "$APP_SUBMISSION_ID" "$plist_path"
-  /usr/bin/plutil -insert "$notary_app_key.status" -string Accepted "$plist_path"
-  /usr/bin/plutil -insert "$notary_app_key.log" -string notary-logs/app.json "$plist_path"
-  /usr/bin/plutil -insert notarization.pkg -json '{}' "$plist_path"
-  /usr/bin/plutil -insert notarization.pkg.submissionId -string \
-    "$PKG_SUBMISSION_ID" "$plist_path"
-  /usr/bin/plutil -insert notarization.pkg.status -string Accepted "$plist_path"
-  /usr/bin/plutil -insert notarization.pkg.log -string notary-logs/pkg.json "$plist_path"
-  /usr/bin/plutil -insert notarization.dmg -json '{}' "$plist_path"
-  /usr/bin/plutil -insert notarization.dmg.submissionId -string \
-    "$DMG_SUBMISSION_ID" "$plist_path"
-  /usr/bin/plutil -insert notarization.dmg.status -string Accepted "$plist_path"
-  /usr/bin/plutil -insert notarization.dmg.log -string notary-logs/dmg.json "$plist_path"
-
-  /usr/bin/plutil -insert platform -json '{}' "$plist_path"
-  /usr/bin/plutil -insert platform.name -string macOS "$plist_path"
-  /usr/bin/plutil -insert platform.buildHostVersion -string "$PLATFORM_VERSION" "$plist_path"
-  /usr/bin/plutil -insert platform.architecture -string "$PLATFORM_ARCHITECTURE" "$plist_path"
-  /usr/bin/plutil -insert platform.minimumSystemVersion -string \
-    "$MINIMUM_SYSTEM_VERSION" "$plist_path"
-  /usr/bin/plutil -insert platform.supportedMacOSVersionRange -string \
-    "$MINIMUM_SYSTEM_VERSION or later" "$plist_path"
-  /usr/bin/plutil -insert platform.supportedArchitectures -json '[]' "$plist_path"
-  /usr/bin/plutil -insert platform.supportedArchitectures.0 -string \
-    "$SUPPORTED_ARCHITECTURES[1]" "$plist_path"
-  if [[ ${#SUPPORTED_ARCHITECTURES[@]} -eq 2 ]]; then
-    /usr/bin/plutil -insert platform.supportedArchitectures.1 -string \
-      "$SUPPORTED_ARCHITECTURES[2]" "$plist_path"
+with open(output_path, "x", encoding="utf-8") as stream:
+    json.dump(manifest, stream, sort_keys=True, separators=(",", ":"))
+    stream.write("\n")
+os.chmod(output_path, 0o600)
+PY
+  then
+    fail "could not write release manifest"
   fi
-  /usr/bin/plutil -insert toolchain -json '{}' "$plist_path"
-  /usr/bin/plutil -insert toolchain.xcodeVersion -string "$XCODE_VERSION" "$plist_path"
-  /usr/bin/plutil -insert toolchain.xcodeBuildVersion -string \
-    "$XCODE_BUILD_VERSION" "$plist_path"
-  /usr/bin/plutil -insert toolchain.swiftVersion -string "$SWIFT_VERSION" "$plist_path"
-  /usr/bin/plutil -insert toolchain.swiftTarget -string "$SWIFT_TARGET" "$plist_path"
+  /usr/bin/python3 -I -E -s -c '
+import json
+import sys
 
-  /usr/bin/plutil -insert testing -json '{}' "$plist_path"
-  /usr/bin/plutil -insert testing.evidenceURL -string \
-    "$RELEASE_TEST_EVIDENCE_URL" "$plist_path"
-  /usr/bin/plutil -insert testing.cleanMachineEvidenceURL -string \
-    "$RELEASE_CLEAN_MACHINE_EVIDENCE_URL" "$plist_path"
-  /usr/bin/plutil -insert testing.workflow -string "$CI_WORKFLOW_PATH" "$plist_path"
-  /usr/bin/plutil -insert testing.workflowName -string \
-    "$CI_WORKFLOW_NAME" "$plist_path"
-  /usr/bin/plutil -insert testing.cleanMachineWorkflow -string \
-    "$CLEAN_WORKFLOW_PATH" "$plist_path"
-  /usr/bin/plutil -insert testing.cleanMachineWorkflowName -string \
-    "$CLEAN_WORKFLOW_NAME" "$plist_path"
-  /usr/bin/plutil -insert testing.commit -string "$HEAD_COMMIT" "$plist_path"
-  /usr/bin/plutil -insert testing.cleanMachineCommit -string \
-    "$HEAD_COMMIT" "$plist_path"
-  /usr/bin/plutil -insert testing.status -string Passed "$plist_path"
-  /usr/bin/plutil -insert testing.cleanMachineStatus -string Passed "$plist_path"
-  /usr/bin/plutil -insert testing.gates -json \
-    '["test_backend","test_proxy_policy","test_integration_contract","test_integration_tsan","test_keychain_identity","test_upgrade","test_ui_validation","test_build_assets","test_release_pipeline","test_privacy","build_app","codesign_verify","diff_check","test_clean_machine_validation"]' \
-    "$plist_path"
-
-  /usr/bin/plutil -insert rollback -json '{}' "$plist_path"
-  if (( ROLLBACK_AVAILABLE )); then
-    /usr/bin/plutil -insert rollback.available -bool true "$plist_path"
-    /usr/bin/plutil -insert rollback.version -string \
-      "$PREVIOUS_RELEASE_VERSION" "$plist_path"
-    /usr/bin/plutil -insert rollback.releaseURL -string \
-      "$PREVIOUS_RELEASE_URL" "$plist_path"
-    /usr/bin/plutil -insert rollback.assetName -string \
-      "$ROLLBACK_ASSET_NAME" "$plist_path"
-    /usr/bin/plutil -insert rollback.assetSHA256 -string \
-      "$ROLLBACK_ASSET_SHA256" "$plist_path"
-    /usr/bin/plutil -insert rollback.sourceCommit -string \
-      "$PREVIOUS_RELEASE_COMMIT" "$plist_path"
-    /usr/bin/plutil -insert rollback.sourceManifestURL -string \
-      "$GITHUB_WEB_ROOT/releases/download/$PREVIOUS_RELEASE_TAG/release-manifest.json" \
-      "$plist_path"
-    /usr/bin/plutil -insert rollback.sourceChecksumsURL -string \
-      "$GITHUB_WEB_ROOT/releases/download/$PREVIOUS_RELEASE_TAG/SHA256SUMS" \
-      "$plist_path"
-  else
-    /usr/bin/plutil -insert rollback.available -bool false "$plist_path"
-    /usr/bin/plutil -insert rollback.bootstrap -bool true "$plist_path"
-  fi
-  /usr/bin/plutil -insert rollback.procedure -string \
-    "docs/RELEASING.md#rollback-and-revocation" "$plist_path"
-  /usr/bin/plutil -insert knownLimitations -json \
-    '["Local-origin diagnostics do not prove public reachability.","Router protocol compatibility varies by device and firmware."]' \
-    "$plist_path"
-
-  /usr/bin/plutil -convert json -o "$output_path" "$plist_path"
-  /usr/bin/plutil -p "$output_path" >/dev/null
+with open(sys.argv[1], "rb") as stream:
+    manifest = json.load(stream)
+if not isinstance(manifest, dict):
+    raise SystemExit(1)
+' "$output_path" ||
+    fail "release manifest is not valid JSON"
 }
 
 sanitize_environment

@@ -453,9 +453,13 @@ def main():
     root = fixture_root()
     scenario = os.environ.get("GATEBEAM_FAKE_GITHUB_SCENARIO", "success")
     arguments = sys.argv[1:]
-    if len(arguments) != 2 or arguments[0] != "--config":
-        fail("fake curl accepts only a private config path in argv")
-    config_path = pathlib.Path(arguments[1])
+    if (
+        len(arguments) != 3
+        or arguments[0] != "--disable"
+        or arguments[1] != "--config"
+    ):
+        fail("fake curl requires --disable first and only a private config path")
+    config_path = pathlib.Path(arguments[2])
     config_stat = config_path.lstat()
     if (
         not config_path.is_file()
