@@ -1,99 +1,72 @@
 # Gatebeam
 
-Gatebeam is a native macOS menu bar app for keeping a remote-desktop entry point current without handing DNS and router mapping work to a collection of unrelated tools. It manages Cloudflare DDNS and local-network port exposure for macOS Screen Sharing / Remote Management (TCP `5900`).
+Gatebeam is a native macOS menu bar app for Cloudflare DDNS and optional local-router port mapping for macOS Screen Sharing or Remote Management. It keeps a chosen DNS name current and can ask a compatible home router to expose the Mac's remote-desktop port.
 
-> **0.5.0 Developer Preview:** this is an open-source preview of Gatebeam, released under the [MIT License](LICENSE). The application is ad-hoc signed for development, the PKG is unsigned, and no artifact is notarized or stapled. Its saved Cloudflare token is bound to the exact preview build. After replacing the app with another preview build, open Settings and click **Authorize Token** so macOS can approve and rebind the item. Review and build it locally before exposing a remote-desktop service.
+> **Developer Preview:** Gatebeam is not a guarantee of public reachability. A DNS update, local listener check, or router mapping can still be blocked by CGNAT, double NAT, an ISP, a firewall, VPN/TUN routing, or router policy. Test from a separately controlled external network before relying on it.
 
-> **Known preview limitations:** a successful local mapping or DNS update does not prove that an outside client can reach the Mac. Router behavior, CGNAT, upstream firewalls, and ISP policy can still block inbound traffic. `Direct` bypasses URLSession proxy selection, but cannot bypass a VPN/TUN or transparent network interception. Custom proxy URLs support `http://` and `socks5://` only. External reachability verification must be performed from a separately controlled external network.
-
-> **Security first:** publishing VNC to the public internet is inherently risky. This app helps manage the network path; it does not make an internet-facing VNC service safe by itself. Read [Network and VNC safety](#network-and-vnc-safety) before enabling remote access.
+> **Security:** exposing VNC or Screen Sharing to the internet is risky. Prefer a private overlay network, SSH tunnel, or managed remote-access service for long-lived access. Keep access off when it is not needed.
 
 ![Menu bar status panel](docs/screenshots/popover.png)
 
 ![Settings window](docs/screenshots/settings.png)
 
-## What It Does
+## First Setup
 
-- Updates Cloudflare DNS-only `A` and `AAAA` records, creating a missing record when necessary.
-- Supports IPv4-only, IPv6-only, and dual-stack DDNS operation.
-- For IPv4, uses the usable address on the macOS IPv4 default-route interface first, then falls back to a usable `en`, `bridge`, or `ppp` interface if that route address is unavailable.
-- For IPv6, accepts only stable global addresses on eligible physical interfaces. Tunnel and virtual interface families are hard-excluded even when one owns the IPv6 default route; temporary, deprecated, detached, ULA, link-local, and loopback addresses are also excluded.
-- Uses PCP where available, NAT-PMP for IPv4, and UPnP IGD for IPv4 port mappings.
-- Supports UPnP `WANIPv6FirewallControl` pinholes for IPv6-capable routers.
-- Checks whether macOS Screen Sharing / Remote Management is listening on TCP `5900`.
-- Renews tracked mappings and attempts to remove them before disabling access or changing mapping identity.
-- Stores Cloudflare credentials in a versioned macOS Keychain item whose ACL is bound to Gatebeam's code-signing requirement, not in the app configuration file.
+1. In macOS System Settings, enable **Screen Sharing** or **Remote Management** and confirm the intended account may sign in.
+2. Create a scoped Cloudflare API token following [Cloudflare setup](docs/cloudflare-setup.md). Do not use a Global API Key.
+3. Open Gatebeam from the menu bar, open **Settings**, and choose Cloudflare. For an existing saved token, use **Authorize Token** when available. For a new or replacement token, complete the token-save action offered by your build. Save the remaining settings, then click **Verify** to load the zones the token can read.
+4. Choose a **Domain** (the Cloudflare zone) and enter a **Subdomain**. For example, choose `example.com` and enter `remote`, `remote.example.com`, or `@`.
+5. Choose the address mode, network paths, router protocol, ports, and lease. See [Networking and remote access](docs/networking.md).
+6. Save the configuration, review the displayed status, then explicitly turn on remote access.
+7. From an external network, test the displayed connection address. A successful local check is not an external test.
 
-## Quick Start
+The app creates missing records as **DNS only** `A` and/or `AAAA` records. Cloudflare's orange-cloud proxy does not proxy arbitrary VNC TCP traffic.
 
-1. Enable **Screen Sharing** or **Remote Management** in macOS System Settings.
-2. Open Gatebeam from the menu bar and open **Settings**.
-3. Select **Cloudflare**, enter an API token, then choose a zone and hostname. When upgrading from an earlier Gatebeam build, click **Authorize Token** instead of pasting the token again.
-4. Choose `IPv4`, `Dual`, or `IPv6` address mode.
-5. Confirm the inside port (`5900`) and choose a high external IPv4 port.
-6. Review the network-path status and explicitly enable remote access.
+## What Verify Means
 
-The app creates DNS records as **DNS only**. Cloudflare's standard orange-cloud proxy is for HTTP(S) and will not proxy a VNC TCP connection.
+**Verify** confirms only that the token is active and can read one or more Cloudflare zones. It does not prove that the token may edit DNS. DNS Edit is confirmed only when Gatebeam first creates or updates the selected `A` or `AAAA` record. If that write is rejected, correct the token permissions in Cloudflare and try the update again.
 
-## Proxy And Network Path Policy
+## Network Paths
 
-Different operations should not all inherit the same proxy behavior. In particular, a public-IP lookup routed through a local VPN or HTTP proxy can publish the proxy exit address instead of the address reachable through the home router.
+Cloudflare/DDNS and public-IP probing each have their own **System**, **Direct**, or **Custom** mode. The current preview has one shared Custom proxy URL: every service set to Custom uses the same URL. Router protocols always use the local network directly.
 
-The app presents a network-path setting for Cloudflare/DDNS traffic and keeps local-router protocols direct. The intended defaults are deliberately conservative:
+- **System** follows macOS proxy settings.
+- **Direct** bypasses URLSession HTTP, HTTPS, SOCKS, PAC, and proxy auto-discovery. It does not bypass a route-level VPN/TUN, firewall, or transparent interception.
+- **Custom** accepts a validated `http://` or `socks5://` proxy URL. Do not put proxy credentials in it.
 
-| Operation | Default behavior | Configurable | Why |
-| --- | --- | --- | --- |
-| Cloudflare token verification and DNS updates | Follow macOS proxy settings | Yes: system proxy, direct, or custom `http://` / `socks5://` proxy | Some managed networks require a proxy to reach Cloudflare. |
-| Public IPv4/IPv6 address probes | Direct, bypass HTTP/HTTPS/SOCKS/PAC and auto-discovery | Yes: direct, system proxy, or custom `http://` / `socks5://` proxy | Direct is recommended; a proxy can return its own exit address. |
-| Router WAN IPv4 query | Direct local-network protocol | No | NAT-PMP, PCP, and UPnP target the local gateway, not the internet. |
-| PCP, NAT-PMP, UPnP, and IPv6 pinholes | Direct local-network protocol | No | These are LAN control protocols and must never traverse an HTTP proxy. |
-| Local-origin TCP check | Loopback/LAN only | No | It verifies the Mac's own TCP listener. It is not a public-IP check and does not prove that an outside client can connect. |
-| External reachability verification | Separate external test | N/A | Run it from a separately controlled network. A local-origin TCP check, local mapping, or DNS update cannot prove public reachability. |
+For the complete contract and diagnosis path, read [Proxy policy](docs/proxy-policy.md) and [Networking and remote access](docs/networking.md).
 
-The router-reported WAN IPv4 address is preferred over a web probe when the router provides one. The app detects private/CGNAT-like router WAN addresses and reports that an IPv4 mapping may not be reachable from the wider internet. IPv4 local-address selection follows the default-route interface first. IPv6 selection hard-excludes tunnel and virtual interfaces before ranking stable global candidates.
+## Keychain
 
-The menu bar status popover displays the complete addresses and connection URLs needed for the user to connect or copy them. Those values exist only in local UI state.
+Gatebeam stores the Cloudflare token in the macOS Keychain, never in its normal configuration file. The candidate credential-safety release introduces explicit token controls:
 
-Gatebeam 0.5.0 does not provide a diagnostic-export command and does not persist a diagnostic log. If either capability is added later, it must redact credentials, hostnames, public addresses, and router responses by default.
+- **Save Changes** keeps an existing saved token and does not read, write, or delete it.
+- **Authorize Token** is the intentional path to let the current build access an existing token, including after an app upgrade.
+- **Replace Token** intentionally writes a non-empty replacement.
+- **Remove Token** requires confirmation and deletes only the saved token.
 
-## Mapping Cleanup Contract
+These controls may cause a one-time macOS Keychain authorization prompt. Background checks, launch, timers, diagnostics, and normal saves should not prompt. If macOS denies or cancels a prompt, do not keep retrying: open Settings and use the explicit authorization action when ready. This behavior applies only after the candidate credential-safety change is included. Older preview builds may access Keychain during Verify or Save; upgrade to the candidate release before relying on the explicit-control contract.
 
-Gatebeam does not claim that remote access is off until every tracked router rule has been removed. If deletion fails, it keeps remote access marked enabled, persists the exact remaining mappings for retry, and blocks mapping-identity changes from creating replacement rules. If a newly created rule cannot be checkpointed and compensation cleanup also fails, Gatebeam records that rule in its recovery journal. On a later check or launch, journal cleanup runs before any new mapping is opened.
+## Safety Checklist
 
-## Check Interval
+- Use a strong macOS account password and keep macOS updated.
+- Use a high, random external IPv4 port instead of publicly exposing TCP `5900`.
+- Treat an IPv6 firewall pinhole to the inside port as public exposure too.
+- Keep mapping leases finite and enable renewal only when continued access is intended.
+- Close remote access in Gatebeam before quitting for an extended period, uninstalling, or rolling back. Confirm that mapping removal succeeded.
+- Do not assume LAN hairpin NAT proves outside connectivity.
 
-The recurring check interval defaults to `300` seconds and accepts `60` through `86400` seconds. Missing, non-finite, zero, or negative numeric values normalize to `300`; positive values below or above the supported range normalize to the nearest limit. A non-numeric settings-field entry uses `300`. Normalized legacy values are written back.
+## Detailed Guides
 
-If the configuration file cannot be read or decoded, Gatebeam preserves the damaged file instead of replacing it with defaults. It marks configuration and mapping recovery state as unknown, blocks new router mappings and settings overwrite, and shows recovery guidance. Back up the damaged file before restoring a known-good configuration; mapping creation remains fail-closed until the configuration and recovery state can be confirmed.
-
-Even direct URLSession traffic cannot bypass a route-level VPN/TUN, firewall, or transparent network interception. During diagnosis, temporarily disable those tools or compare the displayed route and address with your router's own status page.
-
-## Cloudflare Permissions
-
-Create a scoped API token under **Cloudflare Dashboard > My Profile > API Tokens > Create Token**. The **Edit zone DNS** template is a good starting point. Grant:
-
-- `Zone > DNS > Edit`
-- `Zone > Zone > Read`
-
-Restrict **Zone Resources** to the one zone used by this Mac. Use access to all zones only when you want the app to list every eligible zone. Do not use the Global API Key. Avoid Client IP filtering for a DDNS token because the connection's source address can change.
-
-Useful Cloudflare references:
-
-- [Create API tokens](https://developers.cloudflare.com/fundamentals/api/get-started/create-token/)
-- [API token permissions](https://developers.cloudflare.com/fundamentals/api/reference/permissions/)
-- [DNS Records API](https://developers.cloudflare.com/api/resources/dns/subresources/records/)
-
-## IPv6 Notes
-
-IPv6 normally uses firewall pinholes rather than address translation. PCP may grant the requested external port; `WANIPv6FirewallControl` exposes the Mac's local service port directly. As a result, IPv4 and IPv6 can legitimately have different connection ports. The app should show separate family-specific VNC URLs in that case.
-
-Some networks do not offer usable global IPv6, do not expose PCP, or prohibit inbound IPv6 in the ISP router. Dual-stack status is therefore reported per address family rather than as a single all-or-nothing result.
-
-Protocol references: [PCP RFC 6887](https://datatracker.ietf.org/doc/html/rfc6887) and [UPnP WANIPv6FirewallControl](https://upnp.org/specs/gw/UPnP-gw-WANIPv6FirewallControl-v1-Service.pdf).
+- [Cloudflare setup](docs/cloudflare-setup.md): permissions, zones, records, rotation, and record cleanup.
+- [Networking and remote access](docs/networking.md): address modes, proxy paths, router protocols, ports, leases, and troubleshooting.
+- [Proxy policy](docs/proxy-policy.md): precise request-path behavior.
+- [Architecture](docs/architecture.md): implementation overview.
+- [Releasing](docs/RELEASING.md): maintainer release process.
 
 ## Build And Test
 
-Requirements: macOS with Xcode Command Line Tools or Xcode installed.
+Requirements: macOS with Xcode Command Line Tools or Xcode.
 
 ```sh
 ./scripts/test_backend.sh
@@ -105,6 +78,10 @@ Requirements: macOS with Xcode Command Line Tools or Xcode installed.
 ./scripts/test_ui_validation.sh
 ./scripts/test_build_assets.sh
 ./scripts/test_release_pipeline.sh
+./scripts/test_final_artifact_contract.sh
+./scripts/test_final_candidate_validator.sh
+./scripts/test_formal_publish.sh
+./scripts/test_release_workflow_contract.sh
 ./scripts/build_app.sh
 ./scripts/test_privacy.sh
 ```
@@ -120,9 +97,27 @@ The validation suite is split by contract:
 - `test_ui_validation.sh`: isolated AppKit validation mode, no network side effects, no Keychain prompts, and UI contract coverage.
 - `test_build_assets.sh`: icon, app bundle, PKG, and DMG staging/build-asset checks.
 - `test_release_pipeline.sh`: fixture-based, fail-closed validation of the formal release pipeline and its publication gates.
+- `test_final_artifact_contract.sh`: exact-byte candidate and attestation binding, descriptor-bound extraction under path replacement, safe extraction, replay prevention, and linked-path rejection.
+- `test_final_candidate_validator.sh`: actual validator behavior for exact APP/ZIP/flat-PKG/DMG allowlists, productsign RSA/CMS XAR structure, XAR/cpio and sparse-file budgets, signing gates, install/upgrade/rollback/uninstall failures, and no-attestation failure semantics.
+- `test_formal_publish.sh`: trusted GitHub Actions evidence, complete SemVer 2.0 immutable history, the POST/upload/PATCH by 401/403/404/5xx mutation matrix, response-loss recovery, concurrent remote draft ownership, exact API asset upload, immutable publication, and atomic failure cases.
+- `test_release_workflow_contract.sh`: pinned Actions, job ordering, signing-secret isolation, and no-rebuild publication policy.
 - `test_privacy.sh`: credentials, email addresses, bare domains, IPv4/IPv6 literals, user-specific paths, and built-binary private material against explicit fixture allowlists.
 
 Automated tests use injected stores or signing fixtures and do not access a contributor's login Keychain.
+
+Formal releases use a three-stage, fail-closed path: the tagged workflow signs,
+notarizes, staples, and freezes one candidate; a second clean macOS job validates
+those exact bytes and emits a hash-bound attestation without signing secrets;
+`release_formal.sh` then creates the GitHub draft, uploads and verifies the
+seven exact frozen assets, rechecks all evidence, and publishes only that
+attested candidate as an immutable release without rebuilding or rewriting it.
+The publisher is the third job of the same globally serialized tagged workflow;
+there is no manual upload or publish handoff.
+Every GitHub mutation is assigned an exact byte identity and publication nonce;
+if a POST, upload, or PATCH response is lost, the publisher paginates remote
+state and resumes only from one exact matching draft, asset, or immutable
+release.
+See [Releasing Gatebeam](docs/RELEASING.md).
 
 The built app is written to `dist/Gatebeam.app`. `test_ui_validation.sh` is a UI contract check; the final preview should also be visually inspected from rendered screenshots for both Aqua and Dark Aqua states.
 
@@ -171,7 +166,7 @@ Use the macOS system proxy when it requires authentication. Avoid embedding a pr
 
 ## Contributing
 
-Please read [CONTRIBUTING.md](CONTRIBUTING.md) before opening an issue or pull request. Security-sensitive bugs should follow [SECURITY.md](SECURITY.md), not public issue reporting.
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening an issue or pull request. Report security-sensitive bugs through [SECURITY.md](SECURITY.md), not a public issue.
 
 ## License
 

@@ -584,12 +584,15 @@ final class NetworkAgent {
     }
 
     @discardableResult
-    func persistSettings(config newConfig: AppConfig, token: String) throws -> AppConfig {
+    func persistSettings(
+        config newConfig: AppConfig,
+        tokenMutation: CloudflareTokenMutation = .keepExisting
+    ) throws -> AppConfig {
         let request = reserveSettingsRequest()
         return try withKeychainTransaction {
             try persistSettingsOnKeychainQueue(
                 config: newConfig.normalizedForPersistence(),
-                token: token,
+                tokenMutation: tokenMutation,
                 requestGeneration: request.generation,
                 baseConfigRevision: request.configRevision
             )
@@ -598,7 +601,7 @@ final class NetworkAgent {
 
     func persistSettingsAsync(
         config newConfig: AppConfig,
-        token: String,
+        tokenMutation: CloudflareTokenMutation = .keepExisting,
         completion: @escaping (Result<AppConfig, Error>) -> Void
     ) {
         let request = reserveSettingsRequest()
@@ -606,7 +609,7 @@ final class NetworkAgent {
             let result = Result {
                 try self.persistSettingsOnKeychainQueue(
                     config: newConfig.normalizedForPersistence(),
-                    token: token,
+                    tokenMutation: tokenMutation,
                     requestGeneration: request.generation,
                     baseConfigRevision: request.configRevision
                 )
@@ -619,14 +622,23 @@ final class NetworkAgent {
 
     private func persistSettingsOnKeychainQueue(
         config newConfig: AppConfig,
-        token: String,
+        tokenMutation: CloudflareTokenMutation,
         requestGeneration: UInt64,
         baseConfigRevision: UInt64
     ) throws -> AppConfig {
-        let normalizedToken = token.trimmingCharacters(in: .whitespacesAndNewlines)
+        let validatedMutation = try tokenMutation.validated()
         guard sideEffectsEnabled else {
             return withState {
-                cachedCloudflareToken = normalizedToken
+                switch validatedMutation {
+                case .keepExisting:
+                    break
+                case .replace(let token):
+                    cachedCloudflareToken = token
+                    keychainReadFailure = nil
+                case .explicitRemove:
+                    cachedCloudflareToken = ""
+                    keychainReadFailure = nil
+                }
                 commitConfigOnStateQueue(newConfig, advanceRevision: false)
                 return newConfig
             }
@@ -636,116 +648,97 @@ final class NetworkAgent {
             generation: requestGeneration,
             requestedConfigRevision: baseConfigRevision
         )
-        let tokenRequestGeneration = withState { keychainStateGeneration }
-        let previousToken = try loadCloudflareTokenOnKeychainQueue(
-            retryAfterFailure: true,
-            interaction: .userInitiated,
-            requestGeneration: tokenRequestGeneration
-        )
+        let requestedToken: String?
+        switch validatedMutation {
+        case .keepExisting:
+            requestedToken = nil
+        case .replace(let token):
+            requestedToken = token
+        case .explicitRemove:
+            requestedToken = ""
+        }
         try requireCurrentSettingsRequest(
             generation: requestGeneration,
             configRevision: effectiveBaseConfigRevision
         )
-        let tokenChanged = previousToken != normalizedToken
-        var tokenWritten = false
-        if tokenChanged {
-            do {
-                sideEffectWillStartObserver?("keychain.write")
-                try writeTokenToKeychain(normalizedToken)
-                tokenWritten = true
-            } catch {
-                withState {
-                    guard settingsRequestGeneration == requestGeneration else { return }
-                    let action = normalizedToken.isEmpty ? "delete" : "save"
-                    keychainErrorMessage = "Could not \(action) the Cloudflare token: \(error.localizedDescription)"
-                    publishCurrentSettingsErrorOnStateQueue()
-                }
-                throw error
-            }
-        }
+        let tokenChanged = requestedToken.map { requested in
+            withState { cachedCloudflareToken != requested }
+        } ?? false
 
-        do {
+        return try withTransaction {
             try requireCurrentSettingsRequest(
                 generation: requestGeneration,
                 configRevision: effectiveBaseConfigRevision
             )
-            return try withTransaction {
-                try requireCurrentSettingsRequest(
-                    generation: requestGeneration,
-                    configRevision: effectiveBaseConfigRevision
-                )
-                let mutationRevision = beginConfigMutation()
-                defer { endConfigMutation(mutationRevision) }
-                try requireKnownConfigState()
-                try requireCurrentRevision(mutationRevision)
+            let mutationRevision = beginConfigMutation()
+            defer { endConfigMutation(mutationRevision) }
+            try requireKnownConfigState()
+            try requireCurrentRevision(mutationRevision)
 
-                var previousConfig = config
-                var appliedConfig = newConfig
-                if mappingLifecycleChanged(from: previousConfig, to: appliedConfig) {
-                    previousConfig = try revokeMappingsBeforeConfigChange(
-                        previousConfig,
-                        expectedRevision: mutationRevision
-                    )
-                    appliedConfig.activeRouterMappings = []
-                    appliedConfig.ipv6PinholeID = nil
-                }
-                try persistNonKeychainSettings(
-                    appliedConfig,
-                    previousConfig: previousConfig,
+            var previousConfig = config
+            var appliedConfig = newConfig
+            if mappingLifecycleChanged(from: previousConfig, to: appliedConfig) {
+                previousConfig = try revokeMappingsBeforeConfigChange(
+                    previousConfig,
                     expectedRevision: mutationRevision
                 )
-
-                let committed = withState {
-                    guard configRevision == mutationRevision,
-                          lastCommittedSettingsGeneration < requestGeneration else {
-                        return false
-                    }
-                    if tokenChanged {
-                        keychainStateGeneration &+= 1
-                    }
-                    cachedCloudflareToken = normalizedToken
-                    keychainReadFailure = nil
-                    keychainErrorMessage = nil
-                    configPersistenceErrorMessage = nil
-                    launchAgentErrorMessage = nil
-                    if !recoveryStateUnknown {
-                        routerMappingErrorMessage = nil
-                    }
-                    lastCommittedSettingsGeneration = requestGeneration
-                    lastSettingsCommitRevision = mutationRevision
-                    commitConfigOnStateQueue(appliedConfig, advanceRevision: false)
-                    publishCurrentSettingsErrorOnStateQueue()
-                    return true
-                }
-                guard committed else { throw NetworkAgentError.superseded }
-                finishPostCommit(previousConfig: previousConfig, appliedConfig: appliedConfig)
-                return appliedConfig
+                appliedConfig.activeRouterMappings = []
+                appliedConfig.ipv6PinholeID = nil
             }
-        } catch {
-            if tokenWritten {
-                do {
-                    sideEffectWillStartObserver?("keychain.rollback")
-                    try writeTokenToKeychain(previousToken)
-                } catch {
+            try persistNonKeychainSettings(
+                appliedConfig,
+                previousConfig: previousConfig,
+                expectedRevision: mutationRevision
+            ) {
+                try sideEffectGate.sync {
+                    try requireCurrentSettingsRequest(
+                        generation: requestGeneration,
+                        configRevision: mutationRevision
+                    )
+                    if tokenChanged, let requestedToken {
+                        do {
+                            sideEffectWillStartObserver?("keychain.write")
+                            try writeTokenToKeychain(requestedToken)
+                        } catch {
+                            withState {
+                                let action = requestedToken.isEmpty ? "delete" : "save"
+                                keychainErrorMessage = "Could not \(action) the Cloudflare token: \(error.localizedDescription)"
+                                publishCurrentSettingsErrorOnStateQueue()
+                            }
+                            throw error
+                        }
+                    }
                     withState {
-                        guard settingsRequestGeneration == requestGeneration else { return }
-                        cachedCloudflareToken = nil
-                        keychainErrorMessage = "Could not roll back the Cloudflare token: \(error.localizedDescription)"
+                        if tokenChanged {
+                            keychainStateGeneration &+= 1
+                        }
+                        if let requestedToken {
+                            cachedCloudflareToken = requestedToken
+                            keychainReadFailure = nil
+                            keychainErrorMessage = nil
+                        }
+                        configPersistenceErrorMessage = nil
+                        launchAgentErrorMessage = nil
+                        if !recoveryStateUnknown {
+                            routerMappingErrorMessage = nil
+                        }
+                        lastCommittedSettingsGeneration = requestGeneration
+                        lastSettingsCommitRevision = mutationRevision
+                        commitConfigOnStateQueue(appliedConfig, advanceRevision: false)
                         publishCurrentSettingsErrorOnStateQueue()
                     }
-                    throw NetworkAgentError.transactionFailed(
-                        "Settings were not committed and the Cloudflare token rollback also failed: \(error.localizedDescription)"
-                    )
                 }
             }
-            throw error
+            finishPostCommit(previousConfig: previousConfig, appliedConfig: appliedConfig)
+            return appliedConfig
         }
     }
 
     private func persistNonKeychainSettings(
         _ appliedConfig: AppConfig,
         previousConfig: AppConfig,
-        expectedRevision: UInt64
+        expectedRevision: UInt64,
+        finalize: () throws -> Void
     ) throws {
         var loginItemChanged = false
         var configWritten = false
@@ -769,6 +762,8 @@ final class NetworkAgent {
             }
             configWritten = true
             try requireCurrentRevision(expectedRevision)
+            failureArea = "Cloudflare token"
+            try finalize()
         } catch {
             var rollbackFailures: [String] = []
             if configWritten {
@@ -857,6 +852,17 @@ final class NetworkAgent {
         withState { cachedCloudflareToken ?? "" }
     }
 
+    var cloudflareTokenState: CloudflareTokenReadState {
+        withState {
+            if let cachedCloudflareToken {
+                return cachedCloudflareToken.isEmpty
+                    ? .missing
+                    : .available(cachedCloudflareToken)
+            }
+            return keychainReadFailure == nil ? .unknown : .unavailable
+        }
+    }
+
     @discardableResult
     func loadCloudflareToken(
         retryAfterFailure: Bool = true,
@@ -916,41 +922,74 @@ final class NetworkAgent {
         return try result.get()
     }
 
-    func saveCloudflareToken(_ token: String) throws {
-        let normalized = token.trimmingCharacters(in: .whitespacesAndNewlines)
+    func applyCloudflareTokenMutation(_ mutation: CloudflareTokenMutation) throws {
+        try withKeychainTransaction {
+            try applyCloudflareTokenMutationOnKeychainQueue(mutation)
+        }
+    }
+
+    func applyCloudflareTokenMutationAsync(
+        _ mutation: CloudflareTokenMutation,
+        completion: @escaping (Result<Void, Error>) -> Void
+    ) {
+        keychainQueue.async {
+            let result = Result {
+                try self.applyCloudflareTokenMutationOnKeychainQueue(mutation)
+            }
+            DispatchQueue.main.async {
+                completion(result)
+            }
+        }
+    }
+
+    private func applyCloudflareTokenMutationOnKeychainQueue(
+        _ mutation: CloudflareTokenMutation
+    ) throws {
+        dispatchPrecondition(condition: .onQueue(keychainQueue))
+        let validatedMutation = try mutation.validated()
+        guard validatedMutation != .keepExisting else { return }
         guard sideEffectsEnabled else {
             withState {
-                cachedCloudflareToken = normalized
+                switch validatedMutation {
+                case .keepExisting:
+                    break
+                case .replace(let token):
+                    cachedCloudflareToken = token
+                case .explicitRemove:
+                    cachedCloudflareToken = ""
+                }
                 keychainReadFailure = nil
             }
             return
         }
 
-        try withKeychainTransaction {
-            let requestGeneration = withState { keychainStateGeneration }
-            let current = try loadCloudflareTokenOnKeychainQueue(
-                retryAfterFailure: true,
-                interaction: .userInitiated,
-                requestGeneration: requestGeneration
-            )
-            guard current != normalized else { return }
-            do {
-                try writeTokenToKeychain(normalized)
-                withState {
-                    keychainStateGeneration &+= 1
-                    cachedCloudflareToken = normalized
-                    keychainReadFailure = nil
-                    keychainErrorMessage = nil
-                    publishCurrentSettingsErrorOnStateQueue()
-                }
-            } catch {
-                withState {
-                    let action = normalized.isEmpty ? "delete" : "save"
-                    keychainErrorMessage = "Could not \(action) the Cloudflare token: \(error.localizedDescription)"
-                    publishCurrentSettingsErrorOnStateQueue()
-                }
-                throw error
+        let requestedToken: String
+        switch validatedMutation {
+        case .keepExisting:
+            return
+        case .replace(let token):
+            requestedToken = token
+        case .explicitRemove:
+            requestedToken = ""
+        }
+        guard withState({ cachedCloudflareToken != requestedToken }) else { return }
+        do {
+            try writeTokenToKeychain(requestedToken)
+            withState {
+                keychainStateGeneration &+= 1
+                cachedCloudflareToken = requestedToken
+                keychainReadFailure = nil
+                keychainErrorMessage = nil
+                publishCurrentSettingsErrorOnStateQueue()
             }
+            scheduleCheck(retryKeychainAfterFailure: false)
+        } catch {
+            withState {
+                let action = requestedToken.isEmpty ? "delete" : "save"
+                keychainErrorMessage = "Could not \(action) the Cloudflare token: \(error.localizedDescription)"
+                publishCurrentSettingsErrorOnStateQueue()
+            }
+            throw error
         }
     }
 
@@ -1025,12 +1064,12 @@ final class NetworkAgent {
                 let suppliedToken = token?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                 let candidate = suppliedToken.isEmpty
                     ? try self.loadCloudflareToken(
-                        retryAfterFailure: true,
+                        retryAfterFailure: false,
                         interaction: .userInitiated
                     )
                     : suppliedToken
                 guard !candidate.isEmpty else {
-                    throw CloudflareError.configuration("Cloudflare API token is missing")
+                    throw CloudflareError.configuration(.missingToken)
                 }
                 let config = self.config
                 self.workQueue.async {
@@ -1081,7 +1120,7 @@ final class NetworkAgent {
                     )
                     : suppliedToken
                 guard !candidate.isEmpty else {
-                    throw CloudflareError.configuration("Cloudflare API token is missing")
+                    throw CloudflareError.configuration(.missingToken)
                 }
                 let config = self.config
                 self.workQueue.async {
@@ -2861,6 +2900,11 @@ final class NetworkAgent {
     }
 
     private func buildConnectionURLs(config: AppConfig, status: inout AppStatus) {
+        status.connectionURL = nil
+        status.connectionURLIPv4 = nil
+        status.connectionURLIPv6 = nil
+        guard config.remoteAccessEnabled else { return }
+
         let dnsHost = config.dnsRecordName.trimmingCharacters(in: .whitespacesAndNewlines)
         let ipv4Port = status.externalPort ?? config.externalPort
         let ipv6Port = status.ipv6ExternalPort ?? config.externalPort

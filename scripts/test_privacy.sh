@@ -205,6 +205,8 @@ is_allowed_email() {
 is_allowed_domain() {
   local source_path="$1"
   local value="$2"
+  local xmlsig_domain="www.w3"".""org"
+  local xcode_domain="xcode"".""app"
 
   case "$value" in
     example.test|*.example.test)
@@ -228,6 +230,12 @@ is_allowed_domain() {
   esac
 
   case "$source_path" in
+    Tests/ReleasePipelineTests/Fixtures/productsign-flat-toc.xml|scripts/release_container_contract.py)
+      [[ "$value" == "$xmlsig_domain" ]] && return 0
+      ;;
+    scripts/test_final_candidate_validator.sh)
+      [[ "$value" == "$xmlsig_domain" || "$value" == "$xcode_domain" ]] && return 0
+      ;;
     scripts/test_keychain_identity.sh)
       local separator=.
       [[ "$value" == "subject${separator}cn" ]] && return 0

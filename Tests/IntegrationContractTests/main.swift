@@ -1,5 +1,6 @@
 import Foundation
 import Darwin
+import AppKit
 import LocalAuthentication
 import Security
 
@@ -16,6 +17,14 @@ struct SimulatedKeychainFailure: Error, LocalizedError {
 
     var errorDescription: String? {
         "Simulated Keychain \(operation) failure"
+    }
+}
+
+struct SimulatedLeakingCloudflareFailure: Error, LocalizedError {
+    let secret: String
+
+    var errorDescription: String? {
+        "Authorization Bearer \(secret) through proxy-user:proxy-password"
     }
 }
 
@@ -1342,7 +1351,7 @@ func testInvalidProxyPreventsAllPersistence() throws {
     )
 
     do {
-        try coordinator.persist(config: config, token: "never-persisted")
+        try coordinator.persist(config: config, tokenMutation: .replace("never-persisted"))
         throw IntegrationContractFailure("Invalid custom proxy must fail before persistence")
     } catch NetworkError.invalidProxyURL {
         // Expected: production proxy validation rejects the value first.
@@ -1364,7 +1373,7 @@ func testInactiveCredentialProxyIsScrubbedBeforePersistence() throws {
         }
     )
 
-    let normalized = try coordinator.persist(config: config, token: "test-token")
+    let normalized = try coordinator.persist(config: config, tokenMutation: .replace("test-token"))
     try expect(normalized.customProxyURL.isEmpty, "Inactive proxy credentials must be cleared from the normalized config")
     try expect(savedConfig?.customProxyURL == "", "Inactive proxy credentials must never reach config persistence")
 
@@ -1388,7 +1397,7 @@ func testInactiveValidProxyIsClearedBeforePersistence() throws {
         }
     )
 
-    _ = try coordinator.persist(config: config, token: "test-token")
+    _ = try coordinator.persist(config: config, tokenMutation: .replace("test-token"))
     try expect(savedConfig?.customProxyURL == "", "Unused custom proxy values must be cleared before config persistence")
 }
 
@@ -1399,13 +1408,17 @@ func testValidProxyPersistsInOrder() throws {
 
     var calls: [String] = []
     let coordinator = SettingsPersistenceCoordinator(
-        persistSettings: { config, token in
-            calls.append("transaction:\(token):\(config.customProxyURL)")
+        persistSettings: { config, mutation in
+            try expect(
+                mutation == .replace("test-token"),
+                "The persistence boundary must receive the explicit replacement mutation"
+            )
+            calls.append("transaction:test-token:\(config.customProxyURL)")
             return config
         }
     )
 
-    try coordinator.persist(config: config, token: "test-token")
+    try coordinator.persist(config: config, tokenMutation: .replace("test-token"))
     try expect(
         calls == ["transaction:test-token:socks5://[2001:db8::1]:1080"],
         "Valid settings must cross one transactional persistence boundary"
@@ -1424,12 +1437,600 @@ func testTokenFailurePreventsConfigPersistence() throws {
     )
 
     do {
-        try coordinator.persist(config: .default, token: "test-token")
+        try coordinator.persist(config: .default, tokenMutation: .replace("test-token"))
         throw IntegrationContractFailure("A token persistence failure must be propagated")
     } catch is TokenWriteFailure {
         // Expected: config persistence must not run after a failed token write.
     }
     try expect(calls == ["transaction"], "Transaction failure must propagate without reporting persistence success")
+}
+
+func testTokenMutationPolicyNeverInfersRemoval() throws {
+    let states: [CloudflareTokenReadState] = [
+        .unknown,
+        .missing,
+        .available("saved-token"),
+        .unavailable
+    ]
+    for state in states {
+        try expect(
+            SettingsTokenMutationPolicy.saveMutation(
+                enteredToken: "",
+                fieldWasEdited: false,
+                readState: state
+            ) == .keepExisting,
+            "An untouched token field must always keep the existing credential"
+        )
+        try expect(
+            SettingsTokenMutationPolicy.saveMutation(
+                enteredToken: "   \n",
+                fieldWasEdited: true,
+                readState: state
+            ) == .keepExisting,
+            "An edited but empty token field must never imply deletion"
+        )
+    }
+
+    try expect(
+        SettingsTokenMutationPolicy.saveMutation(
+            enteredToken: " replacement-token ",
+            fieldWasEdited: true,
+            readState: .unavailable
+        ) == .replace("replacement-token"),
+        "A nonempty edited field must become an explicit normalized replacement"
+    )
+    try expect(
+        SettingsTokenMutationPolicy.saveMutation(
+            enteredToken: "saved-token",
+            fieldWasEdited: true,
+            readState: .available("saved-token")
+        ) == .keepExisting,
+        "Re-entering the loaded token must not rewrite Keychain"
+    )
+    try expect(
+        SettingsTokenMutationPolicy.verificationToken(
+            enteredToken: "",
+            readState: .available("saved-token")
+        ) == "saved-token",
+        "Verify may use an already loaded token without changing it"
+    )
+    try expect(
+        SettingsTokenMutationPolicy.verificationToken(
+            enteredToken: "",
+            readState: .unknown
+        ) == nil,
+        "An unknown empty field must stay unknown instead of becoming a removal"
+    )
+    try expect(
+        SettingsTokenMutationPolicy.removalMutation(confirmed: false) == nil,
+        "Cancelling the removal confirmation must produce no mutation"
+    )
+    try expect(
+        SettingsTokenMutationPolicy.removalMutation(confirmed: true) == .explicitRemove,
+        "Only the confirmed removal action may produce explicitRemove"
+    )
+
+    do {
+        _ = try CloudflareTokenMutation.replace(" \n ").validated()
+        throw IntegrationContractFailure("An empty replacement payload must be rejected")
+    } catch CloudflareTokenMutationError.emptyReplacement {
+        // Expected: deletion has its own explicit operation.
+    }
+}
+
+func testKeepExistingSaveNeverTouchesUnknownOrFailedKeychain() throws {
+    enum FailureFixture: Equatable {
+        case none
+        case readFailure
+        case denied
+        case cancelled
+
+        var name: String {
+            switch self {
+            case .none: return "unknown"
+            case .readFailure: return "read-failure"
+            case .denied: return "denied"
+            case .cancelled: return "cancelled"
+            }
+        }
+    }
+
+    for fixture in [
+        FailureFixture.none,
+        .readFailure,
+        .denied,
+        .cancelled
+    ] {
+        let baseDirectory = try makeTemporaryDirectory(named: "token-keep-\(fixture.name)")
+        defer { try? FileManager.default.removeItem(at: baseDirectory) }
+
+        let reads = LockedCounter()
+        let writes = LockedCounter()
+        let deletes = LockedCounter()
+        let keychain = KeychainStore(
+            service: "unused",
+            operationHandlers: KeychainOperationHandlers(
+                set: { _, _ in _ = writes.increment() },
+                get: { _ in
+                    reads.increment()
+                    switch fixture {
+                    case .none:
+                        return "must-not-be-read"
+                    case .readFailure:
+                        throw SimulatedKeychainFailure(operation: "read")
+                    case .denied:
+                        throw KeychainError.status(operation: "read", code: errSecAuthFailed)
+                    case .cancelled:
+                        throw KeychainError.status(operation: "read", code: errSecUserCanceled)
+                    }
+                },
+                delete: { _ in _ = deletes.increment() }
+            )
+        )
+        let agent = NetworkAgent(
+            configStore: AppConfigStore(baseDirectory: baseDirectory),
+            keychain: keychain,
+            initialConfig: .default
+        )
+
+        if fixture != .none {
+            do {
+                _ = try agent.loadCloudflareToken(
+                    retryAfterFailure: false,
+                    interaction: .background
+                )
+                throw IntegrationContractFailure("\(fixture.name) fixture must fail its initial read")
+            } catch {
+                // Establish the denied/cancelled/failed state before ordinary Save.
+            }
+            try expect(
+                agent.cloudflareTokenState == .unavailable,
+                "\(fixture.name) must be represented as unavailable, never as a missing token"
+            )
+        } else {
+            try expect(agent.cloudflareTokenState == .unknown, "A fresh agent must begin with unknown token state")
+        }
+
+        var config = AppConfig.default
+        config.dnsRecordName = "\(fixture.name).example.test"
+        _ = try agent.persistSettings(
+            config: config,
+            tokenMutation: .keepExisting
+        )
+        let persisted = try AppConfigStore(baseDirectory: baseDirectory).load()
+        try expect(
+            persisted.dnsRecordName == config.dnsRecordName,
+            "Ordinary Save must still persist non-secret settings for \(fixture.name)"
+        )
+        try expect(
+            reads.current == (fixture == .none ? 0 : 1),
+            "keepExisting must not perform an additional Keychain read for \(fixture.name)"
+        )
+        try expect(writes.current == 0, "keepExisting must not write Keychain for \(fixture.name)")
+        try expect(deletes.current == 0, "keepExisting must not delete Keychain for \(fixture.name)")
+
+        _ = try agent.persistSettings(
+            config: config,
+            tokenMutation: .keepExisting
+        )
+        try expect(
+            reads.current == (fixture == .none ? 0 : 1),
+            "Repeated ordinary Save must not create repeated authorization prompts for \(fixture.name)"
+        )
+    }
+}
+
+func testVerifyKeepsTokenAndLatchesDeniedOrCancelledReads() throws {
+    let failures: [(String, OSStatus)] = [
+        ("denied", errSecAuthFailed),
+        ("cancelled", errSecUserCanceled)
+    ]
+
+    for (name, status) in failures {
+        let baseDirectory = try makeTemporaryDirectory(named: "token-verify-\(name)")
+        defer { try? FileManager.default.removeItem(at: baseDirectory) }
+
+        let reads = LockedCounter()
+        let writes = LockedCounter()
+        let deletes = LockedCounter()
+        let keychain = KeychainStore(
+            service: "unused",
+            operationHandlers: KeychainOperationHandlers(
+                set: { _, _ in _ = writes.increment() },
+                get: { _ in
+                    reads.increment()
+                    throw KeychainError.status(operation: "read", code: status)
+                },
+                delete: { _ in _ = deletes.increment() }
+            )
+        )
+        let agent = NetworkAgent(
+            configStore: AppConfigStore(baseDirectory: baseDirectory),
+            keychain: keychain,
+            initialConfig: .default
+        )
+
+        var firstResult: Result<[CloudflareZoneSummary], Error>?
+        agent.loadCloudflareZones(token: nil) { firstResult = $0 }
+        try expect(waitUntil { firstResult != nil }, "The first \(name) Verify callback must arrive")
+        if case .success = firstResult {
+            throw IntegrationContractFailure("A \(name) Keychain read must fail Verify")
+        }
+
+        var secondResult: Result<[CloudflareZoneSummary], Error>?
+        agent.loadCloudflareZones(token: nil) { secondResult = $0 }
+        try expect(waitUntil { secondResult != nil }, "The repeated \(name) Verify callback must arrive")
+        if case .success = secondResult {
+            throw IntegrationContractFailure("A repeated \(name) Verify must preserve the failure")
+        }
+
+        try expect(reads.current == 1, "Repeated \(name) Verify must consume the failure latch without another prompt")
+        try expect(writes.current == 0, "Verify must never persist a token after \(name)")
+        try expect(deletes.current == 0, "Verify must never delete a token after \(name)")
+        try expect(
+            !FileManager.default.fileExists(atPath: agentConfigPath(baseDirectory)),
+            "Verify must not persist ordinary settings before credential validation"
+        )
+        try expect(agent.cloudflareTokenState == .unavailable, "Verify \(name) must retain unavailable state")
+    }
+}
+
+func testSettingsVerifyDiscardsOutOfOrderAndEditedTokenResults() throws {
+    var coordinator = SettingsCloudflareVerificationCoordinator()
+    var config = AppConfig.default
+    config.ddnsProxyMode = .system
+    config.customProxyURL = "http://ignored.example.test:8080"
+
+    let tokenA = try coordinator.begin(
+        token: "token-a",
+        pendingTokenMutation: .replace("token-a"),
+        formConfig: config
+    )
+    config.ddnsProxyMode = .direct
+    let tokenB = try coordinator.begin(
+        token: "token-b",
+        pendingTokenMutation: .replace("token-b"),
+        formConfig: config
+    )
+
+    try expect(tokenA.token == "token-a", "The first Verify request must capture token A")
+    try expect(tokenB.token == "token-b", "The second Verify request must capture token B")
+    try expect(
+        tokenA.pendingTokenMutation == .replace("token-a"),
+        "Verify A feedback must remain bound to token A's captured mutation"
+    )
+    try expect(
+        tokenB.pendingTokenMutation == .replace("token-b"),
+        "Verify B feedback must remain bound to token B's captured mutation"
+    )
+    try expect(
+        !coordinator.complete(tokenA),
+        "A late Verify A callback must be discarded after Verify B starts"
+    )
+    try expect(
+        coordinator.complete(tokenB),
+        "The newest Verify B callback must be accepted"
+    )
+
+    let tokenBeforeEdit = try coordinator.begin(
+        token: "token-before-edit",
+        pendingTokenMutation: .replace("token-before-edit"),
+        formConfig: config
+    )
+    try expect(
+        coordinator.cancelActive(),
+        "Editing the token while Verify is running must cancel the active generation"
+    )
+    try expect(
+        !coordinator.complete(tokenBeforeEdit),
+        "A callback for the pre-edit token must never update the edited field"
+    )
+}
+
+func testSettingsVerifyUsesUnsavedCloudflareProxyWithoutPersistence() throws {
+    let baseDirectory = try makeTemporaryDirectory(named: "verify-unsaved-proxy")
+    defer { try? FileManager.default.removeItem(at: baseDirectory) }
+
+    var config = AppConfig.default
+    config.ddnsProxyMode = .custom
+    config.customProxyURL = "  socks5://proxy.example.test:1080  "
+    var coordinator = SettingsCloudflareVerificationCoordinator()
+    let request = try coordinator.begin(
+        token: "candidate-token",
+        pendingTokenMutation: .replace("candidate-token"),
+        formConfig: config
+    )
+
+    try expect(request.proxyMode == .custom, "Verify must capture the current unsaved DDNS proxy mode")
+    try expect(
+        request.customProxyURL == "socks5://proxy.example.test:1080",
+        "Verify must normalize and capture the current unsaved custom proxy URL"
+    )
+    try expect(
+        config.customProxyURL == "  socks5://proxy.example.test:1080  ",
+        "Building a Verify request must not mutate the form configuration"
+    )
+    try expect(
+        !FileManager.default.fileExists(atPath: agentConfigPath(baseDirectory)),
+        "Building a Verify request must not persist settings"
+    )
+
+    config.ddnsProxyMode = .direct
+    let directRequest = try coordinator.begin(
+        token: "candidate-token",
+        pendingTokenMutation: .keepExisting,
+        formConfig: config
+    )
+    try expect(directRequest.proxyMode == .direct, "Verify must use the current unsaved Direct mode")
+    try expect(
+        directRequest.customProxyURL.isEmpty,
+        "Direct Verify must not carry an inactive custom proxy URL"
+    )
+
+    config.ddnsProxyMode = .custom
+    config.customProxyURL = "not-a-proxy"
+    do {
+        _ = try coordinator.begin(
+            token: "candidate-token",
+            pendingTokenMutation: .keepExisting,
+            formConfig: config
+        )
+        throw IntegrationContractFailure("An invalid unsaved custom proxy must block Verify")
+    } catch NetworkError.invalidProxyURL {
+        // Expected: invalid visible form data cannot silently fall back to saved routing.
+    }
+    try expect(
+        !coordinator.complete(directRequest),
+        "A failed newer Verify attempt must still invalidate the previous request"
+    )
+}
+
+func testCloudflareTokenRemovalPromptCancelAndConfirmContract() throws {
+    let alert = SettingsCloudflareTokenRemovalPrompt.makeAlert()
+    try expect(alert.buttons.count == 2, "Token removal must offer exactly Remove and Cancel")
+    try expect(alert.buttons[0].title == "Remove Token", "The first action must explicitly remove the token")
+    try expect(
+        alert.buttons[0].hasDestructiveAction,
+        "The Remove Token button must use macOS destructive-action styling"
+    )
+    try expect(alert.buttons[1].title == "Cancel", "The safe secondary action must be Cancel")
+    try expect(
+        SettingsCloudflareTokenRemovalPrompt.mutation(for: .alertSecondButtonReturn) == nil,
+        "Cancelling the removal alert must not produce a Keychain mutation"
+    )
+    try expect(
+        SettingsCloudflareTokenRemovalPrompt.mutation(for: .alertFirstButtonReturn) == .explicitRemove,
+        "Confirming the removal alert must produce only an explicit token removal"
+    )
+}
+
+func testCloudflareTokenRemovalControllerPath() throws {
+    _ = NSApplication.shared
+    let baseDirectory = try makeTemporaryDirectory(named: "token-removal-controller")
+    defer { try? FileManager.default.removeItem(at: baseDirectory) }
+
+    let lock = NSLock()
+    var reads = 0
+    var writes = 0
+    var deletes = 0
+    var storedToken: String?
+    let keychain = KeychainStore(
+        service: "unused",
+        operationHandlers: KeychainOperationHandlers(
+            set: { value, _ in
+                lock.lock()
+                storedToken = value
+                writes += 1
+                lock.unlock()
+            },
+            get: { _ in
+                lock.lock()
+                reads += 1
+                let value = storedToken
+                lock.unlock()
+                return value
+            },
+            delete: { _ in
+                lock.lock()
+                storedToken = nil
+                deletes += 1
+                lock.unlock()
+            }
+        )
+    )
+    let agent = NetworkAgent(
+        configStore: AppConfigStore(baseDirectory: baseDirectory),
+        keychain: keychain,
+        initialConfig: .default
+    )
+    try agent.applyCloudflareTokenMutation(.replace("saved-token"))
+    lock.lock()
+    reads = 0
+    writes = 0
+    deletes = 0
+    lock.unlock()
+
+    var response = NSApplication.ModalResponse.alertSecondButtonReturn
+    let controller = SettingsWindowController(
+        agent: agent,
+        autoLoadCloudflare: false,
+        tokenRemovalResponseProvider: { _ in response }
+    )
+
+    controller.confirmRemoveCloudflareToken()
+    RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+    lock.lock()
+    let cancelledCounts = (reads, writes, deletes)
+    lock.unlock()
+    try expect(
+        cancelledCounts == (0, 0, 0),
+        "Cancel through the real remove-button controller action must perform zero Keychain operations"
+    )
+
+    response = .alertFirstButtonReturn
+    controller.confirmRemoveCloudflareToken()
+    try expect(
+        waitUntil {
+            lock.lock()
+            let completed = deletes == 1
+            lock.unlock()
+            return completed
+        },
+        "Confirmed controller removal must complete one Keychain delete"
+    )
+    lock.lock()
+    let confirmedCounts = (reads, writes, deletes)
+    lock.unlock()
+    try expect(
+        confirmedCounts == (0, 0, 1),
+        "Confirm through the real controller action must perform read=0, write=0, delete=1"
+    )
+    try expect(agent.cloudflareTokenState == .missing, "Confirmed controller removal must publish missing state")
+    controller.close()
+}
+
+func testCloudflareZoneReadPresentationDoesNotClaimDNSReady() throws {
+    let singular = SettingsCloudflareZoneReadPresentation.message(
+        zoneCount: 1,
+        pendingStorage: false
+    )
+    try expect(
+        singular == "Token is active and can read 1 zone. DNS Edit is confirmed when Gatebeam updates the selected record.",
+        "Verify must accurately describe one readable zone without claiming DNS readiness"
+    )
+    let plural = SettingsCloudflareZoneReadPresentation.message(
+        zoneCount: 2,
+        pendingStorage: true
+    )
+    try expect(plural.contains("2 zones"), "Verify must use the plural zone form")
+    try expect(plural.contains("Save Changes stores it"), "An unsaved verified token must be described as pending storage")
+    for message in [singular, plural] {
+        try expect(!message.contains("Connected"), "Zone Read verification must never claim Connected")
+        try expect(!message.contains("ready"), "Zone Read verification must never claim DNS ready")
+    }
+}
+
+func testSettingsCloudflareErrorPresentationFailsClosed() throws {
+    let secret = "cfut_UI_SECRET_123"
+    let unexpected = SettingsCloudflareErrorPresentation.message(
+        for: SimulatedLeakingCloudflareFailure(secret: secret)
+    )
+    try expect(
+        unexpected == SettingsCloudflareErrorPresentation.genericMessage,
+        "An unexpected Cloudflare-path error must use fixed local UI copy"
+    )
+    try expect(
+        !unexpected.contains(secret) && !unexpected.contains("proxy-password"),
+        "Unexpected backend errors must not expose token or proxy fragments in Settings"
+    )
+
+    let invalidProxy = SettingsCloudflareErrorPresentation.message(
+        for: NetworkError.invalidProxyURL(
+            "http://proxy-user:proxy-password@example.test cfut_PROXY_SECRET"
+        )
+    )
+    try expect(
+        invalidProxy == "Invalid proxy URL: \(SettingsProxyValidation.formatMessage)",
+        "Proxy validation UI must use the fixed local format message"
+    )
+    try expect(
+        !invalidProxy.contains("proxy-password") && !invalidProxy.contains("cfut_"),
+        "Proxy validation UI must not echo the rejected proxy value"
+    )
+
+    let controlled = CloudflareError.service(
+        operation: .listZones,
+        failure: .rejected(httpStatus: 500, safeCodes: [])
+    )
+    try expect(
+        SettingsCloudflareErrorPresentation.message(for: controlled)
+            == controlled.localizedDescription,
+        "A controlled Cloudflare error must retain its fixed actionable UI copy"
+    )
+}
+
+func testRemoteConnectionURLPolicyFailsClosedWhenAccessIsOff() throws {
+    var status = AppStatus.initial
+    status.connectionURL = "vnc://remote.example.test:45900"
+    status.connectionURLIPv4 = "vnc://192.0.2.8:45900"
+    status.connectionURLIPv6 = "vnc://[2001:db8::8]:5900"
+
+    try expect(
+        RemoteConnectionURLPolicy.displayURL(remoteAccessEnabled: false, status: status)
+            == RemoteConnectionURLPolicy.unavailableText,
+        "An off UI must display an unavailable placeholder instead of a stale VNC URL"
+    )
+    try expect(
+        RemoteConnectionURLPolicy.primaryCopyURL(remoteAccessEnabled: false, status: status) == nil,
+        "The primary copy action must fail closed while remote access is off"
+    )
+    try expect(
+        RemoteConnectionURLPolicy.ipv6CopyURL(remoteAccessEnabled: false, status: status) == nil,
+        "The IPv6 copy action must fail closed while remote access is off"
+    )
+    try expect(
+        RemoteConnectionURLPolicy.primaryCopyURL(remoteAccessEnabled: true, status: status)
+            == status.connectionURLIPv4,
+        "The enabled primary copy action must prefer the explicit IPv4 URL"
+    )
+}
+
+func testExplicitReplacementAndRemovalAreIdempotent() throws {
+    let baseDirectory = try makeTemporaryDirectory(named: "token-explicit-mutations")
+    defer { try? FileManager.default.removeItem(at: baseDirectory) }
+
+    let lock = NSLock()
+    var storedToken: String? = "old-token"
+    var writes: [String] = []
+    var readCount = 0
+    var deleteCount = 0
+    let keychain = KeychainStore(
+        service: "unused",
+        operationHandlers: KeychainOperationHandlers(
+            set: { value, _ in
+                lock.lock()
+                storedToken = value
+                writes.append(value)
+                lock.unlock()
+            },
+            get: { _ in
+                lock.lock()
+                defer { lock.unlock() }
+                readCount += 1
+                return storedToken
+            },
+            delete: { _ in
+                lock.lock()
+                storedToken = nil
+                deleteCount += 1
+                lock.unlock()
+            }
+        )
+    )
+    let agent = NetworkAgent(
+        configStore: AppConfigStore(baseDirectory: baseDirectory),
+        keychain: keychain,
+        initialConfig: .default
+    )
+
+    _ = try agent.persistSettings(
+        config: .default,
+        tokenMutation: .replace("new-token")
+    )
+    _ = try agent.persistSettings(
+        config: .default,
+        tokenMutation: .replace("new-token")
+    )
+    try expect(writes == ["new-token"], "Repeating the same replacement must not rewrite Keychain")
+    try expect(readCount == 0, "Explicit replacement must not pre-read the old token")
+    try expect(agent.cloudflareTokenState == .available("new-token"), "Replacement must update the visible token state")
+
+    try agent.applyCloudflareTokenMutation(.explicitRemove)
+    try agent.applyCloudflareTokenMutation(.explicitRemove)
+    try expect(deleteCount == 1, "Repeating explicit removal must not trigger another Keychain prompt or delete")
+    try expect(readCount == 0, "Explicit removal must not pre-read the old token")
+    try expect(storedToken == nil, "Explicit removal must delete the saved token")
+    try expect(agent.cloudflareTokenState == .missing, "Explicit removal must publish missing state")
 }
 
 func testDisabledSideEffectsRejectChecks() throws {
@@ -1566,15 +2167,21 @@ func testKeychainDeleteFailurePreservesTokenAndBlocksConfig() throws {
     defer { stopAgentForCleanup(agent) }
     let loadedToken = try agent.loadCloudflareToken()
     try expect(loadedToken == existingToken, "The fixture token must load before deletion")
+    var changedConfig = AppConfig.default
+    changedConfig.checkIntervalSeconds = 900
 
     do {
-        try agent.persistSettings(config: .default, token: "")
+        try agent.persistSettings(config: changedConfig, tokenMutation: .explicitRemove)
         throw IntegrationContractFailure("A Keychain delete error must propagate through settings persistence")
     } catch is SimulatedKeychainFailure {
         // Expected.
     }
 
-    try expect(!FileManager.default.fileExists(atPath: agentConfigPath(baseDirectory)), "A failed token deletion must block config persistence")
+    let rolledBackConfig = try AppConfigStore(baseDirectory: baseDirectory).load()
+    try expect(
+        rolledBackConfig.checkIntervalSeconds == AppConfig.default.checkIntervalSeconds,
+        "A failed token deletion must roll back the requested config change"
+    )
     try expect(agent.cloudflareToken() == existingToken, "A failed deletion must preserve the cached token for UI rollback")
     try expect(
         agent.status.settingsErrorMessage?.contains("Could not delete") == true,
@@ -1582,8 +2189,13 @@ func testKeychainDeleteFailurePreservesTokenAndBlocksConfig() throws {
     )
 
     deleteShouldFail = false
-    try agent.persistSettings(config: .default, token: "")
+    try agent.persistSettings(config: changedConfig, tokenMutation: .explicitRemove)
     try expect(FileManager.default.fileExists(atPath: agentConfigPath(baseDirectory)), "A successful retry may persist config after Keychain deletion")
+    let persistedConfig = try AppConfigStore(baseDirectory: baseDirectory).load()
+    try expect(
+        persistedConfig.checkIntervalSeconds == 900,
+        "A successful retry must persist the requested config"
+    )
     try expect(agent.cloudflareToken().isEmpty, "A successful retry must update the cached token")
     try expect(agent.status.settingsErrorMessage == nil, "A successful Keychain retry must clear its visible error")
 }
@@ -2100,7 +2712,7 @@ func testExplicitKeychainAuthorizationClearsFailureLatch() throws {
     )
 }
 
-func testLegacyMigrationSerializesConcurrentEmptySave() throws {
+func testLegacyMigrationSerializesConcurrentKeepExistingSave() throws {
     let baseDirectory = try makeTemporaryDirectory(named: "keychain-migration-empty-save")
     defer {
         try? FileManager.default.removeItem(at: baseDirectory)
@@ -2158,14 +2770,14 @@ func testLegacyMigrationSerializesConcurrentEmptySave() throws {
     )
 
     var saveResult: Result<AppConfig, Error>?
-    agent.persistSettingsAsync(config: .default, token: "") { saveResult = $0 }
+    agent.persistSettingsAsync(config: .default, tokenMutation: .keepExisting) { saveResult = $0 }
     Thread.sleep(forTimeInterval: 0.05)
     lock.lock()
     let eventsWhileMigrationIsBlocked = events
     lock.unlock()
     try expect(
         !eventsWhileMigrationIsBlocked.contains("delete:\(currentService)"),
-        "An empty save submitted during migration must not touch Keychain before authorization finishes"
+        "A keep-existing save submitted during migration must not touch Keychain before authorization finishes"
     )
     finishMigration.signal()
 
@@ -2183,12 +2795,19 @@ func testLegacyMigrationSerializesConcurrentEmptySave() throws {
     let legacyDelete = finalEvents.firstIndex(of: "delete:\(legacyService)")
     let currentDelete = finalEvents.lastIndex(of: "delete:\(currentService)")
     try expect(
-        legacyDelete != nil && currentDelete != nil && legacyDelete! < currentDelete!,
-        "Legacy cleanup must finish before the queued save deletes the current item"
+        legacyDelete != nil && currentDelete == nil,
+        "Migration may remove only the legacy item; a keep-existing save must never delete the current item"
     )
-    try expect(finalValues.isEmpty, "The queued empty save must leave neither legacy nor current token behind")
-    try expect(agent.cloudflareToken().isEmpty, "The UI token cache must match the serialized empty save")
-    try expect(agent.status.settingsErrorMessage == nil, "Successful migration and deletion must clear Keychain errors")
+    try expect(
+        finalValues["\(currentService):\(account)"] == "legacy-race-token"
+            && finalValues["\(legacyService):\(account)"] == nil,
+        "A keep-existing save must preserve the migrated token"
+    )
+    try expect(
+        agent.cloudflareToken() == "legacy-race-token",
+        "The UI token cache must retain the authorized token after a keep-existing save"
+    )
+    try expect(agent.status.settingsErrorMessage == nil, "Successful migration and save must clear Keychain errors")
 }
 
 func testOldBackgroundReadCannotOverwriteAuthorizationSuccess() throws {
@@ -2342,8 +2961,8 @@ func testDeleteWriteAuthorizeOrderingSurvivesBackendRestart() throws {
     var deleteResult: Result<AppConfig, Error>?
     var writeResult: Result<AppConfig, Error>?
     var authorizationResult: Result<KeychainAuthorizationOutcome, Error>?
-    agent.persistSettingsAsync(config: .default, token: "") { deleteResult = $0 }
-    agent.persistSettingsAsync(config: .default, token: "replacement-token") { writeResult = $0 }
+    agent.persistSettingsAsync(config: .default, tokenMutation: .explicitRemove) { deleteResult = $0 }
+    agent.persistSettingsAsync(config: .default, tokenMutation: .replace("replacement-token")) { writeResult = $0 }
     agent.authorizeSavedCloudflareToken { authorizationResult = $0 }
 
     try expect(
@@ -2475,7 +3094,7 @@ func testSettingsTransactionRollsBackOnConfigWriteFailure() throws {
     failWrites = true
 
     do {
-        try agent.persistSettings(config: requestedConfig, token: "after-token")
+        try agent.persistSettings(config: requestedConfig, tokenMutation: .replace("after-token"))
         throw IntegrationContractFailure("Config write failure must fail the settings transaction")
     } catch is AppConfigStoreError {
         // Expected.
@@ -2700,7 +3319,7 @@ func testSideEffectGateLinearizesTheFinalCheckWindow() throws {
     var disabled = config
     disabled.remoteAccessEnabled = false
     var saveCompleted = false
-    agent.persistSettingsAsync(config: disabled, token: "") { result in
+    agent.persistSettingsAsync(config: disabled, tokenMutation: .keepExisting) { result in
         if case .success = result {
             saveCompleted = true
         }
@@ -4520,7 +5139,7 @@ func testPersistSettingsAsyncNeverBlocksTheMainThread() throws {
     var completionWasOnMain = false
     var completionError: Error?
     let startedAt = Date()
-    agent.persistSettingsAsync(config: requested, token: "") { result in
+    agent.persistSettingsAsync(config: requested, tokenMutation: .keepExisting) { result in
         completionArrived = true
         completionWasOnMain = Thread.isMainThread
         if case .failure(let error) = result {
@@ -4926,7 +5545,7 @@ func testMappingIdentityChangeMustDeleteOldRuleFirst() throws {
         var requested = previous
         applyChange(&requested)
         do {
-            _ = try agent.persistSettings(config: requested, token: "")
+            _ = try agent.persistSettings(config: requested, tokenMutation: .keepExisting)
             throw IntegrationContractFailure("A failed old-rule deletion must block the new \(name)")
         } catch {
             try expect(
@@ -4998,7 +5617,7 @@ func testPostCleanupPersistenceFailureKeepsTruthfulMappingState() throws {
     var requested = previous
     requested.externalPort += 1
     do {
-        _ = try agent.persistSettings(config: requested, token: "")
+        _ = try agent.persistSettings(config: requested, tokenMutation: .keepExisting)
         throw IntegrationContractFailure("The injected post-cleanup config failure must propagate")
     } catch is AppConfigStoreError {
         // Expected.
@@ -5721,7 +6340,7 @@ func testTemporaryAccessExpirationDoesNotWaitForKeychainAuthorization() throws {
     )
     agent.persistSettingsAsync(
         config: config,
-        token: "stale-settings-token"
+        tokenMutation: .replace("stale-settings-token")
     ) { result in
         resultLock.lock()
         staleSaveResult = result
@@ -6823,7 +7442,7 @@ func testDisabledSideEffectsNeverTouchInjectedLANServices() throws {
     agent.start()
     agent.runCheck()
     agent.setRemoteAccessEnabled(false)
-    _ = try agent.persistSettings(config: .default, token: "")
+    _ = try agent.persistSettings(config: .default, tokenMutation: .keepExisting)
     RunLoop.current.run(until: Date().addingTimeInterval(0.1))
 
     try expect(local.callCount == 0, "Disabled side effects must not inspect LAN addresses, gateways, or ports")
@@ -6846,6 +7465,17 @@ let tests: [(String, () throws -> Void)] = [
     ("inactive valid proxy scrubbing", testInactiveValidProxyIsClearedBeforePersistence),
     ("valid proxy persistence ordering", testValidProxyPersistsInOrder),
     ("token failure persistence ordering", testTokenFailurePreventsConfigPersistence),
+    ("token mutation policy never infers removal", testTokenMutationPolicyNeverInfersRemoval),
+    ("keep-existing save isolates unknown and failed Keychain", testKeepExistingSaveNeverTouchesUnknownOrFailedKeychain),
+    ("Verify latches denied and cancelled Keychain reads", testVerifyKeepsTokenAndLatchesDeniedOrCancelledReads),
+    ("Settings Verify rejects stale token callbacks", testSettingsVerifyDiscardsOutOfOrderAndEditedTokenResults),
+    ("Settings Verify uses unsaved Cloudflare proxy", testSettingsVerifyUsesUnsavedCloudflareProxyWithoutPersistence),
+    ("Cloudflare token removal prompt contract", testCloudflareTokenRemovalPromptCancelAndConfirmContract),
+    ("Cloudflare token removal controller path", testCloudflareTokenRemovalControllerPath),
+    ("Cloudflare Zone Read presentation", testCloudflareZoneReadPresentationDoesNotClaimDNSReady),
+    ("Settings Cloudflare error presentation", testSettingsCloudflareErrorPresentationFailsClosed),
+    ("remote connection URL off-state policy", testRemoteConnectionURLPolicyFailsClosedWhenAccessIsOff),
+    ("explicit token replacement and removal idempotence", testExplicitReplacementAndRemovalAreIdempotent),
     ("disabled side-effects check isolation", testDisabledSideEffectsRejectChecks),
     ("disabled side-effects config isolation", testDisabledSideEffectsDoNotReadSuppliedConfigStore),
     ("Keychain read error propagation", testKeychainReadFailurePropagates),
@@ -6858,7 +7488,7 @@ let tests: [(String, () throws -> Void)] = [
     ("Keychain current item ACL refresh", testCurrentKeychainItemAuthorizationRefreshesAccess),
     ("Keychain legacy cleanup retry", testLegacyCleanupFailureRetriesWithoutLosingSecureCopy),
     ("Keychain explicit authorization latch", testExplicitKeychainAuthorizationClearsFailureLatch),
-    ("Keychain migration and concurrent empty save", testLegacyMigrationSerializesConcurrentEmptySave),
+    ("Keychain migration and concurrent keep-existing save", testLegacyMigrationSerializesConcurrentKeepExistingSave),
     ("Keychain stale read and authorization ordering", testOldBackgroundReadCannotOverwriteAuthorizationSuccess),
     ("Keychain delete write authorize restart ordering", testDeleteWriteAuthorizeOrderingSurvivesBackendRestart),
     ("real config write failure", testConfigStoreReportsRealWriteFailure),

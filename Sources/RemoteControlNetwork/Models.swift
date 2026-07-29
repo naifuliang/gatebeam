@@ -74,6 +74,68 @@ enum DNSProvider: String, Codable, CaseIterable {
     case cloudflare
 }
 
+enum CloudflareTokenMutation: Equatable {
+    case keepExisting
+    case replace(String)
+    case explicitRemove
+
+    func validated() throws -> CloudflareTokenMutation {
+        switch self {
+        case .keepExisting, .explicitRemove:
+            return self
+        case .replace(let token):
+            let normalized = token.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !normalized.isEmpty else {
+                throw CloudflareTokenMutationError.emptyReplacement
+            }
+            return .replace(normalized)
+        }
+    }
+}
+
+enum CloudflareTokenMutationError: Error, LocalizedError {
+    case emptyReplacement
+
+    var errorDescription: String? {
+        "A replacement Cloudflare token cannot be empty. Use the explicit Remove Token action instead."
+    }
+}
+
+enum CloudflareTokenReadState: Equatable {
+    case unknown
+    case missing
+    case available(String)
+    case unavailable
+}
+
+enum RemoteConnectionURLPolicy {
+    static let unavailableText = "Unavailable while remote access is off"
+
+    static func displayURL(
+        remoteAccessEnabled: Bool,
+        status: AppStatus
+    ) -> String {
+        guard remoteAccessEnabled else { return unavailableText }
+        return status.connectionURL ?? "No connection URL yet"
+    }
+
+    static func primaryCopyURL(
+        remoteAccessEnabled: Bool,
+        status: AppStatus
+    ) -> String? {
+        guard remoteAccessEnabled else { return nil }
+        return status.connectionURLIPv4 ?? status.connectionURL
+    }
+
+    static func ipv6CopyURL(
+        remoteAccessEnabled: Bool,
+        status: AppStatus
+    ) -> String? {
+        guard remoteAccessEnabled else { return nil }
+        return status.connectionURLIPv6
+    }
+}
+
 enum MappingProtocolPreference: String, Codable, CaseIterable {
     case automatic
     case pcp

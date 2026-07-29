@@ -39,6 +39,18 @@ jobs:
       - name: Run formal release pipeline tests
         run: ./scripts/test_release_pipeline.sh
 
+      - name: Run final artifact contract tests
+        run: ./scripts/test_final_artifact_contract.sh
+
+      - name: Run final candidate validator behavior tests
+        run: ./scripts/test_final_candidate_validator.sh
+
+      - name: Run formal publisher tests
+        run: ./scripts/test_formal_publish.sh
+
+      - name: Validate formal release workflow contract
+        run: ./scripts/test_release_workflow_contract.sh
+
       - name: Verify Keychain and code-signing identity
         run: ./scripts/test_keychain_identity.sh
 

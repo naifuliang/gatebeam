@@ -18,6 +18,18 @@ final class MockHTTPClient: HTTPRequesting {
     }
 }
 
+final class ThrowingHTTPClient: HTTPRequesting {
+    let error: Error
+
+    init(error: Error) {
+        self.error = error
+    }
+
+    func request(_ request: HTTPRequest) throws -> HTTPResponse {
+        throw error
+    }
+}
+
 struct TestFailure: Error, LocalizedError {
     let message: String
 
@@ -28,8 +40,12 @@ struct TestFailure: Error, LocalizedError {
     var errorDescription: String? { message }
 }
 
-func response(_ json: String, status: Int = 200) -> HTTPResponse {
-    HTTPResponse(statusCode: status, data: Data(json.utf8), headers: [:])
+func response(
+    _ json: String,
+    status: Int = 200,
+    headers: [AnyHashable: Any] = [:]
+) -> HTTPResponse {
+    HTTPResponse(statusCode: status, data: Data(json.utf8), headers: headers)
 }
 
 func pcpDeletionResponse(for request: Data, resultCode: UInt8 = 0) -> Data {
@@ -6488,9 +6504,12 @@ func testOlderConfigDecodesWithoutIPv6State() throws {
     try expect(decoded.activeRouterMappings.isEmpty, "Older configs should default tracked router mappings to an empty list")
 }
 
-func testReportsCloudflareAPIError() throws {
+func testReportsCloudflareDNSPermissionGuidanceWithoutResponseSecrets() throws {
     let mock = MockHTTPClient(responses: [
-        response(#"{"success":false,"errors":[{"code":9109,"message":"Invalid access token"}],"result":null}"#, status: 403)
+        response(
+            #"{"success":false,"errors":[{"code":9109,"message":"secret-marker"}],"result":null}"#,
+            status: 403
+        )
     ])
     let provider = CloudflareDNSProvider(http: mock)
 
@@ -6501,9 +6520,309 @@ func testReportsCloudflareAPIError() throws {
             ipAddress: "192.0.0.9",
             token: "bad-token"
         )
-        throw TestFailure("Invalid token response should fail")
+        throw TestFailure("A denied DNS-record request should fail")
     } catch let error as CloudflareError {
-        try expect(error.localizedDescription.contains("9109"), "Cloudflare error code should be preserved")
+        try expect(
+            error.localizedDescription == CloudflarePermissionGuidance.dnsWriteDenied,
+            "A DNS-record 403 must explain the exact target-zone permissions"
+        )
+        try expect(
+            !error.localizedDescription.contains("secret-marker"),
+            "A DNS-record 403 must not expose response-body details"
+        )
+    }
+}
+
+func testReportsCloudflareCreatePermissionGuidance() throws {
+    let mock = MockHTTPClient(responses: [
+        response(#"{"success":true,"errors":[],"result":[]}"#),
+        response(
+            #"{"success":false,"errors":[{"code":10000,"message":"secret-create-marker"}],"result":null}"#,
+            status: 403
+        )
+    ])
+    let provider = CloudflareDNSProvider(http: mock)
+
+    do {
+        _ = try provider.upsertARecord(
+            zoneID: "0123456789abcdef0123456789abcdef",
+            recordName: "mac.example.com",
+            ipAddress: "192.0.0.9",
+            token: "under-scoped-token"
+        )
+        throw TestFailure("A denied first DNS write should fail")
+    } catch let error as CloudflareError {
+        try expect(
+            error.localizedDescription == CloudflarePermissionGuidance.dnsWriteDenied,
+            "The first denied DNS write must request Zone/DNS/Edit and Zone/Zone/Read"
+        )
+        try expect(
+            !error.localizedDescription.contains("secret-create-marker"),
+            "The first denied DNS write must not expose the Cloudflare response body"
+        )
+    }
+}
+
+private let cloudflareTokenPrefix = "cf" + "ut_"
+private let cloudflareResponseToken = cloudflareTokenPrefix + "RESPONSE_SECRET_123"
+private let cloudflareTransportToken = cloudflareTokenPrefix + "TRANSPORT_SECRET"
+
+private let cloudflareSecretFragments = [
+    cloudflareResponseToken,
+    "Authorization: Bearer response-secret",
+    "proxy-user:proxy-password",
+    "<html>private gateway response</html>",
+    "9109: server-controlled-message"
+]
+
+private func cloudflareErrorFixture(
+    operation: CloudflareOperation,
+    body: String,
+    status: Int
+) throws -> CloudflareError {
+    let secretHeaders: [AnyHashable: Any] = [
+        "Authorization": "Bearer cfut_HEADER_SECRET",
+        "Proxy-Authorization": "Basic proxy-password",
+        "X-Debug-Secret": "header-secret"
+    ]
+    let failing = response(body, status: status, headers: secretHeaders)
+    let verifySuccess = response(
+        #"{"success":true,"errors":[],"result":{"id":"token-1","status":"active"}}"#
+    )
+    let emptyRecords = response(#"{"success":true,"errors":[],"result":[]}"#)
+    let existingRecord = response(
+        #"{"success":true,"errors":[],"result":[{"id":"record-1","type":"A","name":"mac.example.com","content":"192.0.0.10","ttl":120,"proxied":false}]}"#
+    )
+    let provider: CloudflareDNSProvider
+
+    do {
+        switch operation {
+        case .verifyToken:
+            provider = CloudflareDNSProvider(http: MockHTTPClient(responses: [failing]))
+            _ = try provider.listZones(token: "request-token")
+        case .listZones:
+            provider = CloudflareDNSProvider(
+                http: MockHTTPClient(responses: [verifySuccess, failing])
+            )
+            _ = try provider.listZones(token: "request-token")
+        case .readZone:
+            provider = CloudflareDNSProvider(
+                http: MockHTTPClient(responses: [verifySuccess, failing])
+            )
+            _ = try provider.validateConfiguration(
+                zoneID: "0123456789abcdef0123456789abcdef",
+                recordName: "mac.example.com",
+                token: "request-token"
+            )
+        case .listDNSRecords:
+            provider = CloudflareDNSProvider(http: MockHTTPClient(responses: [failing]))
+            _ = try provider.upsertARecord(
+                zoneID: "0123456789abcdef0123456789abcdef",
+                recordName: "mac.example.com",
+                ipAddress: "192.0.0.9",
+                token: "request-token"
+            )
+        case .createDNSRecord:
+            provider = CloudflareDNSProvider(
+                http: MockHTTPClient(responses: [emptyRecords, failing])
+            )
+            _ = try provider.upsertARecord(
+                zoneID: "0123456789abcdef0123456789abcdef",
+                recordName: "mac.example.com",
+                ipAddress: "192.0.0.9",
+                token: "request-token"
+            )
+        case .updateDNSRecord:
+            provider = CloudflareDNSProvider(
+                http: MockHTTPClient(responses: [existingRecord, failing])
+            )
+            _ = try provider.upsertARecord(
+                zoneID: "0123456789abcdef0123456789abcdef",
+                recordName: "mac.example.com",
+                ipAddress: "192.0.0.9",
+                token: "request-token"
+            )
+        }
+        throw TestFailure("\(operation.rawValue) fixture should fail")
+    } catch let error as CloudflareError {
+        return error
+    }
+}
+
+private func assertCloudflareErrorIsSanitized(
+    _ error: CloudflareError,
+    operation: CloudflareOperation,
+    expectedFailure: CloudflareServiceFailure
+) throws {
+    try expect(
+        error == .service(operation: operation, failure: expectedFailure),
+        "\(operation.rawValue) must preserve only its controlled operation/failure model"
+    )
+    let uiStatus = ComponentStatus.failed(
+        "Cloudflare request failed",
+        detail: error.localizedDescription
+    )
+    let surfaces = [
+        error.localizedDescription,
+        String(describing: error),
+        String(reflecting: error),
+        (error as NSError).localizedDescription,
+        uiStatus.message,
+        uiStatus.detail
+    ]
+    let forbidden = cloudflareSecretFragments + [
+        "cfut_HEADER_SECRET",
+        "proxy-password",
+        "header-secret",
+        "response-secret",
+        "server-controlled-message"
+    ]
+    for surface in surfaces {
+        for secret in forbidden {
+            try expect(
+                !surface.localizedCaseInsensitiveContains(secret),
+                "\(operation.rawValue) leaked a response/header/credential fragment through an error or UI surface"
+            )
+        }
+    }
+}
+
+func testCloudflareErrorsSanitizeJSONAndNonJSONAcrossEveryOperation() throws {
+    let operations: [CloudflareOperation] = [
+        .verifyToken,
+        .listZones,
+        .readZone,
+        .listDNSRecords,
+        .createDNSRecord,
+        .updateDNSRecord
+    ]
+    let joinedSecrets = cloudflareSecretFragments.joined(separator: " | ")
+    let jsonBody = """
+    {"success":false,"errors":[{"code":9109,"message":"\(joinedSecrets)"}],"result":null}
+    """
+    let nonJSONBody = joinedSecrets
+
+    for operation in operations {
+        let structured = try cloudflareErrorFixture(
+            operation: operation,
+            body: jsonBody,
+            status: 500
+        )
+        try assertCloudflareErrorIsSanitized(
+            structured,
+            operation: operation,
+            expectedFailure: .rejected(httpStatus: 500, safeCodes: [])
+        )
+
+        let invalid = try cloudflareErrorFixture(
+            operation: operation,
+            body: nonJSONBody,
+            status: 502
+        )
+        try assertCloudflareErrorIsSanitized(
+            invalid,
+            operation: operation,
+            expectedFailure: .invalidResponse(httpStatus: 502)
+        )
+    }
+}
+
+func testCloudflare403UsesFixedPermissionGuidanceAcrossEveryOperation() throws {
+    let body = cloudflareSecretFragments.joined(separator: "\n")
+    for operation in [
+        CloudflareOperation.verifyToken,
+        .listZones,
+        .readZone,
+        .listDNSRecords,
+        .createDNSRecord,
+        .updateDNSRecord
+    ] {
+        let error = try cloudflareErrorFixture(
+            operation: operation,
+            body: body,
+            status: 403
+        )
+        try assertCloudflareErrorIsSanitized(
+            error,
+            operation: operation,
+            expectedFailure: .permissionDenied
+        )
+        try expect(
+            error.localizedDescription == CloudflarePermissionGuidance.dnsWriteDenied,
+            "Every Cloudflare 403 must use the same fixed local permission guidance"
+        )
+    }
+}
+
+func testCloudflareTransportErrorDoesNotExposeUnderlyingRequestDetails() throws {
+    let underlying = TestFailure(
+        "\(cloudflareTransportToken) Authorization Bearer proxy-user:proxy-password https://private.example"
+    )
+    let provider = CloudflareDNSProvider(http: ThrowingHTTPClient(error: underlying))
+    do {
+        _ = try provider.listZones(token: "request-token")
+        throw TestFailure("A transport failure should be mapped")
+    } catch let error as CloudflareError {
+        try assertCloudflareErrorIsSanitized(
+            error,
+            operation: .verifyToken,
+            expectedFailure: .transport
+        )
+        try expect(
+            !error.localizedDescription.contains("private.example"),
+            "Transport errors must not expose request or proxy locations"
+        )
+    }
+}
+
+func testCloudflareValidationErrorsDoNotEchoResponseValues() throws {
+    let inactiveProvider = CloudflareDNSProvider(
+        http: MockHTTPClient(responses: [
+            response(
+                #"{"success":true,"errors":[],"result":{"id":"token-1","status":"cfut_STATUS_SECRET proxy-password"}}"#
+            )
+        ])
+    )
+    do {
+        _ = try inactiveProvider.listZones(token: "request-token")
+        throw TestFailure("A non-active token status should fail")
+    } catch let error as CloudflareError {
+        try expect(
+            error == .configuration(.inactiveToken),
+            "A non-active token status must map to a fixed configuration issue"
+        )
+        try expect(
+            !error.localizedDescription.contains("cfut_")
+                && !error.localizedDescription.contains("proxy-password"),
+            "A server-controlled token status must not enter an error"
+        )
+    }
+
+    let zoneProvider = CloudflareDNSProvider(
+        http: MockHTTPClient(responses: [
+            response(#"{"success":true,"errors":[],"result":{"id":"token-1","status":"active"}}"#),
+            response(
+                #"{"success":true,"errors":[],"result":{"id":"zone-1","name":"cfut_ZONE_SECRET.proxy-password","status":"active"}}"#
+            )
+        ])
+    )
+    do {
+        _ = try zoneProvider.validateConfiguration(
+            zoneID: "0123456789abcdef0123456789abcdef",
+            recordName: "mac.example.com",
+            token: "request-token"
+        )
+        throw TestFailure("A record outside the selected zone should fail")
+    } catch let error as CloudflareError {
+        try expect(
+            error == .configuration(.recordOutsideZone),
+            "A server-controlled zone name must map to a fixed configuration issue"
+        )
+        try expect(
+            !error.localizedDescription.contains("cfut_")
+                && !error.localizedDescription.contains("proxy-password"),
+            "A server-controlled zone name must not enter an error"
+        )
     }
 }
 
@@ -6594,7 +6913,12 @@ let tests: [(String, () throws -> Void)] = [
     ("rejects temporary IPv6", testLocalIPv6SelectionRejectsTemporaryAddress),
     ("rejects tunnel-only fixed ifconfig IPv6", testLocalIPv6SelectionRejectsTunnelOnlyIfconfigFixture),
     ("decodes older config", testOlderConfigDecodesWithoutIPv6State),
-    ("reports API error", testReportsCloudflareAPIError),
+    ("reports DNS permission guidance", testReportsCloudflareDNSPermissionGuidanceWithoutResponseSecrets),
+    ("reports first DNS write permission guidance", testReportsCloudflareCreatePermissionGuidance),
+    ("sanitizes every Cloudflare JSON and non-JSON error path", testCloudflareErrorsSanitizeJSONAndNonJSONAcrossEveryOperation),
+    ("uses fixed permission guidance for every Cloudflare 403", testCloudflare403UsesFixedPermissionGuidanceAcrossEveryOperation),
+    ("sanitizes Cloudflare transport errors", testCloudflareTransportErrorDoesNotExposeUnderlyingRequestDetails),
+    ("sanitizes Cloudflare validation response values", testCloudflareValidationErrorsDoNotEchoResponseValues),
     ("lists paginated zones", testListsZonesAcrossPages),
     ("supports account-owned token", testListsZonesWithAccountOwnedToken)
 ]
