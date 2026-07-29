@@ -120,6 +120,28 @@ final class LockedClock {
     }
 }
 
+final class LockedMonotonicClock {
+    private let lock = NSLock()
+    private var value: TimeInterval
+
+    init(_ value: TimeInterval) {
+        self.value = value
+    }
+
+    func now() -> TimeInterval {
+        lock.lock()
+        let result = value
+        lock.unlock()
+        return result
+    }
+
+    func set(_ value: TimeInterval) {
+        lock.lock()
+        self.value = value
+        lock.unlock()
+    }
+}
+
 struct SimulatedRouterFailure: Error, LocalizedError {
     let operation: String
 
@@ -180,12 +202,30 @@ final class MockRouterMappingService: RouterMappingServicing {
     private var storedEnsureCalls: [RouterMappingAddressFamily] = []
     private var failedRemovalIDs: Set<String> = []
     private var failedEnsureFamilies: Set<RouterMappingAddressFamily> = []
+    private var ensureError: Error?
     private var recoveryFailure: RouterMappingRecoveryRequiredError?
     private var legacyRemovalReport = RouterMappingRemovalReport(attempts: [])
     private var storedLegacyRemovalCallCount = 0
+    private var storedExternalIPv4CallCount = 0
+    private var epochInvalidatedIDs: Set<String> = []
+    private var epochAddressChanges: [String: String] = [:]
+    private var verificationFailureIDs: Set<String> = []
     var failAllRemovals = false
     var beforeRemoval: (() -> Void)?
-    var externalIPv4 = "8.8.8.8"
+    var afterRemoval: (() -> Void)?
+    var beforeEnsure: (() -> Void)?
+    var beforeEnsureFamily:
+        ((RouterMappingAddressFamily) -> Void)?
+    var cancellationHandler: (() -> Void)?
+    var externalIPv4 = "192.0.2.53"
+    var externalIPv4Failure: Error?
+    var nowProvider: () -> Date = Date.init
+    var monotonicUptimeProvider: () -> TimeInterval = {
+        ProcessInfo.processInfo.systemUptime
+    }
+    var bootIdentifierProvider: () -> String = {
+        RouterMappingService.systemBootIdentifier
+    }
 
     var removalCalls: [ActiveRouterMapping] {
         lock.lock()
@@ -212,6 +252,13 @@ final class MockRouterMappingService: RouterMappingServicing {
         return result
     }
 
+    var externalIPv4CallCount: Int {
+        lock.lock()
+        let result = storedExternalIPv4CallCount
+        lock.unlock()
+        return result
+    }
+
     func setRemovalFailures(_ mappings: [ActiveRouterMapping]) {
         lock.lock()
         failedRemovalIDs = Set(mappings.map(\.identifier))
@@ -221,6 +268,12 @@ final class MockRouterMappingService: RouterMappingServicing {
     func setEnsureFailures(_ families: Set<RouterMappingAddressFamily>) {
         lock.lock()
         failedEnsureFamilies = families
+        lock.unlock()
+    }
+
+    func setEnsureError(_ error: Error?) {
+        lock.lock()
+        ensureError = error
         lock.unlock()
     }
 
@@ -236,9 +289,44 @@ final class MockRouterMappingService: RouterMappingServicing {
         lock.unlock()
     }
 
+    func setEpochInvalidations(_ mappings: [ActiveRouterMapping]) {
+        lock.lock()
+        epochInvalidatedIDs = Set(mappings.map(\.identifier))
+        lock.unlock()
+    }
+
+    func setEpochAddressChange(
+        _ mapping: ActiveRouterMapping,
+        replacementAddress: String
+    ) {
+        lock.lock()
+        epochAddressChanges[mapping.identifier] = replacementAddress
+        lock.unlock()
+    }
+
+    func setVerificationFailures(
+        _ mappings: [ActiveRouterMapping]
+    ) {
+        lock.lock()
+        verificationFailureIDs = Set(
+            mappings.map(\.identifier)
+        )
+        lock.unlock()
+    }
+
     func externalIPv4Address(gatewayAddress: String) throws -> String {
         operations.increment()
-        return externalIPv4
+        lock.lock()
+        storedExternalIPv4CallCount += 1
+        let address = externalIPv4
+        let failure = externalIPv4Failure
+        lock.unlock()
+        if let failure { throw failure }
+        return address
+    }
+
+    func cancelCurrentOperations() {
+        cancellationHandler?()
     }
 
     func ensureMapping(
@@ -270,6 +358,7 @@ final class MockRouterMappingService: RouterMappingServicing {
     func removeMappings(_ mappings: [ActiveRouterMapping]) -> RouterMappingRemovalReport {
         operations.increment()
         beforeRemoval?()
+        defer { afterRemoval?() }
         lock.lock()
         storedRemovalCalls.append(contentsOf: mappings)
         let failures = failedRemovalIDs
@@ -302,6 +391,96 @@ final class MockRouterMappingService: RouterMappingServicing {
         return report
     }
 
+    func verifyMappingsForCurrentCheck(
+        _ mappings: [ActiveRouterMapping]
+    ) throws -> RouterMappingEpochReport {
+        lock.lock()
+        let invalidated = mappings.filter {
+            epochInvalidatedIDs.contains($0.identifier)
+        }
+        let invalidatedIDs = Set(invalidated.map(\.identifier))
+        let addressChanges = epochAddressChanges
+        let verificationFailures = verificationFailureIDs
+        lock.unlock()
+        let addressInvalidations = mappings.compactMap { mapping in
+            addressChanges[mapping.identifier].map {
+                RouterMappingInvalidation(
+                    mapping: mapping,
+                    reason: .effectiveClientAddressChanged(
+                        replacementAddress: $0
+                    )
+                )
+            }
+        }
+        let allInvalidatedIDs = invalidatedIDs.union(
+            addressInvalidations.map { $0.mapping.identifier }
+        )
+        let refreshed = mappings.filter {
+                !allInvalidatedIDs.contains($0.identifier)
+            }
+        return RouterMappingEpochReport(
+            refreshedMappings: refreshed,
+            invalidations: invalidated.map {
+                RouterMappingInvalidation(
+                    mapping: $0,
+                    reason: .routerStateLost
+                )
+            } + addressInvalidations,
+            errors: refreshed.filter {
+                verificationFailures.contains($0.identifier)
+            }.map {
+                "Injected \($0.transport.displayName) verification failure"
+            },
+            currentCheckProofs: refreshed.compactMap {
+                verificationFailures.contains($0.identifier)
+                    ? nil
+                    : currentCheckProof(for: $0)
+            }
+        )
+    }
+
+    private func currentCheckProof(
+        for mapping: ActiveRouterMapping
+    ) -> RouterMappingCurrentCheckProof? {
+        guard let address = mapping.routerExternalAddress else {
+            return nil
+        }
+        let nowUptime = monotonicUptimeProvider()
+        let leaseExpiresUptime =
+            mapping.leaseExpiresUptime
+            ?? nowUptime + max(
+                0,
+                mapping.leaseExpiresAt.timeIntervalSince(
+                    nowProvider()
+                )
+            )
+        return RouterMappingCurrentCheckProof(
+            family: mapping.addressFamily,
+            transport: mapping.transport,
+            identity: RouterMappingProofIdentity(
+                mappingIdentifier: mapping.identifier,
+                effectiveSourceAddress: mapping.localAddress,
+                gatewayAddress: mapping.gatewayAddress,
+                protocolBinding: mapping.pcpNonce,
+                internalPort: mapping.internalPort,
+                externalPort: mapping.externalPort,
+                pinholeID: mapping.pinholeID
+            ),
+            boundWANAddress: address,
+            verifiedAtUptime: nowUptime,
+            leaseExpiresUptime: leaseExpiresUptime,
+            sideEffectSafetyMargin:
+                RouterMappingCurrentCheckProof
+                    .defaultSideEffectSafetyMargin,
+            mappingIdentityVerified: true,
+            boundWANEvidenceVerified: true,
+            sameBootVerified: true,
+            leaseVerified: true,
+            epochOrIGDContinuityVerified: true,
+            checkpointed: false
+        )
+    }
+
     private func ensure(
         family: RouterMappingAddressFamily,
         config: AppConfig,
@@ -309,16 +488,28 @@ final class MockRouterMappingService: RouterMappingServicing {
         gatewayAddress: String
     ) throws -> PortMappingResult {
         operations.increment()
+        beforeEnsure?()
         lock.lock()
         storedEnsureCalls.append(family)
         let shouldFail = failedEnsureFamilies.contains(family)
+        let injectedEnsureError = ensureError
         let injectedRecovery = recoveryFailure
         lock.unlock()
+        beforeEnsureFamily?(family)
+        if let injectedEnsureError {
+            throw injectedEnsureError
+        }
         if let injectedRecovery {
             throw injectedRecovery
         }
         if shouldFail {
             throw SimulatedRouterFailure(operation: "\(family.displayName) ensure")
+        }
+        if family == .ipv6,
+           config.mappingProtocolPreference == .natpmp {
+            throw SimulatedRouterFailure(
+                operation: "NAT-PMP IPv6 unsupported"
+            )
         }
 
         let transport: RouterMappingTransport
@@ -334,6 +525,10 @@ final class MockRouterMappingService: RouterMappingServicing {
         }
         let externalPort = family == .ipv4 ? config.externalPort : config.internalPort
         let pinholeID: UInt16? = family == .ipv6 && transport == .upnp ? 41 : nil
+        let now = nowProvider()
+        let nowUptime = monotonicUptimeProvider()
+        let bootIdentifier = bootIdentifierProvider()
+        let lifetime = max(1, config.mappingLeaseSeconds)
         let mapping = ActiveRouterMapping(
             transport: transport,
             addressFamily: family,
@@ -341,18 +536,63 @@ final class MockRouterMappingService: RouterMappingServicing {
             gatewayAddress: gatewayAddress,
             internalPort: config.internalPort,
             externalPort: externalPort,
+            routerExternalAddress: family == .ipv4
+                ? externalIPv4
+                : localAddress,
             pinholeID: pinholeID,
-            pcpNonce: transport == .pcp ? config.pcpNonce : nil,
-            leaseExpiresAt: Date().addingTimeInterval(3600),
-            renewAfter: Date().addingTimeInterval(1800)
+            pcpNonce: transport == .pcp
+                ? config.pcpNonce
+                : (transport == .upnp
+                    ? "mock-bound-upnp-identity"
+                    : nil),
+            leaseExpiresAt: now.addingTimeInterval(
+                TimeInterval(lifetime)
+            ),
+            renewAfter: now.addingTimeInterval(
+                TimeInterval(lifetime) / 2
+            ),
+            routerEpoch: transport == .pcp || transport == .natpmp
+                ? 1
+                : nil,
+            routerEpochObservedAt: transport == .pcp || transport == .natpmp
+                ? now
+                : nil,
+            routerEpochObservedUptime: transport == .pcp || transport == .natpmp
+                ? nowUptime
+                : nil,
+            routerEpochBootIdentifier: transport == .pcp || transport == .natpmp
+                ? bootIdentifier
+                : nil,
+            routerEpochHealthCheckAfter:
+                transport == .pcp || transport == .natpmp
+                ? now.addingTimeInterval(60)
+                : nil,
+            routerEpochHealthCheckUptime:
+                transport == .pcp || transport == .natpmp
+                ? nowUptime + 60
+                : nil,
+            leaseExpiresUptime: nowUptime + TimeInterval(lifetime),
+            renewAfterUptime: nowUptime + TimeInterval(lifetime) / 2,
+            leaseBootIdentifier: bootIdentifier,
+            leaseAnchorWallTime: now,
+            leaseRemainingAtAnchor: TimeInterval(lifetime),
+            renewRemainingAtAnchor: TimeInterval(lifetime) / 2
         )
+        guard let proof = currentCheckProof(for: mapping) else {
+            throw SimulatedRouterFailure(
+                operation: "incomplete current-check proof"
+            )
+        }
         return PortMappingResult(
             protocolName: transport.displayName,
             externalPort: externalPort,
-            routerExternalAddress: family == .ipv4 ? "8.8.8.8" : localAddress,
+            routerExternalAddress: family == .ipv4
+                ? externalIPv4
+                : localAddress,
             message: "mock renewable lease",
             pinholeID: pinholeID,
-            activeMapping: mapping
+            activeMapping: mapping,
+            currentCheckProof: proof
         )
     }
 }
@@ -383,12 +623,30 @@ func expect(_ condition: @autoclosure () -> Bool, _ message: String) throws {
     }
 }
 
+func stopAgent(
+    _ agent: NetworkAgent,
+    timeout: TimeInterval = 3
+) throws {
+    try expect(
+        agent.stopAndWaitUntilIdle(timeout: timeout),
+        "NetworkAgent must become explicitly idle before its temporary directory is removed"
+    )
+}
+
+func stopAgentForCleanup(_ agent: NetworkAgent) {
+    precondition(
+        agent.stopAndWaitUntilIdle(),
+        "NetworkAgent cleanup timed out before temporary directory removal"
+    )
+}
+
 func waitUntil(
     timeout: TimeInterval = 3,
     condition: () -> Bool
 ) -> Bool {
-    let deadline = Date().addingTimeInterval(timeout)
-    while !condition(), Date() < deadline {
+    let deadline = ProcessInfo.processInfo.systemUptime + timeout
+    while !condition(),
+          ProcessInfo.processInfo.systemUptime < deadline {
         RunLoop.current.run(until: Date().addingTimeInterval(0.01))
     }
     return condition()
@@ -546,14 +804,14 @@ func testScheduledChecksUseBackgroundKeychainPolicy() throws {
         localNetworkService: MockLocalNetworkService(),
         routerMappingService: MockRouterMappingService()
     )
+    defer { stopAgentForCleanup(startupAgent) }
 
     startupAgent.start()
     try expect(
         waitUntil { startupChecks.current == 1 && audit.snapshot.count == 1 },
         "Startup must complete one non-interactive Keychain-backed check"
     )
-    startupAgent.stop()
-
+    try stopAgent(startupAgent)
     let scheduleLock = NSLock()
     var periodicHandler: (() -> Void)?
     let periodicChecks = LockedCounter()
@@ -572,6 +830,7 @@ func testScheduledChecksUseBackgroundKeychainPolicy() throws {
             return NetworkAgentScheduledTimer {}
         }
     )
+    defer { stopAgentForCleanup(periodicAgent) }
     periodicAgent.start()
     scheduleLock.lock()
     let capturedPeriodicHandler = periodicHandler
@@ -584,8 +843,7 @@ func testScheduledChecksUseBackgroundKeychainPolicy() throws {
         waitUntil { periodicChecks.current == 1 && audit.snapshot.count == 2 },
         "The injected periodic timer must run one non-interactive Keychain-backed check"
     )
-    periodicAgent.stop()
-
+    try stopAgent(periodicAgent)
     _ = try? keychain.get(
         account: "cloudflare-api-token",
         interaction: .userInitiated
@@ -764,6 +1022,7 @@ func dependencyDescriptors(for config: AppConfig) throws -> [NetworkAgentDepende
         initialConfig: config,
         sideEffectsEnabled: false
     )
+    defer { stopAgentForCleanup(agent) }
     return try agent.networkDependencyDescriptors()
 }
 
@@ -927,6 +1186,7 @@ func testCheckIntervalNormalizationAndLegacyMigration() throws {
         initialConfig: invalidRuntimeConfig,
         sideEffectsEnabled: false
     )
+    defer { stopAgentForCleanup(agent) }
     try expect(
         agent.config.checkIntervalSeconds == AppConfig.defaultCheckIntervalSeconds,
         "Injected runtime configuration must be normalized before the timer can observe it"
@@ -1056,6 +1316,7 @@ func testCorruptConfigIsPreservedAndFailsMappingRecoveryClosed() throws {
             fileURL: baseDirectory.appendingPathComponent("fallback/mappings.json")
         )
     )
+    defer { stopAgentForCleanup(agent) }
     agent.runCheck()
     try expect(
         waitUntil {
@@ -1073,7 +1334,7 @@ func testCorruptConfigIsPreservedAndFailsMappingRecoveryClosed() throws {
         preservedAfterCheck == malformed,
         "NetworkAgent must not replace the damaged config while fail-closed"
     )
-    agent.stop()
+    try stopAgent(agent)
 }
 
 func testInvalidProxyPreventsAllPersistence() throws {
@@ -1792,6 +2053,7 @@ func testDisabledSideEffectsRejectChecks() throws {
         sideEffectsEnabled: false,
         checkExecutionObserver: { checkExecutions += 1 }
     )
+    defer { stopAgentForCleanup(agent) }
     agent.onStatusChanged = { _ in statusChanges += 1 }
 
     agent.start()
@@ -1831,6 +2093,7 @@ func testDisabledSideEffectsDoNotReadSuppliedConfigStore() throws {
         ),
         sideEffectsEnabled: false
     )
+    defer { stopAgentForCleanup(agent) }
 
     try expect(agent.config.dnsRecordName.isEmpty, "Disabled side effects must start from isolated defaults")
     try expect(!agent.config.remoteAccessEnabled, "Disabled side effects must not inherit production enablement")
@@ -1861,6 +2124,7 @@ func testKeychainReadFailurePropagates() throws {
         keychain: keychain,
         initialConfig: .default
     )
+    defer { stopAgentForCleanup(agent) }
 
     do {
         _ = try agent.loadCloudflareToken()
@@ -1900,6 +2164,7 @@ func testKeychainDeleteFailurePreservesTokenAndBlocksConfig() throws {
         keychain: keychain,
         initialConfig: .default
     )
+    defer { stopAgentForCleanup(agent) }
     let loadedToken = try agent.loadCloudflareToken()
     try expect(loadedToken == existingToken, "The fixture token must load before deletion")
     var changedConfig = AppConfig.default
@@ -1967,6 +2232,7 @@ func testKeychainSingleFlightAndFailureLatch() throws {
         keychain: keychain,
         initialConfig: .default
     )
+    defer { stopAgentForCleanup(agent) }
 
     let callers = 8
     let group = DispatchGroup()
@@ -2380,6 +2646,7 @@ func testExplicitKeychainAuthorizationClearsFailureLatch() throws {
         keychain: keychain,
         initialConfig: .default
     )
+    defer { stopAgentForCleanup(agent) }
 
     do {
         _ = try agent.loadCloudflareToken(
@@ -2493,6 +2760,7 @@ func testLegacyMigrationSerializesConcurrentKeepExistingSave() throws {
         keychain: keychain,
         initialConfig: .default
     )
+    defer { stopAgentForCleanup(agent) }
 
     var authorizationResult: Result<KeychainAuthorizationOutcome, Error>?
     agent.authorizeSavedCloudflareToken { authorizationResult = $0 }
@@ -2598,6 +2866,7 @@ func testOldBackgroundReadCannotOverwriteAuthorizationSuccess() throws {
         keychain: keychain,
         initialConfig: .default
     )
+    defer { stopAgentForCleanup(agent) }
 
     let readFinished = DispatchSemaphore(value: 0)
     DispatchQueue.global(qos: .userInitiated).async {
@@ -2682,6 +2951,7 @@ func testDeleteWriteAuthorizeOrderingSurvivesBackendRestart() throws {
         keychain: keychain,
         initialConfig: .default
     )
+    defer { stopAgentForCleanup(agent) }
     let initialLoad = try agent.loadCloudflareToken(interaction: .background)
     try expect(
         initialLoad == "initial-token",
@@ -2733,6 +3003,7 @@ func testDeleteWriteAuthorizeOrderingSurvivesBackendRestart() throws {
         keychain: keychain,
         initialConfig: .default
     )
+    defer { stopAgentForCleanup(restartedAgent) }
     let restartedToken = try restartedAgent.loadCloudflareToken(
         retryAfterFailure: false,
         interaction: .background
@@ -2808,6 +3079,7 @@ func testSettingsTransactionRollsBackOnConfigWriteFailure() throws {
             return .success(())
         }
     )
+    defer { stopAgentForCleanup(agent) }
     _ = try agent.loadCloudflareToken()
     var rollbackCallbackConfig: AppConfig?
     var rollbackCallbackWasOnMain = false
@@ -2867,6 +3139,7 @@ func testConcurrentStateAccessDoesNotDeadlock() throws {
         initialConfig: .default,
         sideEffectsEnabled: false
     )
+    defer { stopAgentForCleanup(agent) }
 
     let group = DispatchGroup()
     for index in 0..<200 {
@@ -2920,8 +3193,10 @@ func testCheckCoalescingPreventsQueuedStorms() throws {
     }
 
     var config = AppConfig.default
+    config.remoteAccessEnabled = true
     config.dnsProvider = .disabled
     config.preferredAddressFamily = .ipv4
+    config.mappingProtocolPreference = .disabled
     config.checkIntervalSeconds = 0
     let agent = NetworkAgent(
         configStore: AppConfigStore(baseDirectory: baseDirectory),
@@ -2929,8 +3204,10 @@ func testCheckCoalescingPreventsQueuedStorms() throws {
         initialConfig: config,
         checkExecutionObserver: { checkExecutions.increment() },
         localNetworkService: local,
-        routerMappingService: MockRouterMappingService()
+        routerMappingService: MockRouterMappingService(),
+        publicIPServiceFactory: { _ in MockPublicIPService() }
     )
+    defer { stopAgentForCleanup(agent) }
 
     agent.start()
     try expect(entered.wait(timeout: .now() + 2) == .success, "The first check must enter the injected gate")
@@ -2948,7 +3225,7 @@ func testCheckCoalescingPreventsQueuedStorms() throws {
         agent.config.checkIntervalSeconds == AppConfig.defaultCheckIntervalSeconds,
         "The timer must observe the normalized default interval"
     )
-    agent.stop()
+    try stopAgent(agent)
 }
 
 func testConfigMutationInvalidatesAnOldCheckBeforeRouterSideEffects() throws {
@@ -2979,6 +3256,7 @@ func testConfigMutationInvalidatesAnOldCheckBeforeRouterSideEffects() throws {
         localNetworkService: local,
         routerMappingService: router
     )
+    defer { stopAgentForCleanup(agent) }
     agent.runCheck()
     try expect(entered.wait(timeout: .now() + 2) == .success, "The old check must pause before mapping work")
 
@@ -3000,7 +3278,7 @@ func testConfigMutationInvalidatesAnOldCheckBeforeRouterSideEffects() throws {
         agent.config.activeRouterMappings.isEmpty,
         "A superseded check must not publish stale mapping state"
     )
-    agent.stop()
+    try stopAgent(agent)
 }
 
 func testSideEffectGateLinearizesTheFinalCheckWindow() throws {
@@ -3031,6 +3309,7 @@ func testSideEffectGateLinearizesTheFinalCheckWindow() throws {
         routerMappingService: router,
         emergencyMappingJournal: emergencyJournal(in: baseDirectory)
     )
+    defer { stopAgentForCleanup(agent) }
     agent.runCheck()
     try expect(
         sideEffectEntered.wait(timeout: .now() + 2) == .success,
@@ -3059,17 +3338,688 @@ func testSideEffectGateLinearizesTheFinalCheckWindow() throws {
         agent.config.activeRouterMappings.isEmpty,
         "The waiting save must clean up the completed old-generation mapping"
     )
-    agent.stop()
+    try stopAgent(agent)
+}
+
+func testStopAndDisableCooperativelyCancelRouterTransaction() throws {
+    func makeConfig() -> AppConfig {
+        var config = AppConfig.default
+        config.remoteAccessEnabled = true
+        config.dnsProvider = .disabled
+        config.preferredAddressFamily = .ipv4
+        config.mappingProtocolPreference = .pcp
+        return config
+    }
+
+    do {
+        let directory = try makeTemporaryDirectory(
+            named: "stop-router-cancellation"
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let router = MockRouterMappingService()
+        router.beforeEnsure = {
+            entered.signal()
+            release.wait()
+        }
+        router.cancellationHandler = {
+            release.signal()
+        }
+        let agent = NetworkAgent(
+            configStore: AppConfigStore(baseDirectory: directory),
+            keychain: inMemoryKeychain(),
+            initialConfig: makeConfig(),
+            localNetworkService: MockLocalNetworkService(),
+            routerMappingService: router,
+            publicIPServiceFactory: { _ in MockPublicIPService() }
+        )
+        defer { stopAgentForCleanup(agent) }
+        agent.runCheck()
+        try expect(
+            entered.wait(timeout: .now() + 2) == .success,
+            "Stop test must enter the router transaction"
+        )
+        let started = ProcessInfo.processInfo.systemUptime
+        agent.stop()
+        try expect(
+            ProcessInfo.processInfo.systemUptime - started < 0.2,
+            "stop() must not wait behind the side-effect gate"
+        )
+        try stopAgent(agent)
+        try expect(
+            agent.config.activeRouterMappings.isEmpty
+                && router.ensureCalls == [.ipv4],
+            "A cancelled old-generation MAP result must not be persisted"
+        )
+    }
+
+    do {
+        let directory = try makeTemporaryDirectory(
+            named: "disable-router-cancellation"
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let router = MockRouterMappingService()
+        router.beforeEnsure = {
+            entered.signal()
+            release.wait()
+        }
+        router.cancellationHandler = {
+            release.signal()
+        }
+        var config = makeConfig()
+        config.dnsProvider = .cloudflare
+        config.cloudflareZoneID = "disable-generation-zone"
+        config.dnsRecordName = "disable-generation.example.test"
+        let keychain = inMemoryKeychain()
+        try keychain.set(
+            "integration-token",
+            account: "cloudflare-api-token"
+        )
+        let publicIP = MockPublicIPService()
+        let eventLock = NSLock()
+        var events: [String] = []
+        let completed = DispatchSemaphore(value: 0)
+        let agent = NetworkAgent(
+            configStore: AppConfigStore(baseDirectory: directory),
+            keychain: keychain,
+            initialConfig: config,
+            checkCompletionObserver: {
+                completed.signal()
+            },
+            sideEffectWillStartObserver: { label in
+                eventLock.lock()
+                events.append(label)
+                eventLock.unlock()
+            },
+            localNetworkService: MockLocalNetworkService(),
+            routerMappingService: router,
+            publicIPServiceFactory: { _ in publicIP }
+        )
+        defer { stopAgentForCleanup(agent) }
+        agent.runCheck()
+        try expect(
+            entered.wait(timeout: .now() + 2) == .success,
+            "Disable test must enter the router transaction"
+        )
+        let started = ProcessInfo.processInfo.systemUptime
+        agent.setRemoteAccessEnabled(false)
+        try expect(
+            waitUntil(timeout: 0.75) {
+                !agent.config.remoteAccessEnabled
+            },
+            "Disable must cooperatively cancel the transaction and commit promptly"
+        )
+        try expect(
+            ProcessInfo.processInfo.systemUptime - started < 0.75
+                && router.ensureCalls == [.ipv4]
+                && agent.config.activeRouterMappings.isEmpty,
+            "Disable must remain single-flight and reject the late MAP result"
+        )
+        try expect(
+            completed.wait(timeout: .now() + 0.75) == .success,
+            "The superseded check must complete promptly after disable"
+        )
+        try stopAgent(agent)
+        eventLock.lock()
+        let observedEvents = events
+        eventLock.unlock()
+        try expect(
+            publicIP.ipv4CallCount == 0
+                && publicIP.ipv6CallCount == 0
+                && router.externalIPv4CallCount == 0,
+            "A mid-check disable must prevent every later public-IP and router-WAN probe"
+        )
+        try expect(
+            !observedEvents.contains(where: {
+                $0.hasPrefix("public-ip.")
+                    || $0.hasPrefix("cloudflare.")
+            }),
+            "A mid-check disable must prevent every later public-IP and Cloudflare side effect"
+        )
+    }
+}
+
+func testDisabledRecoveryCheckSkipsAllNonCleanupNetworkWork() throws {
+    let directory = try makeTemporaryDirectory(
+        named: "disabled-recovery-short-circuit"
+    )
+    let store = AppConfigStore(baseDirectory: directory)
+    let emergency = emergencyJournal(in: directory)
+    let fallback = EmergencyMappingJournal(
+        fileURL: directory.appendingPathComponent(
+            "fallback-router-mappings.json"
+        )
+    )
+    let recoveredMapping = activeMappingFixture(
+        transport: .pcp,
+        family: .ipv4
+    )
+    try store.saveMappingRecoveryJournal([recoveredMapping])
+
+    var config = AppConfig.default
+    config.remoteAccessEnabled = false
+    config.dnsProvider = .cloudflare
+    config.cloudflareZoneID = "disabled-recovery-zone"
+    config.dnsRecordName = "disabled-recovery.example.test"
+    config.preferredAddressFamily = .dualStack
+    config.mappingProtocolPreference = .automatic
+
+    let localNetwork = MockLocalNetworkService()
+    let router = MockRouterMappingService()
+    let publicIP = MockPublicIPService()
+    let eventLock = NSLock()
+    var events: [String] = []
+    let completed = DispatchSemaphore(value: 0)
+    let agent = NetworkAgent(
+        configStore: store,
+        keychain: inMemoryKeychain(),
+        initialConfig: config,
+        checkCompletionObserver: {
+            completed.signal()
+        },
+        sideEffectWillStartObserver: { label in
+            eventLock.lock()
+            events.append(label)
+            eventLock.unlock()
+        },
+        localNetworkService: localNetwork,
+        routerMappingService: router,
+        publicIPServiceFactory: { _ in publicIP },
+        emergencyMappingJournal: emergency,
+        fallbackMappingJournal: fallback,
+        performInitialCheckOnStart: false
+    )
+    defer {
+        stopAgentForCleanup(agent)
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    let checkStarted = ProcessInfo.processInfo.systemUptime
+    agent.runCheck()
+    try expect(
+        completed.wait(timeout: .now() + 1) == .success,
+        "A disabled recovery check must complete through its explicit observer"
+    )
+    let checkElapsed =
+        ProcessInfo.processInfo.systemUptime - checkStarted
+    let stopStarted = ProcessInfo.processInfo.systemUptime
+    try expect(
+        agent.stopAndWaitUntilIdle(timeout: 0.5),
+        "A disabled recovery agent must stop promptly after cleanup"
+    )
+    let stopElapsed =
+        ProcessInfo.processInfo.systemUptime - stopStarted
+
+    eventLock.lock()
+    let observedEvents = events
+    eventLock.unlock()
+    let status = agent.status
+    let persistedConfig = try store.load()
+    let primaryRecoveryEmpty =
+        try store.loadMappingRecoveryJournal().isEmpty
+    let emergencyRecoveryEmpty = try emergency.load().isEmpty
+    let fallbackRecoveryEmpty = try fallback.load().isEmpty
+    try expect(
+        router.removalCalls.map(\.identifier)
+            == [recoveredMapping.identifier]
+            && router.ensureCalls.isEmpty
+            && router.operationCount == 1,
+        "The disabled check must perform only the necessary recovered mapping delete"
+    )
+    try expect(
+        localNetwork.callCount == 0
+            && router.externalIPv4CallCount == 0
+            && publicIP.ipv4CallCount == 0
+            && publicIP.ipv6CallCount == 0,
+        "The disabled check must skip local discovery, router WAN, and public-IP probes"
+    )
+    try expect(
+        observedEvents == ["router.recovery.delete"],
+        "The disabled check must expose only the required recovery side effect: \(observedEvents)"
+    )
+    try expect(
+        primaryRecoveryEmpty
+            && emergencyRecoveryEmpty
+            && fallbackRecoveryEmpty
+            && persistedConfig.activeRouterMappings.isEmpty
+            && !persistedConfig.remoteAccessEnabled,
+        "Recovery cleanup and the closed configuration must be durable before the check returns"
+    )
+    try expect(
+        status.ddnsStatus.state == .disabled
+            && status.routerStatus.state == .disabled
+            && status.remoteDesktopStatus.state == .disabled
+            && status.externalReachabilityStatus.state == .disabled
+            && status.ddnsStatus.message == "Remote access is off"
+            && status.routerStatus.message == "Remote access is off",
+        "Every component must clearly report the closed state"
+    )
+    try expect(
+        checkElapsed < 1 && stopElapsed < 0.5,
+        "Closed recovery must complete and stop promptly (check \(checkElapsed)s, stop \(stopElapsed)s)"
+    )
+}
+
+func testDisabledPersistedActiveMappingRecoveryMatrix() throws {
+    typealias SeededState = (
+        directory: URL,
+        store: AppConfigStore,
+        emergency: EmergencyMappingJournal,
+        fallback: EmergencyMappingJournal
+    )
+
+    let wallClock = LockedClock(
+        Date(timeIntervalSince1970: 80_000)
+    )
+    let uptime = LockedMonotonicClock(500)
+    let currentBoot = "boot-disabled-active-current"
+
+    func makeMapping(
+        transport: RouterMappingTransport = .pcp,
+        bootIdentifier: String = currentBoot,
+        remainingLease: TimeInterval = 60
+    ) -> ActiveRouterMapping {
+        var mapping = activeMappingFixture(
+            transport: transport,
+            family: .ipv4,
+            renewAfter: wallClock.now().addingTimeInterval(
+                remainingLease / 2
+            ),
+            leaseExpiresAt: wallClock.now().addingTimeInterval(
+                remainingLease
+            )
+        )
+        mapping.routerExternalAddress = "203.0.113.53"
+        mapping.leaseBootIdentifier = bootIdentifier
+        mapping.leaseExpiresUptime =
+            uptime.now() + remainingLease
+        mapping.renewAfterUptime =
+            uptime.now() + remainingLease / 2
+        mapping.leaseAnchorWallTime = wallClock.now()
+        mapping.leaseRemainingAtAnchor = remainingLease
+        mapping.renewRemainingAtAnchor = remainingLease / 2
+        if transport == .pcp || transport == .natpmp {
+            mapping.routerEpoch = 500
+            mapping.routerEpochObservedAt = wallClock.now()
+            mapping.routerEpochObservedUptime = uptime.now()
+            mapping.routerEpochBootIdentifier = bootIdentifier
+        }
+        return mapping
+    }
+
+    func seed(
+        name: String,
+        mapping: ActiveRouterMapping
+    ) throws -> SeededState {
+        let directory = try makeTemporaryDirectory(named: name)
+        let store = AppConfigStore(baseDirectory: directory)
+        let emergency = emergencyJournal(in: directory)
+        let fallback = EmergencyMappingJournal(
+            fileURL: directory.appendingPathComponent(
+                "fallback-router-mappings.json"
+            )
+        )
+        var config = AppConfig.default
+        config.remoteAccessEnabled = false
+        config.dnsProvider = .cloudflare
+        config.cloudflareZoneID = "disabled-active-zone"
+        config.dnsRecordName = "disabled-active.example.test"
+        config.preferredAddressFamily = .dualStack
+        config.mappingProtocolPreference = .automatic
+        config.activeRouterMappings = [mapping]
+        try store.save(config)
+        try store.saveMappingRecoveryJournal([mapping])
+        try emergency.save([mapping])
+        try fallback.save([mapping])
+        return (directory, store, emergency, fallback)
+    }
+
+    func persistedIdentifiers(
+        _ state: SeededState
+    ) throws -> [[String]] {
+        [
+            try state.store.load()
+                .activeRouterMappings.map(\.identifier),
+            try state.store.loadMappingRecoveryJournal()
+                .map(\.identifier),
+            try state.emergency.load().map(\.identifier),
+            try state.fallback.load().map(\.identifier)
+        ]
+    }
+
+    do {
+        let mapping = makeMapping()
+        let seeded = try seed(
+            name: "disabled-active-delete-success",
+            mapping: mapping
+        )
+        let router = MockRouterMappingService()
+        let localNetwork = MockLocalNetworkService()
+        let publicIP = MockPublicIPService()
+        let completed = DispatchSemaphore(value: 0)
+        let eventLock = NSLock()
+        var events: [String] = []
+        let agent = NetworkAgent(
+            configStore: seeded.store,
+            keychain: inMemoryKeychain(),
+            checkCompletionObserver: { completed.signal() },
+            sideEffectWillStartObserver: { label in
+                eventLock.lock()
+                events.append(label)
+                eventLock.unlock()
+            },
+            localNetworkService: localNetwork,
+            routerMappingService: router,
+            publicIPServiceFactory: { _ in publicIP },
+            emergencyMappingJournal: seeded.emergency,
+            fallbackMappingJournal: seeded.fallback,
+            nowProvider: wallClock.now,
+            monotonicUptimeProvider: uptime.now,
+            bootIdentifierProvider: { currentBoot },
+            performInitialCheckOnStart: false
+        )
+        defer {
+            stopAgentForCleanup(agent)
+            try? FileManager.default.removeItem(
+                at: seeded.directory
+            )
+        }
+        let checkStarted = ProcessInfo.processInfo.systemUptime
+        agent.runCheck()
+        try expect(
+            completed.wait(timeout: .now() + 1) == .success,
+            "Persisted active cleanup success must complete promptly"
+        )
+        let checkElapsed =
+            ProcessInfo.processInfo.systemUptime - checkStarted
+        let stopStarted = ProcessInfo.processInfo.systemUptime
+        try expect(
+            agent.stopAndWaitUntilIdle(timeout: 0.5),
+            "Persisted active cleanup success must stop promptly"
+        )
+        let stopElapsed =
+            ProcessInfo.processInfo.systemUptime - stopStarted
+        eventLock.lock()
+        let observed = events
+        eventLock.unlock()
+        let identities = try persistedIdentifiers(seeded)
+        try expect(
+            router.removalCalls.map(\.identifier)
+                == [mapping.identifier],
+            "The active and three journal copies must deduplicate to one complete identity"
+        )
+        try expect(
+            identities.allSatisfy(\.isEmpty),
+            "Successful cleanup must durably clear main config and all three journals"
+        )
+        try expect(
+            agent.config.activeRouterMappings.isEmpty
+                && agent.status.routerStatus.state == .disabled,
+            "Off may be displayed only after active mappings are durably empty"
+        )
+        try expect(
+            localNetwork.callCount == 0
+                && publicIP.ipv4CallCount == 0
+                && publicIP.ipv6CallCount == 0
+                && router.externalIPv4CallCount == 0
+                && observed == ["router.recovery.delete"],
+            "Successful closed cleanup must perform no non-cleanup network work"
+        )
+        try expect(
+            checkElapsed < 1 && stopElapsed < 0.5,
+            "Successful closed cleanup must meet completion and stop latency bounds"
+        )
+    }
+
+    do {
+        let mapping = makeMapping()
+        let seeded = try seed(
+            name: "disabled-active-delete-failure",
+            mapping: mapping
+        )
+        let router = MockRouterMappingService()
+        router.setRemovalFailures([mapping])
+        let localNetwork = MockLocalNetworkService()
+        let publicIP = MockPublicIPService()
+        let completed = DispatchSemaphore(value: 0)
+        let agent = NetworkAgent(
+            configStore: seeded.store,
+            keychain: inMemoryKeychain(),
+            checkCompletionObserver: { completed.signal() },
+            localNetworkService: localNetwork,
+            routerMappingService: router,
+            publicIPServiceFactory: { _ in publicIP },
+            emergencyMappingJournal: seeded.emergency,
+            fallbackMappingJournal: seeded.fallback,
+            nowProvider: wallClock.now,
+            monotonicUptimeProvider: uptime.now,
+            bootIdentifierProvider: { currentBoot },
+            performInitialCheckOnStart: false
+        )
+        defer {
+            stopAgentForCleanup(agent)
+            try? FileManager.default.removeItem(
+                at: seeded.directory
+            )
+        }
+        let checkStarted = ProcessInfo.processInfo.systemUptime
+        agent.runCheck()
+        try expect(
+            completed.wait(timeout: .now() + 1) == .success,
+            "Persisted active cleanup failure must complete promptly"
+        )
+        let checkElapsed =
+            ProcessInfo.processInfo.systemUptime - checkStarted
+        let identities = try persistedIdentifiers(seeded)
+        try expect(
+            identities.allSatisfy {
+                $0 == [mapping.identifier]
+            },
+            "A failed delete must retain the complete identity in main config and all journals"
+        )
+        try expect(
+            agent.status.routerStatus.state == .failed
+                && agent.status.routerStatus.message
+                    == "Router cleanup failed"
+                && agent.status.remoteDesktopStatus.state
+                    == .warning
+                && agent.status.remoteDesktopStatus.message
+                    == "A router rule may still be open",
+            "A failed cleanup must not claim that remote access is safely off"
+        )
+        try expect(
+            localNetwork.callCount == 0
+                && publicIP.ipv4CallCount == 0
+                && publicIP.ipv6CallCount == 0
+                && router.externalIPv4CallCount == 0,
+            "A failed closed cleanup must still skip every non-cleanup probe"
+        )
+        let stopStarted = ProcessInfo.processInfo.systemUptime
+        try expect(
+            agent.stopAndWaitUntilIdle(timeout: 0.5)
+                && checkElapsed < 1
+                && ProcessInfo.processInfo.systemUptime
+                    - stopStarted < 0.5,
+            "Failed closed cleanup must meet completion and stop latency bounds"
+        )
+    }
+
+    do {
+        let mapping = makeMapping()
+        let seeded = try seed(
+            name: "disabled-active-delete-cancel",
+            mapping: mapping
+        )
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let completed = DispatchSemaphore(value: 0)
+        let router = MockRouterMappingService()
+        router.failAllRemovals = true
+        router.beforeRemoval = {
+            entered.signal()
+            release.wait()
+        }
+        router.cancellationHandler = {
+            release.signal()
+        }
+        let localNetwork = MockLocalNetworkService()
+        let publicIP = MockPublicIPService()
+        let agent = NetworkAgent(
+            configStore: seeded.store,
+            keychain: inMemoryKeychain(),
+            checkCompletionObserver: { completed.signal() },
+            localNetworkService: localNetwork,
+            routerMappingService: router,
+            publicIPServiceFactory: { _ in publicIP },
+            emergencyMappingJournal: seeded.emergency,
+            fallbackMappingJournal: seeded.fallback,
+            nowProvider: wallClock.now,
+            monotonicUptimeProvider: uptime.now,
+            bootIdentifierProvider: { currentBoot },
+            performInitialCheckOnStart: false
+        )
+        defer {
+            stopAgentForCleanup(agent)
+            try? FileManager.default.removeItem(
+                at: seeded.directory
+            )
+        }
+        agent.runCheck()
+        try expect(
+            entered.wait(timeout: .now() + 1) == .success,
+            "Cancellation fixture must enter recovery deletion"
+        )
+        let stopStarted = ProcessInfo.processInfo.systemUptime
+        try expect(
+            agent.stopAndWaitUntilIdle(timeout: 0.75),
+            "Cancellation must promptly stop the recovery check"
+        )
+        let stopElapsed =
+            ProcessInfo.processInfo.systemUptime - stopStarted
+        try expect(
+            completed.wait(timeout: .now()) == .success,
+            "Cancelled recovery must signal explicit completion"
+        )
+        let identities = try persistedIdentifiers(seeded)
+        try expect(
+            identities.allSatisfy {
+                $0 == [mapping.identifier]
+            },
+            "Cancellation must leave the identity in main config and every pre-staged journal"
+        )
+        try expect(
+            stopElapsed < 0.75
+                && localNetwork.callCount == 0
+                && publicIP.ipv4CallCount == 0
+                && publicIP.ipv6CallCount == 0
+                && router.externalIPv4CallCount == 0,
+            "Cancelled closed cleanup must stop quickly without later network work"
+        )
+    }
+
+    do {
+        let oldBoot = "boot-disabled-active-old"
+        let mapping = makeMapping(
+            transport: .natpmp,
+            bootIdentifier: oldBoot,
+            remainingLease: 2
+        )
+        let seeded = try seed(
+            name: "disabled-active-cross-boot",
+            mapping: mapping
+        )
+        let udpCalls = LockedCounter()
+        let router = RouterMappingService(
+            udpTransactionHandler: {
+                _, _, _, _, _, _ in
+                udpCalls.increment()
+                throw SimulatedRouterFailure(
+                    operation: "unexpected cross-boot UDP"
+                )
+            },
+            nowProvider: wallClock.now,
+            monotonicUptimeProvider: uptime.now,
+            bootIdentifierProvider: { currentBoot }
+        )
+        let localNetwork = MockLocalNetworkService()
+        let publicIP = MockPublicIPService()
+        let completed = DispatchSemaphore(value: 0)
+        let agent = NetworkAgent(
+            configStore: seeded.store,
+            keychain: inMemoryKeychain(),
+            checkCompletionObserver: { completed.signal() },
+            localNetworkService: localNetwork,
+            routerMappingService: router,
+            publicIPServiceFactory: { _ in publicIP },
+            emergencyMappingJournal: seeded.emergency,
+            fallbackMappingJournal: seeded.fallback,
+            nowProvider: wallClock.now,
+            monotonicUptimeProvider: uptime.now,
+            bootIdentifierProvider: { currentBoot },
+            performInitialCheckOnStart: false
+        )
+        defer {
+            stopAgentForCleanup(agent)
+            try? FileManager.default.removeItem(
+                at: seeded.directory
+            )
+        }
+
+        agent.runCheck()
+        try expect(
+            completed.wait(timeout: .now() + 1) == .success,
+            "Cross-boot finite-lease wait must complete promptly"
+        )
+        let waitingIdentities =
+            try persistedIdentifiers(seeded)
+        try expect(
+            waitingIdentities.allSatisfy {
+                $0 == [mapping.identifier]
+            }
+                && agent.status.routerStatus.state == .failed
+                && udpCalls.current == 0,
+            "Cross-boot cleanup must retain identity and send no unsafe delete before lease expiry"
+        )
+
+        uptime.set(503)
+        agent.runCheck()
+        try expect(
+            completed.wait(timeout: .now() + 1) == .success,
+            "Expired cross-boot recovery must complete promptly"
+        )
+        let expiredIdentities =
+            try persistedIdentifiers(seeded)
+        try expect(
+            expiredIdentities.allSatisfy(\.isEmpty)
+                && agent.status.routerStatus.state == .disabled
+                && agent.config.activeRouterMappings.isEmpty
+                && udpCalls.current == 0,
+            "Finite lease expiry must safely clear every retained identity without UDP deletion"
+        )
+        let stopStarted = ProcessInfo.processInfo.systemUptime
+        try expect(
+            agent.stopAndWaitUntilIdle(timeout: 0.5)
+                && ProcessInfo.processInfo.systemUptime
+                    - stopStarted < 0.5
+                && localNetwork.callCount == 0
+                && publicIP.ipv4CallCount == 0
+                && publicIP.ipv6CallCount == 0,
+            "Cross-boot recovery must stop quickly and perform no non-cleanup probes"
+        )
+    }
 }
 
 func testRouterWANIPv4RequiresPublicRoutability() throws {
     let baseDirectory = try makeTemporaryDirectory(named: "router-wan-public-selection")
-    defer { try? FileManager.default.removeItem(at: baseDirectory) }
 
     let router = MockRouterMappingService()
     let publicIP = MockPublicIPService()
     var config = AppConfig.default
     config.preferredAddressFamily = .ipv4
+    config.mappingProtocolPreference = .automatic
     let agent = NetworkAgent(
         configStore: AppConfigStore(baseDirectory: baseDirectory),
         keychain: inMemoryKeychain(),
@@ -3079,15 +4029,20 @@ func testRouterWANIPv4RequiresPublicRoutability() throws {
         publicIPServiceFactory: { _ in publicIP },
         emergencyMappingJournal: emergencyJournal(in: baseDirectory)
     )
+    defer { stopAgentForCleanup(agent) }
 
-    router.externalIPv4 = "8.8.8.8"
-    let publicRouter = try agent.currentPublicIPv4(
+    router.externalIPv4 = "8.8.4.4"
+    let verifiedPublic = try agent.currentPublicIPv4(
         config: config,
         gatewayAddress: "192.0.2.1",
         revision: 0
     )
-    try expect(publicRouter.publicAddress == "8.8.8.8", "A public router WAN address must take priority")
-    try expect(publicIP.ipv4CallCount == 0, "A public router WAN address must avoid the fallback probe")
+    try expect(
+        verifiedPublic.routerWANAddress == "8.8.4.4"
+            && verifiedPublic.routerWANVerified
+            && !verifiedPublic.blocksDDNS,
+        "Only a router-protocol-verified public WAN address may allow DDNS"
+    )
 
     let nonPublicAddresses = [
         ("10.0.0.1", "RFC1918"),
@@ -3116,11 +4071,1035 @@ func testRouterWANIPv4RequiresPublicRoutability() throws {
             "\(category) address \(address) must remain available for diagnostics"
         )
         try expect(
-            discovery.blocksDDNS,
+            discovery.routerWANVerified
+                && discovery.blocksDDNS,
             "\(category) address \(address) must block A-record updates"
         )
     }
-    agent.stop()
+    try stopAgent(agent)
+    let natOnlyDirectory = try makeTemporaryDirectory(
+        named: "router-wan-natpmp-only"
+    )
+    var natPMPTimeouts: [TimeInterval] = []
+    var upnpDiscoveryCalls = 0
+    let realRouter = RouterMappingService(
+        upnpDiscoveryHandler: {
+            upnpDiscoveryCalls += 1
+            return []
+        },
+        udpRequestHandler: { request, _, _, timeout in
+            try expect(
+                request == Data([0, 0]),
+                "NetworkAgent Auto WAN must use the harmless NAT-PMP External Address request"
+            )
+            natPMPTimeouts.append(timeout)
+            return Data([
+                0, 128, 0, 0,
+                0, 0, 0, 1,
+                100, 64, 1, 20
+            ])
+        }
+    )
+    var automaticConfig = config
+    automaticConfig.mappingProtocolPreference = .automatic
+    let natOnlyPublicIP = MockPublicIPService()
+    let natOnlyAgent = NetworkAgent(
+        configStore: AppConfigStore(
+            baseDirectory: natOnlyDirectory
+        ),
+        keychain: inMemoryKeychain(),
+        initialConfig: automaticConfig,
+        localNetworkService: MockLocalNetworkService(),
+        routerMappingService: realRouter,
+        publicIPServiceFactory: { _ in natOnlyPublicIP },
+        emergencyMappingJournal: emergencyJournal(
+            in: natOnlyDirectory
+        )
+    )
+    defer { stopAgentForCleanup(natOnlyAgent) }
+    let natOnlyDiscovery = try natOnlyAgent.currentPublicIPv4(
+        config: automaticConfig,
+        gatewayAddress: "192.0.2.1",
+        revision: 0
+    )
+    try expect(
+        natOnlyDiscovery.routerWANAddress == "100.64.1.20"
+            && natOnlyDiscovery.publicAddress == natOnlyPublicIP.ipv4
+            && natOnlyDiscovery.routerWANVerified
+            && natOnlyDiscovery.blocksDDNS,
+        "The real Auto path must retain NAT-PMP-only CGNAT evidence and block DDNS"
+    )
+    try expect(
+        natPMPTimeouts == [0.25]
+            && upnpDiscoveryCalls == 0,
+        "NAT-PMP-only Auto WAN must finish in the first short probe without UPnP"
+    )
+    try stopAgent(natOnlyAgent)
+    let unavailableDirectory = try makeTemporaryDirectory(
+        named: "router-wan-auto-unverified"
+    )
+    var unavailableTimeouts: [TimeInterval] = []
+    var unavailableUPnPCalls = 0
+    let unavailableRouter = RouterMappingService(
+        upnpDiscoveryHandler: {
+            unavailableUPnPCalls += 1
+            return []
+        },
+        udpRequestHandler: { _, _, _, timeout in
+            unavailableTimeouts.append(timeout)
+            throw RouterMappingError.timeout(
+                "Injected short Auto WAN timeout"
+            )
+        }
+    )
+    let unavailableAgent = NetworkAgent(
+        configStore: AppConfigStore(
+            baseDirectory: unavailableDirectory
+        ),
+        keychain: inMemoryKeychain(),
+        initialConfig: automaticConfig,
+        localNetworkService: MockLocalNetworkService(),
+        routerMappingService: unavailableRouter,
+        publicIPServiceFactory: { _ in MockPublicIPService() },
+        emergencyMappingJournal: emergencyJournal(
+            in: unavailableDirectory
+        )
+    )
+    defer { stopAgentForCleanup(unavailableAgent) }
+    let unavailableDiscovery = try unavailableAgent.currentPublicIPv4(
+        config: automaticConfig,
+        gatewayAddress: "192.0.2.1",
+        revision: 0
+    )
+    try expect(
+        unavailableDiscovery.routerWANAddress == nil
+            && !unavailableDiscovery.routerWANVerified
+            && unavailableDiscovery.blocksDDNS,
+        "Auto mode must fail closed when neither short NAT-PMP nor UPnP can verify router WAN state"
+    )
+    try expect(
+        unavailableTimeouts == [0.25, 0.5, 1]
+            && unavailableUPnPCalls == 1,
+        "Unavailable Auto WAN must use only the 1.75-second NAT-PMP budget before one UPnP fallback"
+    )
+    let missingGatewayDiscovery = try unavailableAgent
+        .currentPublicIPv4(
+            config: automaticConfig,
+            gatewayAddress: nil,
+            revision: 0
+        )
+    try expect(
+        missingGatewayDiscovery.publicAddress == "8.8.4.4"
+            && missingGatewayDiscovery.routerWANAddress == nil
+            && !missingGatewayDiscovery.routerWANVerified
+            && missingGatewayDiscovery.blocksDDNS,
+        "Auto mode must fail closed when default-route parsing or a network transition yields no gateway"
+    )
+    try stopAgent(unavailableAgent)
+    try? FileManager.default.removeItem(
+        at: unavailableDirectory
+    )
+    try? FileManager.default.removeItem(at: natOnlyDirectory)
+    try? FileManager.default.removeItem(at: baseDirectory)
+}
+
+func testAutomaticPCPMappingSuppliesVerifiedRouterWAN() throws {
+    struct CheckResult {
+        let events: [String]
+        let config: AppConfig
+        let status: AppStatus
+        let ensureCalls: [RouterMappingAddressFamily]
+        let externalIPv4Calls: Int
+        let publicIPv4Calls: Int
+    }
+
+    func automaticConfig() -> AppConfig {
+        var config = AppConfig.default
+        config.remoteAccessEnabled = true
+        config.dnsProvider = .cloudflare
+        config.cloudflareZoneID = "invalid-zone-id"
+        config.dnsRecordName = "mac.example.test"
+        config.preferredAddressFamily = .ipv4
+        config.mappingProtocolPreference = .automatic
+        return config
+    }
+
+    func runFresh(
+        name: String,
+        routerAddress: String,
+        ensureError: Error? = nil,
+        routerWANQueryError: Error? = nil
+    ) throws -> CheckResult {
+        let baseDirectory = try makeTemporaryDirectory(named: name)
+        let router = MockRouterMappingService()
+        router.externalIPv4 = routerAddress
+        router.externalIPv4Failure = routerWANQueryError
+        router.setEnsureError(ensureError)
+        let publicIP = MockPublicIPService()
+        let keychain = inMemoryKeychain()
+        try keychain.set(
+            "integration-token",
+            account: "cloudflare-api-token"
+        )
+        let eventLock = NSLock()
+        var events: [String] = []
+        let completed = DispatchSemaphore(value: 0)
+        let agent = NetworkAgent(
+            configStore: AppConfigStore(baseDirectory: baseDirectory),
+            keychain: keychain,
+            initialConfig: automaticConfig(),
+            checkCompletionObserver: {
+                completed.signal()
+            },
+            sideEffectWillStartObserver: { label in
+                eventLock.lock()
+                events.append(label)
+                eventLock.unlock()
+            },
+            localNetworkService: MockLocalNetworkService(),
+            routerMappingService: router,
+            publicIPServiceFactory: { _ in publicIP },
+            emergencyMappingJournal: emergencyJournal(
+                in: baseDirectory
+            )
+        )
+        defer {
+            stopAgentForCleanup(agent)
+            try? FileManager.default.removeItem(at: baseDirectory)
+        }
+        agent.runCheck()
+        try expect(
+            completed.wait(timeout: .now() + 3) == .success,
+            "\(name) must complete through an explicit observer"
+        )
+        eventLock.lock()
+        let observedEvents = events
+        eventLock.unlock()
+        let result = CheckResult(
+            events: observedEvents,
+            config: agent.config,
+            status: agent.status,
+            ensureCalls: router.ensureCalls,
+            externalIPv4Calls: router.externalIPv4CallCount,
+            publicIPv4Calls: publicIP.ipv4CallCount
+        )
+        try stopAgent(agent)
+        return result
+    }
+
+    let publicResult = try runFresh(
+        name: "auto-pcp-public-wan",
+        routerAddress: "8.8.4.4"
+    )
+    guard let mapIndex = publicResult.events.firstIndex(
+        of: "router.mapping.create"
+    ),
+    let ddnsIndex = publicResult.events.firstIndex(
+        of: "cloudflare.upsert-a"
+    ) else {
+        throw IntegrationContractFailure(
+            "A public PCP MAP must reach both mapping and DDNS side effects"
+        )
+    }
+    try expect(
+        mapIndex < ddnsIndex,
+        "Cloudflare A-record work must start only after PCP MAP verification"
+    )
+    try expect(
+        publicResult.ensureCalls == [.ipv4]
+            && publicResult.externalIPv4Calls == 0,
+        "PCP MAP must run once and its response must avoid a second WAN query or MAP"
+    )
+    try expect(
+        publicResult.status.publicAddress == "8.8.4.4"
+            && publicResult.publicIPv4Calls == 0,
+        "A public PCP MAP address must be the verified DDNS input without an independent public-IP probe"
+    )
+    try expect(
+        publicResult.config.activeRouterMappings.count == 1
+            && publicResult.config.activeRouterMappings[0]
+                .routerExternalAddress == "8.8.4.4",
+        "The verified PCP router WAN address must be persisted with the lease"
+    )
+
+    for address in ["100.64.1.20", "10.0.0.20", "192.0.2.20"] {
+        let result = try runFresh(
+            name: "auto-pcp-non-public-\(address)",
+            routerAddress: address
+        )
+        try expect(
+            result.ensureCalls == [.ipv4]
+                && result.externalIPv4Calls == 0,
+            "A non-public PCP response must still use exactly one verified MAP"
+        )
+        try expect(
+            !result.events.contains("cloudflare.upsert-a")
+                && result.publicIPv4Calls == 1,
+            "CGNAT, RFC1918, and other non-global PCP addresses must block A-record writes"
+        )
+        try expect(
+            result.status.publicAddress == "8.8.4.4",
+            "The independent public address remains diagnostic when PCP reports \(address)"
+        )
+    }
+
+    let failed = try runFresh(
+        name: "auto-pcp-map-failed",
+        routerAddress: "8.8.4.4",
+        ensureError: RouterMappingError.timeout(
+            "Injected PCP MAP timeout"
+        ),
+        routerWANQueryError: RouterMappingError.timeout(
+            "Injected PCP-only WAN query timeout"
+        )
+    )
+    try expect(
+        failed.ensureCalls == [.ipv4]
+            && failed.externalIPv4Calls == 0
+            && !failed.events.contains("cloudflare.upsert-a"),
+        "A failed PCP MAP must fail closed without accepting a separate WAN query"
+    )
+
+    func persistedPCPConfig(
+        externalAddress: String
+    ) -> AppConfig {
+        let now = Date()
+        let nowUptime = ProcessInfo.processInfo.systemUptime
+        let bootIdentifier = RouterMappingService.systemBootIdentifier
+        var mapping = activeMappingFixture(
+            transport: .pcp,
+            family: .ipv4,
+            renewAfter: now.addingTimeInterval(1_800),
+            leaseExpiresAt: now.addingTimeInterval(3_600)
+        )
+        mapping.routerExternalAddress = externalAddress
+        mapping.routerEpoch = 500
+        mapping.routerEpochObservedAt = now
+        mapping.routerEpochObservedUptime = nowUptime
+        mapping.routerEpochBootIdentifier = bootIdentifier
+        mapping.routerEpochHealthCheckAfter =
+            now.addingTimeInterval(60)
+        mapping.routerEpochHealthCheckUptime = nowUptime + 60
+        mapping.leaseExpiresUptime = nowUptime + 3_600
+        mapping.renewAfterUptime = nowUptime + 1_800
+        mapping.leaseBootIdentifier = bootIdentifier
+        mapping.leaseAnchorWallTime = now
+        mapping.leaseRemainingAtAnchor = 3_600
+        mapping.renewRemainingAtAnchor = 1_800
+        var config = automaticConfig()
+        config.externalPort = mapping.externalPort
+        config.pcpNonce = mapping.pcpNonce
+        config.activeRouterMappings = [mapping]
+        return config
+    }
+
+    let restoreDirectory = try makeTemporaryDirectory(
+        named: "auto-pcp-persisted-wan"
+    )
+    defer {
+        try? FileManager.default.removeItem(at: restoreDirectory)
+    }
+    let restoreStore = AppConfigStore(
+        baseDirectory: restoreDirectory
+    )
+    try restoreStore.save(
+        persistedPCPConfig(externalAddress: "8.8.4.4")
+    )
+    let restoreKeychain = inMemoryKeychain()
+    try restoreKeychain.set(
+        "integration-token",
+        account: "cloudflare-api-token"
+    )
+    let restoreRouter = MockRouterMappingService()
+    restoreRouter.externalIPv4Failure = RouterMappingError.timeout(
+        "Persisted PCP evidence must avoid WAN rediscovery"
+    )
+    let restoreEventsLock = NSLock()
+    var restoreEvents: [String] = []
+    let restoreCompleted = DispatchSemaphore(value: 0)
+    let restoredAgent = NetworkAgent(
+        configStore: restoreStore,
+        keychain: restoreKeychain,
+        checkCompletionObserver: {
+            restoreCompleted.signal()
+        },
+        sideEffectWillStartObserver: { label in
+            restoreEventsLock.lock()
+            restoreEvents.append(label)
+            restoreEventsLock.unlock()
+        },
+        localNetworkService: MockLocalNetworkService(),
+        routerMappingService: restoreRouter,
+        publicIPServiceFactory: { _ in MockPublicIPService() },
+        emergencyMappingJournal: emergencyJournal(
+            in: restoreDirectory
+        )
+    )
+    defer { stopAgentForCleanup(restoredAgent) }
+    restoredAgent.runCheck()
+    try expect(
+        restoreCompleted.wait(timeout: .now() + 3) == .success,
+        "The persisted PCP lease check must complete"
+    )
+    restoreEventsLock.lock()
+    let observedRestoreEvents = restoreEvents
+    restoreEventsLock.unlock()
+    guard let epochIndex = observedRestoreEvents.firstIndex(
+        of: "router.mapping.epoch-health"
+    ),
+    let restoredDDNSIndex = observedRestoreEvents.firstIndex(
+        of: "cloudflare.upsert-a"
+    ) else {
+        throw IntegrationContractFailure(
+            "A restored PCP lease must be Epoch-verified before DDNS"
+        )
+    }
+    try expect(
+        restoreRouter.ensureCalls.isEmpty
+            && restoreRouter.externalIPv4CallCount == 0
+            && epochIndex < restoredDDNSIndex,
+        "A same-boot, unexpired, Epoch-verified PCP lease may reuse its persisted WAN address without renewal or rediscovery"
+    )
+    try stopAgent(restoredAgent)
+
+    let orphanDirectory = try makeTemporaryDirectory(
+        named: "auto-pcp-orphan-wan"
+    )
+    defer {
+        try? FileManager.default.removeItem(at: orphanDirectory)
+    }
+    let orphanStore = AppConfigStore(
+        baseDirectory: orphanDirectory
+    )
+    let orphanConfig = persistedPCPConfig(
+        externalAddress: "8.8.4.4"
+    )
+    try orphanStore.save(orphanConfig)
+    let oldMapping = orphanConfig.activeRouterMappings[0]
+    let orphanRouter = MockRouterMappingService()
+    orphanRouter.setEpochAddressChange(
+        oldMapping,
+        replacementAddress: "192.0.2.21"
+    )
+    orphanRouter.setRemovalFailures([oldMapping])
+    orphanRouter.externalIPv4Failure = RouterMappingError.timeout(
+        "Orphaned PCP evidence must not be reused"
+    )
+    let orphanKeychain = inMemoryKeychain()
+    try orphanKeychain.set(
+        "integration-token",
+        account: "cloudflare-api-token"
+    )
+    let orphanEventsLock = NSLock()
+    var orphanEvents: [String] = []
+    let orphanCompleted = DispatchSemaphore(value: 0)
+    let orphanAgent = NetworkAgent(
+        configStore: orphanStore,
+        keychain: orphanKeychain,
+        checkCompletionObserver: {
+            orphanCompleted.signal()
+        },
+        sideEffectWillStartObserver: { label in
+            orphanEventsLock.lock()
+            orphanEvents.append(label)
+            orphanEventsLock.unlock()
+        },
+        localNetworkService: MockLocalNetworkService(),
+        routerMappingService: orphanRouter,
+        publicIPServiceFactory: { _ in MockPublicIPService() },
+        emergencyMappingJournal: emergencyJournal(
+            in: orphanDirectory
+        )
+    )
+    defer { stopAgentForCleanup(orphanAgent) }
+    orphanAgent.runCheck()
+    try expect(
+        orphanCompleted.wait(timeout: .now() + 3) == .success,
+        "The PCP address-change recovery check must complete"
+    )
+    orphanEventsLock.lock()
+    let observedOrphanEvents = orphanEvents
+    orphanEventsLock.unlock()
+    try expect(
+        orphanRouter.ensureCalls.isEmpty
+            && !observedOrphanEvents.contains("cloudflare.upsert-a"),
+        "An effective-address orphan must block both replacement MAP and DDNS until cleanup or monotonic expiry"
+    )
+    try expect(
+        orphanAgent.config.activeRouterMappings.first?
+            .recoveryState == .effectiveClientAddressChanged,
+        "The old PCP identity and lease deadline must remain persisted for recovery"
+    )
+    try stopAgent(orphanAgent)
+}
+
+func testCurrentCheckMappingProofFamilyMatrix() throws {
+    struct InjectedRecoveryCheckpointFailure: Error {}
+
+    struct MatrixResult {
+        let events: [String]
+        let ensureCalls: [RouterMappingAddressFamily]
+        let mappings: [ActiveRouterMapping]
+        let removalCalls: [ActiveRouterMapping]
+        let externalIPv4Calls: Int
+    }
+
+    func run(
+        name: String,
+        preference: MappingProtocolPreference,
+        failedFamilies: Set<RouterMappingAddressFamily> = [],
+        initialMappings: [ActiveRouterMapping] = [],
+        verificationFailures: [ActiveRouterMapping] = [],
+        failRecoveryCheckpoint: Bool = false
+    ) throws -> MatrixResult {
+        let directory = try makeTemporaryDirectory(named: name)
+        let configURL = directory.appendingPathComponent("config.json")
+        let store = AppConfigStore(
+            configURL: configURL,
+            recoveryDataWriter: { data, url in
+                if failRecoveryCheckpoint {
+                    throw InjectedRecoveryCheckpointFailure()
+                }
+                try data.write(to: url, options: .atomic)
+            }
+        )
+        let router = MockRouterMappingService()
+        router.externalIPv4 = "8.8.4.4"
+        router.setEnsureFailures(failedFamilies)
+        router.setVerificationFailures(verificationFailures)
+        let local = MockLocalNetworkService()
+        local.ipv6Address = "2606:4700:4700::1111"
+        let publicIP = MockPublicIPService()
+        let keychain = inMemoryKeychain()
+        try keychain.set(
+            "integration-token",
+            account: "cloudflare-api-token"
+        )
+        var config = AppConfig.default
+        config.remoteAccessEnabled = true
+        config.dnsProvider = .cloudflare
+        config.cloudflareZoneID = "matrix-zone"
+        config.dnsRecordName = "matrix.example.test"
+        config.preferredAddressFamily = .dualStack
+        config.mappingProtocolPreference = preference
+        config.activeRouterMappings = initialMappings
+        if let ipv4 = initialMappings.first(where: {
+            $0.addressFamily == .ipv4
+        }) {
+            config.externalPort = ipv4.externalPort
+            config.pcpNonce = ipv4.pcpNonce
+        }
+
+        let eventLock = NSLock()
+        var events: [String] = []
+        let completed = DispatchSemaphore(value: 0)
+        let agent = NetworkAgent(
+            configStore: store,
+            keychain: keychain,
+            initialConfig: config,
+            checkCompletionObserver: { completed.signal() },
+            sideEffectWillStartObserver: { label in
+                eventLock.lock()
+                events.append(label)
+                eventLock.unlock()
+            },
+            localNetworkService: local,
+            routerMappingService: router,
+            publicIPServiceFactory: { _ in publicIP },
+            emergencyMappingJournal: emergencyJournal(in: directory)
+        )
+        agent.runCheck()
+        try expect(
+            completed.wait(timeout: .now() + 3) == .success,
+            "\(name) must complete through its explicit observer"
+        )
+        eventLock.lock()
+        let observedEvents = events
+        eventLock.unlock()
+        let result = MatrixResult(
+            events: observedEvents,
+            ensureCalls: router.ensureCalls,
+            mappings: agent.config.activeRouterMappings,
+            removalCalls: router.removalCalls,
+            externalIPv4Calls: router.externalIPv4CallCount
+        )
+        try stopAgent(agent)
+        try? FileManager.default.removeItem(at: directory)
+        return result
+    }
+
+    func expectDNSFamilies(
+        _ result: MatrixResult,
+        a: Bool,
+        aaaa: Bool,
+        context: String
+    ) throws {
+        try expect(
+            result.events.contains("cloudflare.upsert-a") == a,
+            "\(context) A-record proof result was incorrect"
+        )
+        try expect(
+            result.events.contains("cloudflare.upsert-aaaa") == aaaa,
+            "\(context) AAAA-record proof result was incorrect"
+        )
+    }
+
+    for preference in [
+        MappingProtocolPreference.automatic,
+        .pcp,
+        .upnp
+    ] {
+        let both = try run(
+            name: "proof-matrix-\(preference.rawValue)-both",
+            preference: preference
+        )
+        try expectDNSFamilies(
+            both,
+            a: true,
+            aaaa: true,
+            context: "\(preference.rawValue) verified dual stack"
+        )
+        try expect(
+            Set(both.mappings.map(\.addressFamily))
+                == Set([.ipv4, .ipv6]),
+            "\(preference.rawValue) must checkpoint one mapping identity per family"
+        )
+
+        let noIPv4 = try run(
+            name: "proof-matrix-\(preference.rawValue)-no-v4",
+            preference: preference,
+            failedFamilies: [.ipv4]
+        )
+        try expectDNSFamilies(
+            noIPv4,
+            a: false,
+            aaaa: true,
+            context: "\(preference.rawValue) IPv4 failure isolation"
+        )
+
+        let noIPv6 = try run(
+            name: "proof-matrix-\(preference.rawValue)-no-v6",
+            preference: preference,
+            failedFamilies: [.ipv6]
+        )
+        try expectDNSFamilies(
+            noIPv6,
+            a: true,
+            aaaa: false,
+            context: "\(preference.rawValue) IPv6 failure isolation"
+        )
+    }
+
+    let proofNow = Date()
+    let proofUptime = ProcessInfo.processInfo.systemUptime
+    let proofBoot = RouterMappingService.systemBootIdentifier
+    var failedPCP = activeMappingFixture(
+        transport: .pcp,
+        family: .ipv4,
+        renewAfter: proofNow.addingTimeInterval(1_800),
+        leaseExpiresAt: proofNow.addingTimeInterval(3_600)
+    )
+    failedPCP.routerExternalAddress = "8.8.4.4"
+    failedPCP.routerEpoch = 500
+    failedPCP.routerEpochObservedAt = proofNow
+    failedPCP.routerEpochObservedUptime = proofUptime
+    failedPCP.routerEpochBootIdentifier = proofBoot
+    failedPCP.routerEpochHealthCheckAfter =
+        proofNow.addingTimeInterval(60)
+    failedPCP.routerEpochHealthCheckUptime = proofUptime + 60
+    failedPCP.leaseExpiresUptime = proofUptime + 3_600
+    failedPCP.renewAfterUptime = proofUptime + 1_800
+    failedPCP.leaseBootIdentifier = proofBoot
+    failedPCP.leaseAnchorWallTime = proofNow
+    failedPCP.leaseRemainingAtAnchor = 3_600
+    failedPCP.renewRemainingAtAnchor = 1_800
+
+    var validUPnPIPv6 = activeMappingFixture(
+        transport: .upnp,
+        family: .ipv6,
+        localAddress: "2606:4700:4700::1111",
+        renewAfter: proofNow.addingTimeInterval(1_800),
+        leaseExpiresAt: proofNow.addingTimeInterval(3_600)
+    )
+    validUPnPIPv6.routerExternalAddress =
+        "2606:4700:4700::1111"
+    validUPnPIPv6.pcpNonce = "mock-bound-upnp-identity"
+    validUPnPIPv6.leaseExpiresUptime = proofUptime + 3_600
+    validUPnPIPv6.renewAfterUptime = proofUptime + 1_800
+    validUPnPIPv6.leaseBootIdentifier = proofBoot
+    validUPnPIPv6.leaseAnchorWallTime = proofNow
+    validUPnPIPv6.leaseRemainingAtAnchor = 3_600
+    validUPnPIPv6.renewRemainingAtAnchor = 1_800
+
+    let mixedRecovery = try run(
+        name: "proof-matrix-pcp-epoch-failure",
+        preference: .automatic,
+        initialMappings: [failedPCP, validUPnPIPv6],
+        verificationFailures: [failedPCP]
+    )
+    try expectDNSFamilies(
+        mixedRecovery,
+        a: false,
+        aaaa: true,
+        context: "failed PCP Epoch with independent UPnP IPv6 proof"
+    )
+    try expect(
+        mixedRecovery.ensureCalls.isEmpty
+            && mixedRecovery.externalIPv4Calls == 0,
+        "A persisted PCP port or another protocol's WAN proof must not replace failed PCP Epoch verification"
+    )
+
+    let natPMP = try run(
+        name: "proof-matrix-natpmp",
+        preference: .natpmp
+    )
+    try expectDNSFamilies(
+        natPMP,
+        a: true,
+        aaaa: false,
+        context: "NAT-PMP IPv4-only mapping"
+    )
+    try expect(
+        natPMP.mappings.count == 1
+            && natPMP.mappings[0].transport == .natpmp
+            && natPMP.mappings[0].addressFamily == .ipv4,
+        "Explicit NAT-PMP must not manufacture an IPv6 mapping proof"
+    )
+
+    let pureDDNS = try run(
+        name: "proof-matrix-ddns-only",
+        preference: .disabled
+    )
+    try expectDNSFamilies(
+        pureDDNS,
+        a: true,
+        aaaa: true,
+        context: "mapping-off pure DDNS exception"
+    )
+    try expect(
+        pureDDNS.ensureCalls.isEmpty,
+        "Pure DDNS must not create a router mapping"
+    )
+
+    let failedCheckpoint = try run(
+        name: "proof-matrix-checkpoint-failure",
+        preference: .automatic,
+        failRecoveryCheckpoint: true
+    )
+    try expectDNSFamilies(
+        failedCheckpoint,
+        a: false,
+        aaaa: false,
+        context: "uncheckpointed mapping"
+    )
+    try expect(
+        Set(failedCheckpoint.removalCalls.map(\.addressFamily))
+            == Set([.ipv4, .ipv6]),
+        "A failed proof checkpoint must compensate both newly created mappings"
+    )
+}
+
+func testDDNSWaitsForDurableUnexpiredMappingProof() throws {
+    struct InjectedMainConfigFailure: Error {}
+
+    func cloudflareConfig(
+        family: AddressFamilyPreference
+    ) -> AppConfig {
+        var config = AppConfig.default
+        config.remoteAccessEnabled = true
+        config.dnsProvider = .cloudflare
+        config.cloudflareZoneID = "durability-zone"
+        config.dnsRecordName = "durability.example.test"
+        config.preferredAddressFamily = family
+        config.mappingProtocolPreference = .automatic
+        return config
+    }
+
+    do {
+        let directory = try makeTemporaryDirectory(
+            named: "ddns-after-durable-router-state"
+        )
+        let eventLock = NSLock()
+        var events: [String] = []
+        func record(_ event: String) {
+            eventLock.lock()
+            events.append(event)
+            eventLock.unlock()
+        }
+        let configURL = directory.appendingPathComponent(
+            "config.json"
+        )
+        let store = AppConfigStore(
+            configURL: configURL,
+            dataWriter: { data, url in
+                record("commit.main-config")
+                try SecureAtomicFileWriter.write(data, to: url)
+            },
+            recoveryDataWriter: { data, url in
+                record("commit.primary-recovery")
+                try SecureAtomicFileWriter.write(data, to: url)
+            }
+        )
+        let emergency = EmergencyMappingJournal(
+            fileURL: directory.appendingPathComponent(
+                "emergency.json"
+            ),
+            dataWriter: { data, url in
+                record("commit.emergency-recovery")
+                try SecureAtomicFileWriter.write(data, to: url)
+            }
+        )
+        let fallback = EmergencyMappingJournal(
+            fileURL: directory.appendingPathComponent(
+                "fallback.json"
+            ),
+            dataWriter: { data, url in
+                record("commit.fallback-recovery")
+                try SecureAtomicFileWriter.write(data, to: url)
+            }
+        )
+        let router = MockRouterMappingService()
+        router.externalIPv4 = "8.8.4.4"
+        let keychain = inMemoryKeychain()
+        try keychain.set(
+            "integration-token",
+            account: "cloudflare-api-token"
+        )
+        let completed = DispatchSemaphore(value: 0)
+        let agent = NetworkAgent(
+            configStore: store,
+            keychain: keychain,
+            initialConfig: cloudflareConfig(family: .ipv4),
+            checkCompletionObserver: {
+                completed.signal()
+            },
+            sideEffectWillStartObserver: { record($0) },
+            localNetworkService: MockLocalNetworkService(),
+            routerMappingService: router,
+            publicIPServiceFactory: { _ in MockPublicIPService() },
+            emergencyMappingJournal: emergency,
+            fallbackMappingJournal: fallback
+        )
+        agent.runCheck()
+        try expect(
+            completed.wait(
+                timeout: .now() + .seconds(3)
+            ) == .success,
+            "The durable-order check must explicitly complete"
+        )
+        eventLock.lock()
+        let observed = events
+        eventLock.unlock()
+        guard let cloudflareIndex = observed.firstIndex(
+            of: "cloudflare.upsert-a"
+        ),
+        let mainIndex = observed.firstIndex(
+            of: "commit.main-config"
+        ),
+        let primaryIndex = observed.lastIndex(
+            of: "commit.primary-recovery"
+        ) else {
+            throw IntegrationContractFailure(
+                "The durable-order fixture did not observe every commit boundary: "
+                    + "\(observed)"
+            )
+        }
+        try expect(
+            primaryIndex < mainIndex
+                && mainIndex < cloudflareIndex,
+            "The recovery ownership checkpoint and main config must "
+                + "commit before Cloudflare: \(observed)"
+        )
+        try expect(
+            agent.config.activeRouterMappings.count == 1
+                && (try? store.loadMappingRecoveryJournal().isEmpty)
+                    == true
+                && (try? emergency.load().isEmpty) == true
+                && (try? fallback.load().isEmpty) == true,
+            "A Cloudflare attempt requires a durable main mapping and "
+                + "cleared ownership journals"
+        )
+        try stopAgent(agent)
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    do {
+        let directory = try makeTemporaryDirectory(
+            named: "ddns-main-config-commit-failure"
+        )
+        let configURL = directory.appendingPathComponent(
+            "config.json"
+        )
+        let store = AppConfigStore(
+            configURL: configURL,
+            dataWriter: { _, _ in
+                throw InjectedMainConfigFailure()
+            }
+        )
+        let emergency = EmergencyMappingJournal(
+            fileURL: directory.appendingPathComponent(
+                "emergency.json"
+            )
+        )
+        let fallback = EmergencyMappingJournal(
+            fileURL: directory.appendingPathComponent(
+                "fallback.json"
+            )
+        )
+        let router = MockRouterMappingService()
+        router.externalIPv4 = "8.8.4.4"
+        let keychain = inMemoryKeychain()
+        try keychain.set(
+            "integration-token",
+            account: "cloudflare-api-token"
+        )
+        let eventLock = NSLock()
+        var events: [String] = []
+        let completed = DispatchSemaphore(value: 0)
+        let agent = NetworkAgent(
+            configStore: store,
+            keychain: keychain,
+            initialConfig: cloudflareConfig(family: .ipv4),
+            checkCompletionObserver: {
+                completed.signal()
+            },
+            sideEffectWillStartObserver: { label in
+                eventLock.lock()
+                events.append(label)
+                eventLock.unlock()
+            },
+            localNetworkService: MockLocalNetworkService(),
+            routerMappingService: router,
+            publicIPServiceFactory: { _ in MockPublicIPService() },
+            emergencyMappingJournal: emergency,
+            fallbackMappingJournal: fallback
+        )
+        agent.runCheck()
+        try expect(
+            completed.wait(
+                timeout: .now() + .seconds(3)
+            ) == .success,
+            "The failed-main-config check must explicitly complete"
+        )
+        eventLock.lock()
+        let observed = events
+        eventLock.unlock()
+        try expect(
+            !observed.contains("cloudflare.upsert-a")
+                && !observed.contains("cloudflare.upsert-aaaa"),
+            "A failed durable commit must send no Cloudflare request"
+        )
+        try expect(
+            router.ensureCalls == [.ipv4]
+                && router.removalCalls.count == 1
+                && agent.config.activeRouterMappings.isEmpty
+                && (try? store.loadMappingRecoveryJournal().isEmpty)
+                    == true
+                && (try? emergency.load().isEmpty) == true
+                && (try? fallback.load().isEmpty) == true,
+            "Commit failure must compensate the mapping and leave no "
+                + "dangling ownership state"
+        )
+        try expect(
+            agent.status.ddnsStatus.message.contains("not committed"),
+            "Commit failure must record why DDNS was skipped"
+        )
+        try stopAgent(agent)
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    do {
+        let directory = try makeTemporaryDirectory(
+            named: "ddns-proof-expires-during-ipv6"
+        )
+        let wallClock = LockedClock(
+            Date(timeIntervalSince1970: 2_200_000_000)
+        )
+        let uptime = LockedMonotonicClock(100)
+        let router = MockRouterMappingService()
+        router.externalIPv4 = "8.8.4.4"
+        router.nowProvider = { wallClock.now() }
+        router.monotonicUptimeProvider = { uptime.now() }
+        router.bootIdentifierProvider = { "short-proof-boot" }
+        router.beforeEnsureFamily = { family in
+            if family == .ipv6 {
+                uptime.set(100.8)
+                wallClock.set(
+                    Date(timeIntervalSince1970: 2_200_000_000.8)
+                )
+            }
+        }
+        let local = MockLocalNetworkService()
+        local.ipv6Address = "2606:4700:4700::1111"
+        var config = cloudflareConfig(family: .dualStack)
+        config.mappingLeaseSeconds = 1
+        let keychain = inMemoryKeychain()
+        try keychain.set(
+            "integration-token",
+            account: "cloudflare-api-token"
+        )
+        let eventLock = NSLock()
+        var events: [String] = []
+        let completed = DispatchSemaphore(value: 0)
+        let agent = NetworkAgent(
+            configStore: AppConfigStore(baseDirectory: directory),
+            keychain: keychain,
+            initialConfig: config,
+            checkCompletionObserver: {
+                completed.signal()
+            },
+            sideEffectWillStartObserver: { label in
+                eventLock.lock()
+                events.append(label)
+                eventLock.unlock()
+            },
+            localNetworkService: local,
+            routerMappingService: router,
+            publicIPServiceFactory: { _ in MockPublicIPService() },
+            emergencyMappingJournal: emergencyJournal(in: directory),
+            nowProvider: { wallClock.now() },
+            monotonicUptimeProvider: { uptime.now() },
+            bootIdentifierProvider: { "short-proof-boot" }
+        )
+        agent.runCheck()
+        try expect(
+            completed.wait(
+                timeout: .now() + .seconds(3)
+            ) == .success,
+            "The short-proof check must explicitly complete"
+        )
+        eventLock.lock()
+        let firstEvents = events
+        eventLock.unlock()
+        try expect(
+            !firstEvents.contains("cloudflare.upsert-a")
+                && firstEvents.contains("cloudflare.upsert-aaaa"),
+            "IPv4 proof crossing its monotonic safety deadline during "
+                + "IPv6 work must block only A: \(firstEvents)"
+        )
+        try expect(
+            agent.status.ddnsStatus.detail.contains(
+                "monotonic lease safety deadline"
+            ),
+            "The family-specific status must record the expired proof"
+        )
+
+        router.beforeEnsureFamily = nil
+        agent.runCheck()
+        try expect(
+            completed.wait(
+                timeout: .now() + .seconds(3)
+            ) == .success,
+            "The proof-expiration recovery check must explicitly complete"
+        )
+        try expect(
+            router.ensureCalls == [.ipv4, .ipv6, .ipv4],
+            "The next check must renew the expired IPv4 proof without "
+                + "unnecessarily renewing IPv6"
+        )
+        try stopAgent(agent)
+        try? FileManager.default.removeItem(at: directory)
+    }
 }
 
 func testPersistSettingsAsyncNeverBlocksTheMainThread() throws {
@@ -3152,6 +5131,7 @@ func testPersistSettingsAsyncNeverBlocksTheMainThread() throws {
         localNetworkService: MockLocalNetworkService(),
         routerMappingService: router
     )
+    defer { stopAgentForCleanup(agent) }
 
     var requested = previous
     requested.remoteAccessEnabled = false
@@ -3178,7 +5158,7 @@ func testPersistSettingsAsyncNeverBlocksTheMainThread() throws {
     try expect(completionWasOnMain, "The asynchronous save result must return on the main thread")
     try expect(completionError == nil, "The injected asynchronous save must succeed after release")
     try expect(!agent.config.remoteAccessEnabled, "The successful asynchronous save must commit the requested state")
-    agent.stop()
+    try stopAgent(agent)
 }
 
 func testSupersededSavePreservesCompletedMappingCleanup() throws {
@@ -3214,6 +5194,7 @@ func testSupersededSavePreservesCompletedMappingCleanup() throws {
         localNetworkService: MockLocalNetworkService(),
         routerMappingService: router
     )
+    defer { stopAgentForCleanup(agent) }
 
     var firstRequest = previous
     firstRequest.remoteAccessEnabled = false
@@ -3241,7 +5222,7 @@ func testSupersededSavePreservesCompletedMappingCleanup() throws {
         !diskConfig.activeRouterMappings.contains { $0.identifier == mapping.identifier },
         "The durable checkpoint must not resurrect the exact mapping removed by a superseded save"
     )
-    agent.stop()
+    try stopAgent(agent)
 }
 
 func testLocalOriginTCPStatusSemantics() throws {
@@ -3264,6 +5245,7 @@ func testLocalOriginTCPStatusSemantics() throws {
         initialConfig: config,
         sideEffectsEnabled: false
     )
+    defer { stopAgentForCleanup(agent) }
 
     var resolvedHost = ""
     var resolvedFamily: Int32 = 0
@@ -3313,6 +5295,7 @@ func testStartAtLoginFailureIsVisibleAndRevertsConfig() throws {
         initialConfig: previousConfig,
         sideEffectsEnabled: false
     )
+    defer { stopAgentForCleanup(agent) }
 
     let appliedConfig = agent.applyStartAtLoginResult(
         .failure(.unstableApplicationLocation),
@@ -3378,6 +5361,7 @@ func testRemoteAccessDisableRetainsFailedMappingForRetry() throws {
         localNetworkService: local,
         routerMappingService: router
     )
+    defer { stopAgentForCleanup(agent) }
 
     agent.setRemoteAccessEnabled(false)
     try expect(
@@ -3487,6 +5471,7 @@ func testLegacyAutomaticCleanupPersistsEveryUnknownProtocol() throws {
         localNetworkService: MockLocalNetworkService(),
         routerMappingService: router
     )
+    defer { stopAgentForCleanup(agent) }
 
     agent.setRemoteAccessEnabled(false)
     try expect(
@@ -3555,6 +5540,7 @@ func testMappingIdentityChangeMustDeleteOldRuleFirst() throws {
             localNetworkService: MockLocalNetworkService(),
             routerMappingService: router
         )
+        defer { stopAgentForCleanup(agent) }
 
         var requested = previous
         applyChange(&requested)
@@ -3626,6 +5612,7 @@ func testPostCleanupPersistenceFailureKeepsTruthfulMappingState() throws {
         localNetworkService: MockLocalNetworkService(),
         routerMappingService: router
     )
+    defer { stopAgentForCleanup(agent) }
 
     var requested = previous
     requested.externalPort += 1
@@ -3672,6 +5659,7 @@ func testTemporaryAccessExpiryDoesNotHideCleanupFailure() throws {
         localNetworkService: MockLocalNetworkService(),
         routerMappingService: router
     )
+    defer { stopAgentForCleanup(agent) }
 
     agent.runCheck()
     try expect(
@@ -3690,7 +5678,7 @@ func testTemporaryAccessExpiryDoesNotHideCleanupFailure() throws {
         waitUntil { !agent.config.remoteAccessEnabled && agent.config.activeRouterMappings.isEmpty },
         "A later expiration cleanup retry must close the mapping before disabling access"
     )
-    agent.stop()
+    try stopAgent(agent)
 }
 
 func testTemporaryAccessUsesIndependentExpirationTimer() throws {
@@ -3700,7 +5688,7 @@ func testTemporaryAccessUsesIndependentExpirationTimer() throws {
     let clock = LockedClock(Date(timeIntervalSince1970: 2_000_200_000))
     let expiresAt = clock.now().addingTimeInterval(30 * 60)
     let mapping = activeMappingFixture(
-        transport: .pcp,
+        transport: .upnp,
         family: .ipv4,
         renewAfter: clock.now().addingTimeInterval(15 * 60),
         leaseExpiresAt: expiresAt
@@ -3709,9 +5697,9 @@ func testTemporaryAccessUsesIndependentExpirationTimer() throws {
     config.remoteAccessEnabled = true
     config.dnsProvider = .disabled
     config.preferredAddressFamily = .ipv4
-    config.mappingProtocolPreference = .pcp
+    config.mappingProtocolPreference = .upnp
+    config.autoRenewMapping = false
     config.externalPort = mapping.externalPort
-    config.pcpNonce = mapping.pcpNonce
     config.activeRouterMappings = [mapping]
     config.accessExpiresAt = expiresAt
     config.checkIntervalSeconds = 86_400
@@ -3735,6 +5723,7 @@ func testTemporaryAccessUsesIndependentExpirationTimer() throws {
             return NetworkAgentScheduledTimer {}
         }
     )
+    defer { stopAgentForCleanup(agent) }
 
     agent.start()
     try expect(
@@ -3771,7 +5760,502 @@ func testTemporaryAccessUsesIndependentExpirationTimer() throws {
         agent.config.checkIntervalSeconds == 86_400,
         "Expiration must not depend on or rewrite the periodic check interval"
     )
-    agent.stop()
+    try stopAgent(agent)
+}
+
+func testMappingDeadlinesDriveUnifiedWakeAndPersistedRecovery() throws {
+    let baseDirectory = try makeTemporaryDirectory(
+        named: "mapping-deadline-wake"
+    )
+    defer { try? FileManager.default.removeItem(at: baseDirectory) }
+
+    let clock = LockedClock(Date(timeIntervalSince1970: 2_000_250_000))
+    let initialNow = clock.now()
+    var mapping = activeMappingFixture(
+        transport: .pcp,
+        family: .ipv4,
+        renewAfter: initialNow.addingTimeInterval(30),
+        leaseExpiresAt: initialNow.addingTimeInterval(60)
+    )
+    mapping.routerEpoch = 100
+    mapping.routerEpochObservedAt = initialNow
+    mapping.routerEpochObservedUptime = 1_000
+    mapping.routerEpochBootIdentifier = "integration-boot"
+    mapping.routerEpochHealthCheckAfter =
+        initialNow.addingTimeInterval(45)
+
+    var config = AppConfig.default
+    config.remoteAccessEnabled = true
+    config.dnsProvider = .disabled
+    config.preferredAddressFamily = .ipv4
+    config.mappingProtocolPreference = .pcp
+    config.externalPort = mapping.externalPort
+    config.pcpNonce = mapping.pcpNonce
+    config.mappingLeaseSeconds = 60
+    config.checkIntervalSeconds = 300
+    config.activeRouterMappings = [mapping]
+
+    let scheduleLock = NSLock()
+    var deadlines: [Date] = []
+    var handlers: [() -> Void] = []
+    let checks = LockedCounter()
+    let checkCompleted = DispatchSemaphore(value: 0)
+    let router = MockRouterMappingService()
+    router.nowProvider = { clock.now() }
+    router.monotonicUptimeProvider = {
+        1_000 + clock.now().timeIntervalSince(initialNow)
+    }
+    router.bootIdentifierProvider = { "integration-boot" }
+    let agent = NetworkAgent(
+        configStore: AppConfigStore(baseDirectory: baseDirectory),
+        keychain: inMemoryKeychain(),
+        initialConfig: config,
+        checkExecutionObserver: { checks.increment() },
+        checkCompletionObserver: { checkCompleted.signal() },
+        localNetworkService: MockLocalNetworkService(),
+        routerMappingService: router,
+        publicIPServiceFactory: { _ in MockPublicIPService() },
+        nowProvider: { clock.now() },
+        monotonicUptimeProvider: {
+            1_000 + clock.now().timeIntervalSince(initialNow)
+        },
+        bootIdentifierProvider: { "integration-boot" },
+        performInitialCheckOnStart: false,
+        expirationTimerScheduler: { deadline, handler in
+            scheduleLock.lock()
+            deadlines.append(deadline)
+            handlers.append(handler)
+            scheduleLock.unlock()
+            return NetworkAgentScheduledTimer {}
+        }
+    )
+    defer { stopAgentForCleanup(agent) }
+    agent.start()
+
+    scheduleLock.lock()
+    let firstDeadline = deadlines.last
+    let renewalHandler = handlers.last
+    scheduleLock.unlock()
+    try expect(
+        firstDeadline == mapping.renewAfter,
+        "A 60-second lease must wake at its 30-second renewAfter before the 300-second check"
+    )
+    guard let renewalHandler else {
+        throw IntegrationContractFailure(
+            "The mapping renewal deadline handler was not scheduled"
+        )
+    }
+
+    clock.set(mapping.renewAfter)
+    renewalHandler()
+    try expect(
+        checkCompleted.wait(
+            timeout: .now() + .seconds(3)
+        ) == .success,
+        "The renewAfter check must explicitly complete"
+    )
+    try expect(
+        router.ensureCalls == [.ipv4]
+            && checks.current == 1
+            && agent.config.activeRouterMappings.first?.renewAfter
+                == clock.now().addingTimeInterval(30),
+        "The completed renewAfter wake must issue and persist exactly one renewal"
+    )
+
+    renewalHandler()
+    try expect(
+        checkCompleted.wait(
+            timeout: .now() + .seconds(3)
+        ) == .success
+            && checks.current >= 2,
+        "A duplicate stale timer callback must complete as one coalesced check"
+    )
+    try expect(
+        router.ensureCalls == [.ipv4],
+        "A duplicate callback before the new renewAfter must not issue another renewal"
+    )
+    scheduleLock.lock()
+    let deadlinesAfterRenewal = deadlines
+    scheduleLock.unlock()
+    try expect(
+        deadlinesAfterRenewal.suffix(from: 1).allSatisfy {
+            $0.timeIntervalSince(
+                clock.now().addingTimeInterval(30)
+            ) >= -0.1
+        },
+        "Renewal scheduling must not enter an immediate busy loop: "
+            + "\(deadlinesAfterRenewal)"
+    )
+    try stopAgent(agent)
+    let persistedDirectory = try makeTemporaryDirectory(
+        named: "persisted-mapping-deadline"
+    )
+    defer {
+        try? FileManager.default.removeItem(at: persistedDirectory)
+    }
+    let persistedStore = AppConfigStore(
+        baseDirectory: persistedDirectory
+    )
+    try persistedStore.save(config)
+    var persistedDeadlines: [Date] = []
+    let persistedAgent = NetworkAgent(
+        configStore: persistedStore,
+        keychain: inMemoryKeychain(),
+        localNetworkService: MockLocalNetworkService(),
+        routerMappingService: MockRouterMappingService(),
+        nowProvider: { initialNow },
+        performInitialCheckOnStart: false,
+        expirationTimerScheduler: { deadline, _ in
+            persistedDeadlines.append(deadline)
+            return NetworkAgentScheduledTimer {}
+        }
+    )
+    defer { stopAgentForCleanup(persistedAgent) }
+    persistedAgent.start()
+    try expect(
+        persistedDeadlines.last.map {
+            $0.timeIntervalSince(initialNow) <= 0.051
+        } == true,
+        "A legacy persisted mapping without boot identity must fail closed "
+            + "into an immediate renewal wake"
+    )
+    try stopAgent(persistedAgent)
+    var epochFirst = mapping
+    epochFirst.renewAfter = initialNow.addingTimeInterval(90)
+    epochFirst.routerEpochHealthCheckAfter =
+        initialNow.addingTimeInterval(20)
+    config.activeRouterMappings = [epochFirst]
+    var epochDeadlines: [Date] = []
+    let epochDirectory = try makeTemporaryDirectory(
+        named: "epoch-deadline-wake"
+    )
+    defer { try? FileManager.default.removeItem(at: epochDirectory) }
+    let epochAgent = NetworkAgent(
+        configStore: AppConfigStore(
+            baseDirectory: epochDirectory
+        ),
+        keychain: inMemoryKeychain(),
+        initialConfig: config,
+        localNetworkService: MockLocalNetworkService(),
+        routerMappingService: MockRouterMappingService(),
+        nowProvider: { initialNow },
+        performInitialCheckOnStart: false,
+        expirationTimerScheduler: { deadline, _ in
+            epochDeadlines.append(deadline)
+            return NetworkAgentScheduledTimer {}
+        }
+    )
+    defer { stopAgentForCleanup(epochAgent) }
+    epochAgent.start()
+    try expect(
+        epochDeadlines.last == epochFirst.routerEpochHealthCheckAfter,
+        "The earliest Epoch health deadline must precede renewAfter and checkInterval"
+    )
+    try stopAgent(epochAgent)
+}
+
+func testMonotonicLeaseDeadlinesIgnoreWallClockAndRestoreConservatively() throws {
+    let directory = try makeTemporaryDirectory(
+        named: "monotonic-lease-deadlines"
+    )
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let baseline = Date(timeIntervalSince1970: 2_000_280_000)
+    let wall = LockedClock(baseline)
+    let uptime = LockedMonotonicClock(100)
+    let bootA = "lease-boot-a"
+
+    var mapping = activeMappingFixture(
+        transport: .pcp,
+        family: .ipv4,
+        renewAfter: baseline.addingTimeInterval(30),
+        leaseExpiresAt: baseline.addingTimeInterval(60)
+    )
+    mapping.leaseBootIdentifier = bootA
+    mapping.renewAfterUptime = 130
+    mapping.leaseExpiresUptime = 160
+    mapping.leaseAnchorWallTime = baseline
+    mapping.renewRemainingAtAnchor = 30
+    mapping.leaseRemainingAtAnchor = 60
+    mapping.routerEpoch = 100
+    mapping.routerEpochObservedAt = baseline
+    mapping.routerEpochObservedUptime = 100
+    mapping.routerEpochBootIdentifier = bootA
+    mapping.routerEpochHealthCheckAfter =
+        baseline.addingTimeInterval(45)
+    mapping.routerEpochHealthCheckUptime = 145
+
+    var config = AppConfig.default
+    config.remoteAccessEnabled = true
+    config.dnsProvider = .disabled
+    config.preferredAddressFamily = .ipv4
+    config.mappingProtocolPreference = .pcp
+    config.externalPort = mapping.externalPort
+    config.pcpNonce = mapping.pcpNonce
+    config.activeRouterMappings = [mapping]
+
+    var deadlines: [Date] = []
+    let checkCompleted = DispatchSemaphore(value: 0)
+    let router = MockRouterMappingService()
+    router.nowProvider = { wall.now() }
+    let agent = NetworkAgent(
+        configStore: AppConfigStore(baseDirectory: directory),
+        keychain: inMemoryKeychain(),
+        initialConfig: config,
+        checkCompletionObserver: { checkCompleted.signal() },
+        localNetworkService: MockLocalNetworkService(),
+        routerMappingService: router,
+        publicIPServiceFactory: { _ in MockPublicIPService() },
+        nowProvider: { wall.now() },
+        monotonicUptimeProvider: { uptime.now() },
+        bootIdentifierProvider: { bootA },
+        performInitialCheckOnStart: false,
+        expirationTimerScheduler: { deadline, _ in
+            deadlines.append(deadline)
+            return NetworkAgentScheduledTimer {}
+        }
+    )
+    defer { stopAgentForCleanup(agent) }
+    agent.start()
+    try expect(
+        deadlines.last == baseline.addingTimeInterval(30),
+        "Same-boot renewal scheduling must project uptime 130 to 30 seconds"
+    )
+
+    wall.set(baseline.addingTimeInterval(3_600))
+    uptime.set(120)
+    agent.runCheck()
+    try expect(
+        checkCompleted.wait(
+            timeout: .now() + .seconds(3)
+        ) == .success,
+        "The NTP-forward check must explicitly complete"
+    )
+    try expect(
+        router.ensureCalls.isEmpty,
+        "An in-process NTP forward jump must not trigger early renewal"
+    )
+
+    wall.set(baseline.addingTimeInterval(-3_600))
+    uptime.set(130)
+    agent.runCheck()
+    try expect(
+        checkCompleted.wait(
+            timeout: .now() + .seconds(3)
+        ) == .success
+            && router.ensureCalls == [.ipv4],
+        "The completed monotonic renewAfter check must trigger despite an NTP backward jump"
+    )
+    try stopAgent(agent)
+    let store = AppConfigStore(baseDirectory: directory)
+    try store.save(config)
+    var rebootDeadlines: [Date] = []
+    let rebootWall = baseline.addingTimeInterval(10)
+    let rebooted = NetworkAgent(
+        configStore: store,
+        keychain: inMemoryKeychain(),
+        routerMappingService: MockRouterMappingService(),
+        nowProvider: { rebootWall },
+        monotonicUptimeProvider: { 10 },
+        bootIdentifierProvider: { "lease-boot-b" },
+        performInitialCheckOnStart: false,
+        expirationTimerScheduler: { deadline, _ in
+            rebootDeadlines.append(deadline)
+            return NetworkAgentScheduledTimer {}
+        }
+    )
+    defer { stopAgentForCleanup(rebooted) }
+    rebooted.start()
+    try expect(
+        rebootDeadlines.last.map {
+            $0.timeIntervalSince(rebootWall) <= 0.051
+        } == true,
+        "Cross-boot recovery must fail closed into an immediate renewal"
+    )
+    try expect(
+        rebooted.config.activeRouterMappings.first?.leaseExpiresUptime
+            == 10
+            && rebooted.config.activeRouterMappings.first?.recoveryState
+                == .clockContinuityUnverified
+            && rebooted.config.activeRouterMappings.first?
+                .recoverySafeAfterUptime == 70,
+        "Cross-boot recovery must expire active use immediately while "
+            + "retaining only a separate conservative cleanup deadline"
+    )
+    let secondBootDirectory = try makeTemporaryDirectory(
+        named: "second-cross-boot-recovery"
+    )
+    defer {
+        try? FileManager.default.removeItem(
+            at: secondBootDirectory
+        )
+    }
+    let secondBootStore = AppConfigStore(
+        baseDirectory: secondBootDirectory
+    )
+    try secondBootStore.save(rebooted.config)
+    let secondBoot = NetworkAgent(
+        configStore: secondBootStore,
+        keychain: inMemoryKeychain(),
+        routerMappingService: MockRouterMappingService(),
+        nowProvider: { rebootWall.addingTimeInterval(5) },
+        monotonicUptimeProvider: { 5 },
+        bootIdentifierProvider: { "lease-boot-d" },
+        performInitialCheckOnStart: false
+    )
+    defer { stopAgentForCleanup(secondBoot) }
+    try expect(
+        secondBoot.config.activeRouterMappings.first?
+            .leaseExpiresUptime == 5
+            && secondBoot.config.activeRouterMappings.first?
+                .recoverySafeAfterUptime == 65,
+        "A second reboot before cleanup must restart the conservative "
+            + "recovery wait rather than treating the old lease as expired"
+    )
+    try stopAgent(secondBoot)
+    try stopAgent(rebooted)
+    let backwardWall = baseline.addingTimeInterval(-3_600)
+    let backward = NetworkAgent(
+        configStore: store,
+        keychain: inMemoryKeychain(),
+        routerMappingService: MockRouterMappingService(),
+        nowProvider: { backwardWall },
+        monotonicUptimeProvider: { 10 },
+        bootIdentifierProvider: { "lease-boot-c" },
+        performInitialCheckOnStart: false
+    )
+    defer { stopAgentForCleanup(backward) }
+    try expect(
+        backward.config.activeRouterMappings.first?.leaseExpiresUptime
+            == 10
+            && backward.config.activeRouterMappings.first?.recoveryState
+                == .clockContinuityUnverified
+            && backward.config.activeRouterMappings.first?
+                .recoverySafeAfterUptime == 70,
+        "A wall-clock rollback across boot must expire the mapping "
+            + "immediately and retain it only as cleanup recovery state"
+    )
+    try stopAgent(backward)
+}
+
+func testCrossBootWallRollbackAfterRuntimeFailsClosed() throws {
+    let directory = try makeTemporaryDirectory(
+        named: "cross-boot-wall-rollback"
+    )
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let baseline = Date(timeIntervalSince1970: 2_000_290_000)
+    let rebootWall = baseline.addingTimeInterval(20)
+    let rebootUptime: TimeInterval = 10
+
+    var mapping = activeMappingFixture(
+        transport: .natpmp,
+        family: .ipv4,
+        localAddress: "10.0.0.20",
+        renewAfter: baseline.addingTimeInterval(45),
+        leaseExpiresAt: baseline.addingTimeInterval(60)
+    )
+    mapping.leaseBootIdentifier = "rollback-old-boot"
+    mapping.renewAfterUptime = 145
+    mapping.leaseExpiresUptime = 160
+    mapping.leaseAnchorWallTime = baseline
+    mapping.renewRemainingAtAnchor = 45
+    mapping.leaseRemainingAtAnchor = 60
+
+    var config = AppConfig.default
+    config.remoteAccessEnabled = true
+    config.dnsProvider = .disabled
+    config.preferredAddressFamily = .ipv4
+    config.mappingProtocolPreference = .natpmp
+    config.externalPort = mapping.externalPort
+    config.activeRouterMappings = [mapping]
+    config.accessExpiresAt = baseline.addingTimeInterval(60)
+    config.accessExpiresUptime = 160
+    config.accessBootIdentifier = "rollback-old-boot"
+    config.accessAnchorWallTime = baseline
+    config.accessRemainingAtAnchor = 60
+
+    let store = AppConfigStore(baseDirectory: directory)
+    try store.save(config)
+    let emergency = emergencyJournal(in: directory)
+    let fallback = EmergencyMappingJournal(
+        fileURL: directory.appendingPathComponent(
+            "cross-boot-fallback-mappings.json"
+        )
+    )
+    let router = MockRouterMappingService()
+    router.setRemovalFailures([mapping])
+    let cleanupCompleted = DispatchSemaphore(value: 0)
+    let checkCompleted = DispatchSemaphore(value: 0)
+    router.afterRemoval = {
+        cleanupCompleted.signal()
+    }
+    let scheduleLock = NSLock()
+    let scheduleReady = DispatchSemaphore(value: 0)
+    var scheduledDeadline: Date?
+    let agent = NetworkAgent(
+        configStore: store,
+        keychain: inMemoryKeychain(),
+        checkCompletionObserver: { checkCompleted.signal() },
+        localNetworkService: MockLocalNetworkService(),
+        routerMappingService: router,
+        emergencyMappingJournal: emergency,
+        fallbackMappingJournal: fallback,
+        nowProvider: { rebootWall },
+        monotonicUptimeProvider: { rebootUptime },
+        bootIdentifierProvider: { "rollback-new-boot" },
+        performInitialCheckOnStart: false,
+        expirationTimerScheduler: { deadline, _ in
+            scheduleLock.lock()
+            scheduledDeadline = deadline
+            scheduleLock.unlock()
+            scheduleReady.signal()
+            return NetworkAgentScheduledTimer {}
+        }
+    )
+    defer { stopAgentForCleanup(agent) }
+
+    try expect(
+        !agent.config.remoteAccessEnabled
+            && agent.config.activeRouterMappings.isEmpty
+            && agent.config.accessExpiresAt == nil
+            && agent.config.accessExpiresUptime == nil,
+        "A temporary session from another boot must close immediately "
+            + "and move its mapping out of active state"
+    )
+
+    agent.start()
+    try expect(
+        scheduleReady.wait(
+            timeout: .now() + .seconds(3)
+        ) == .success,
+        "Cross-boot recovery must arm its conservative cleanup deadline"
+    )
+    scheduleLock.lock()
+    let firstDeadline = scheduledDeadline
+    scheduleLock.unlock()
+    try expect(
+        firstDeadline == rebootWall.addingTimeInterval(60),
+        "The recovery-only deadline must wait the full original finite "
+            + "lease instead of restoring it as active"
+    )
+    agent.runCheck()
+    try expect(
+        cleanupCompleted.wait(
+            timeout: .now() + .seconds(3)
+        ) == .success
+            && checkCompleted.wait(
+                timeout: .now() + .seconds(3)
+            ) == .success
+            && router.removalCalls.map(\.localAddress)
+                == ["10.0.0.20"]
+            && router.ensureCalls.isEmpty
+            && !agent.config.remoteAccessEnabled
+            && agent.config.activeRouterMappings.map(\.identifier)
+                == [mapping.identifier]
+            && agent.status.routerStatus.state == .failed,
+        "Failed recovery before natural expiry must remain blocked and "
+            + "retain its recovery identity without recreating access"
+    )
+    try stopAgent(agent)
 }
 
 func testTemporaryAccessExpirationDoesNotWaitForKeychainAuthorization() throws {
@@ -3833,6 +6317,7 @@ func testTemporaryAccessExpirationDoesNotWaitForKeychainAuthorization() throws {
             return NetworkAgentScheduledTimer {}
         }
     )
+    defer { stopAgentForCleanup(agent) }
 
     agent.start()
     try expect(
@@ -3881,7 +6366,8 @@ func testTemporaryAccessExpirationDoesNotWaitForKeychainAuthorization() throws {
     )
     try expect(
         router.removalCalls == [mapping],
-        "Expiration must schedule and complete exact mapping cleanup without waiting for Keychain UI"
+        "Expiration must schedule and complete exact mapping cleanup without "
+            + "waiting for Keychain UI: \(router.removalCalls)"
     )
     resultLock.lock()
     let completedWhileBlocked = authorizationResult != nil
@@ -3917,7 +6403,7 @@ func testTemporaryAccessExpirationDoesNotWaitForKeychainAuthorization() throws {
     try expect(agent.config.accessExpiresAt == nil, "Late authorization must not restore the expired deadline")
     try expect(agent.config.activeRouterMappings.isEmpty, "Late authorization must not restore router mappings")
     try expect(router.removalCalls == [mapping], "Late authorization must not repeat or undo mapping cleanup")
-    agent.stop()
+    try stopAgent(agent)
 }
 
 func testTemporaryAccessRevokesAnExistingOverlongLease() throws {
@@ -3955,6 +6441,7 @@ func testTemporaryAccessRevokesAnExistingOverlongLease() throws {
         localNetworkService: MockLocalNetworkService(),
         routerMappingService: router
     )
+    defer { stopAgentForCleanup(agent) }
     agent.start()
     try expect(
         waitUntil { agent.status.lastCheckedAt != nil },
@@ -3986,7 +6473,7 @@ func testTemporaryAccessRevokesAnExistingOverlongLease() throws {
         deleteIndex < createIndex,
         "The old overlong lease must be revoked before a temporary replacement is created"
     )
-    agent.stop()
+    try stopAgent(agent)
 }
 
 func testMappingRenewalWindowAndAddressChangeReconciliation() throws {
@@ -3996,7 +6483,7 @@ func testMappingRenewalWindowAndAddressChangeReconciliation() throws {
         config.remoteAccessEnabled = true
         config.dnsProvider = .disabled
         config.preferredAddressFamily = .ipv4
-        config.mappingProtocolPreference = .pcp
+        config.mappingProtocolPreference = mapping.transport.preference
         config.externalPort = mapping.externalPort
         config.pcpNonce = mapping.pcpNonce
         config.activeRouterMappings = [mapping]
@@ -4007,6 +6494,7 @@ func testMappingRenewalWindowAndAddressChangeReconciliation() throws {
             localNetworkService: MockLocalNetworkService(),
             routerMappingService: router
         )
+        defer { stopAgentForCleanup(agent) }
         agent.runCheck()
         try expect(
             waitUntil { agent.status.lastCheckedAt != nil },
@@ -4026,8 +6514,27 @@ func testMappingRenewalWindowAndAddressChangeReconciliation() throws {
     let freshAgent = try runCheck(with: fresh, router: freshRouter)
     try expect(freshRouter.ensureCalls.isEmpty, "A fresh lease must not emit an early renewal packet")
     try expect(freshAgent.config.activeRouterMappings == [fresh], "A fresh lease must retain its tracked state")
-    freshAgent.stop()
-
+    try stopAgent(freshAgent)
+    var rebooted = fresh
+    rebooted.routerEpoch = 600
+    rebooted.routerEpochObservedAt = Date().addingTimeInterval(-30)
+    let rebootRouter = MockRouterMappingService()
+    rebootRouter.setEpochInvalidations([rebooted])
+    let rebootAgent = try runCheck(with: rebooted, router: rebootRouter)
+    try expect(
+        rebootRouter.ensureCalls == [.ipv4],
+        "An Epoch reset must rebuild immediately even before renewAfter"
+    )
+    try expect(
+        rebootRouter.removalCalls.isEmpty,
+        "A mapping invalidated by router state loss must not issue a stale delete"
+    )
+    try expect(
+        rebootAgent.config.activeRouterMappings.count == 1
+            && rebootAgent.config.activeRouterMappings[0].renewAfter > Date(),
+        "The immediate rebuild must replace the invalidated tracked mapping"
+    )
+    try stopAgent(rebootAgent)
     let due = activeMappingFixture(
         transport: .pcp,
         family: .ipv4,
@@ -4041,10 +6548,9 @@ func testMappingRenewalWindowAndAddressChangeReconciliation() throws {
         renewalAgent.config.activeRouterMappings.first?.renewAfter ?? .distantPast > Date(),
         "A successful renewal must persist the next renewal window"
     )
-    renewalAgent.stop()
-
+    try stopAgent(renewalAgent)
     let oldAddress = activeMappingFixture(
-        transport: .pcp,
+        transport: .upnp,
         family: .ipv4,
         localAddress: "192.0.2.99"
     )
@@ -4057,7 +6563,240 @@ func testMappingRenewalWindowAndAddressChangeReconciliation() throws {
         changedAgent.config.activeRouterMappings == [oldAddress],
         "A failed address-change cleanup must preserve the old mapping for retry"
     )
-    changedAgent.stop()
+    try stopAgent(changedAgent)
+}
+
+func testEffectiveAddressChangeBlocksReplacementUntilSafe() throws {
+    let wall = Date(timeIntervalSince1970: 2_000_360_000)
+    let boot = "integration-address-change-boot"
+
+    func run(
+        name: String,
+        transport: RouterMappingTransport,
+        oldAddress: String,
+        replacementAddress: String,
+        expired: Bool,
+        cleanupFails: Bool
+    ) throws -> (MockRouterMappingService, NetworkAgent, URL) {
+        let directory = try makeTemporaryDirectory(named: name)
+        var old = activeMappingFixture(
+            transport: transport,
+            family: .ipv4,
+            localAddress: oldAddress,
+            renewAfter: wall.addingTimeInterval(30),
+            leaseExpiresAt: wall.addingTimeInterval(60)
+        )
+        old.leaseBootIdentifier = boot
+        old.renewAfterUptime = 130
+        old.leaseExpiresUptime = expired ? 99 : 160
+        old.leaseAnchorWallTime = wall
+        old.leaseRemainingAtAnchor = 60
+        old.renewRemainingAtAnchor = 30
+
+        var config = AppConfig.default
+        config.remoteAccessEnabled = true
+        config.dnsProvider = .disabled
+        config.preferredAddressFamily = .ipv4
+        config.mappingProtocolPreference = transport.preference
+        config.externalPort = old.externalPort
+        config.pcpNonce = old.pcpNonce
+        config.activeRouterMappings = [old]
+
+        let local = MockLocalNetworkService()
+        local.ipv4Address = replacementAddress
+        let router = MockRouterMappingService()
+        router.nowProvider = { wall }
+        router.setEpochAddressChange(
+            old,
+            replacementAddress: replacementAddress
+        )
+        if cleanupFails {
+            router.setRemovalFailures([old])
+        }
+        let agent = NetworkAgent(
+            configStore: AppConfigStore(baseDirectory: directory),
+            keychain: inMemoryKeychain(),
+            initialConfig: config,
+            localNetworkService: local,
+            routerMappingService: router,
+            publicIPServiceFactory: { _ in MockPublicIPService() },
+            nowProvider: { wall },
+            monotonicUptimeProvider: { 100 },
+            bootIdentifierProvider: { boot }
+        )
+        defer { stopAgentForCleanup(agent) }
+        agent.runCheck()
+        try expect(
+            waitUntil { agent.status.lastCheckedAt != nil },
+            "Address-change check \(name) must finish"
+        )
+        return (router, agent, directory)
+    }
+
+    let failed = try run(
+        name: "pcp-address-change-failed-cleanup",
+        transport: .pcp,
+        oldAddress: "192.0.2.20",
+        replacementAddress: "192.0.2.21",
+        expired: false,
+        cleanupFails: true
+    )
+    defer { try? FileManager.default.removeItem(at: failed.2) }
+    try expect(
+        failed.0.ensureCalls.isEmpty,
+        "B cleanup failure must block every replacement MAP for C"
+    )
+    try expect(
+        failed.1.config.activeRouterMappings.first?.localAddress
+            == "192.0.2.20"
+            && failed.1.config.activeRouterMappings.first?.recoveryState
+                == .effectiveClientAddressChanged,
+        "Failed cleanup must persist B as the orphan recovery identity"
+    )
+    try stopAgent(failed.1)
+    let succeeded = try run(
+        name: "pcp-address-change-successful-cleanup",
+        transport: .pcp,
+        oldAddress: "192.0.2.20",
+        replacementAddress: "192.0.2.21",
+        expired: false,
+        cleanupFails: false
+    )
+    defer { try? FileManager.default.removeItem(at: succeeded.2) }
+    try expect(
+        succeeded.0.removalCalls.first?.localAddress == "192.0.2.20"
+            && succeeded.0.ensureCalls == [.ipv4],
+        "Confirmed B deletion must happen before exactly one replacement MAP"
+    )
+    try expect(
+        succeeded.1.config.activeRouterMappings.first?.localAddress
+            == "192.0.2.21",
+        "Successful cleanup must replace the tracked identity with C"
+    )
+    try stopAgent(succeeded.1)
+    let expired = try run(
+        name: "pcp-address-change-expired-lease",
+        transport: .pcp,
+        oldAddress: "192.0.2.20",
+        replacementAddress: "192.0.2.21",
+        expired: true,
+        cleanupFails: true
+    )
+    defer { try? FileManager.default.removeItem(at: expired.2) }
+    try expect(
+        expired.0.removalCalls.isEmpty
+            && expired.0.ensureCalls == [.ipv4],
+        "A monotonic-expired B lease may be replaced without an unsafe delete"
+    )
+    try stopAgent(expired.1)
+    let natFailed = try run(
+        name: "natpmp-address-change-failed-cleanup",
+        transport: .natpmp,
+        oldAddress: "10.0.0.20",
+        replacementAddress: "10.0.0.21",
+        expired: false,
+        cleanupFails: true
+    )
+    defer { try? FileManager.default.removeItem(at: natFailed.2) }
+    try expect(
+        natFailed.0.ensureCalls.isEmpty
+            && natFailed.1.config.activeRouterMappings.first?.localAddress
+                == "10.0.0.20"
+            && natFailed.1.config.activeRouterMappings.first?.recoveryState
+                == .effectiveClientAddressChanged,
+        "NAT-PMP effective B cleanup failure must preserve B and block C"
+    )
+    try stopAgent(natFailed.1)
+    let natSucceeded = try run(
+        name: "natpmp-address-change-successful-cleanup",
+        transport: .natpmp,
+        oldAddress: "10.0.0.20",
+        replacementAddress: "10.0.0.21",
+        expired: false,
+        cleanupFails: false
+    )
+    defer { try? FileManager.default.removeItem(at: natSucceeded.2) }
+    try expect(
+        natSucceeded.0.removalCalls.first?.localAddress == "10.0.0.20"
+            && natSucceeded.0.ensureCalls == [.ipv4]
+            && natSucceeded.1.config.activeRouterMappings.first?.localAddress
+                == "10.0.0.21",
+        "NAT-PMP must confirm B deletion before creating and persisting C"
+    )
+    try stopAgent(natSucceeded.1)
+    let natExpired = try run(
+        name: "natpmp-address-change-expired-lease",
+        transport: .natpmp,
+        oldAddress: "10.0.0.20",
+        replacementAddress: "10.0.0.21",
+        expired: true,
+        cleanupFails: true
+    )
+    defer { try? FileManager.default.removeItem(at: natExpired.2) }
+    try expect(
+        natExpired.0.removalCalls.isEmpty
+            && natExpired.0.ensureCalls == [.ipv4],
+        "A monotonic-expired NAT-PMP B lease may be replaced without delete"
+    )
+    try stopAgent(natExpired.1)
+}
+
+func testNATPMPGatewayResetRebuildsOneMappingAtATime() throws {
+    let baseDirectory = try makeTemporaryDirectory(
+        named: "natpmp-serialized-rebuild"
+    )
+    defer { try? FileManager.default.removeItem(at: baseDirectory) }
+
+    let first = activeMappingFixture(
+        transport: .natpmp,
+        family: .ipv4,
+        localAddress: "192.0.2.20",
+        externalPort: 45900
+    )
+    let second = activeMappingFixture(
+        transport: .natpmp,
+        family: .ipv4,
+        localAddress: "192.0.2.21",
+        externalPort: 45901
+    )
+    var config = AppConfig.default
+    config.remoteAccessEnabled = true
+    config.dnsProvider = .disabled
+    config.preferredAddressFamily = .ipv4
+    config.mappingProtocolPreference = .natpmp
+    config.externalPort = first.externalPort
+    config.activeRouterMappings = [first, second]
+
+    let router = MockRouterMappingService()
+    router.setEpochInvalidations([first, second])
+    let agent = NetworkAgent(
+        configStore: AppConfigStore(baseDirectory: baseDirectory),
+        keychain: inMemoryKeychain(),
+        initialConfig: config,
+        localNetworkService: MockLocalNetworkService(),
+        routerMappingService: router,
+        publicIPServiceFactory: { _ in MockPublicIPService() }
+    )
+    defer { stopAgentForCleanup(agent) }
+    agent.runCheck()
+    try expect(
+        waitUntil { agent.status.lastCheckedAt != nil },
+        "The NAT-PMP reset rebuild check must complete"
+    )
+    try expect(
+        router.ensureCalls == [.ipv4],
+        "All invalidated mappings on one NAT-PMP gateway must collapse to one serial rebuild"
+    )
+    try expect(
+        router.removalCalls.isEmpty,
+        "State lost by a restarted gateway must not receive stale deletes"
+    )
+    try expect(
+        agent.config.activeRouterMappings.count == 1
+            && agent.config.activeRouterMappings[0].transport == .natpmp,
+        "The serialized rebuild must persist one authoritative replacement"
+    )
+    try stopAgent(agent)
 }
 
 func testMappingCreationIsCompensatedWhenCheckpointWriteFails() throws {
@@ -4085,6 +6824,7 @@ func testMappingCreationIsCompensatedWhenCheckpointWriteFails() throws {
         localNetworkService: MockLocalNetworkService(),
         routerMappingService: router
     )
+    defer { stopAgentForCleanup(agent) }
 
     agent.runCheck()
     try expect(
@@ -4107,7 +6847,7 @@ func testMappingCreationIsCompensatedWhenCheckpointWriteFails() throws {
         agent.status.settingsErrorMessage?.contains("was closed") == true,
         "The UI must explain that the uncheckpointed mapping was closed"
     )
-    agent.stop()
+    try stopAgent(agent)
 }
 
 func testFailedMappingCompensationPersistsAndRecoversJournal() throws {
@@ -4130,14 +6870,21 @@ func testFailedMappingCompensationPersistsAndRecoversJournal() throws {
     let failingRouter = MockRouterMappingService()
     failingRouter.failAllRemovals = true
     let durableEmergencyJournal = emergencyJournal(in: baseDirectory)
+    let durableFallbackJournal = EmergencyMappingJournal(
+        fileURL: baseDirectory.appendingPathComponent(
+            "fallback-router-mappings.json"
+        )
+    )
     let firstAgent = NetworkAgent(
         configStore: failingStore,
         keychain: inMemoryKeychain(),
         initialConfig: config,
         localNetworkService: MockLocalNetworkService(),
         routerMappingService: failingRouter,
-        emergencyMappingJournal: durableEmergencyJournal
+        emergencyMappingJournal: durableEmergencyJournal,
+        fallbackMappingJournal: durableFallbackJournal
     )
+    defer { stopAgentForCleanup(firstAgent) }
     firstAgent.runCheck()
     try expect(
         waitUntil {
@@ -4153,8 +6900,7 @@ func testFailedMappingCompensationPersistsAndRecoversJournal() throws {
         firstAgent.config.activeRouterMappings.map(\.identifier) == journaled.map(\.identifier),
         "In-memory retry state must match the durable recovery journal"
     )
-    firstAgent.stop()
-
+    try stopAgent(firstAgent)
     let recoveredStore = AppConfigStore(configURL: configURL)
     let recoveredRouter = MockRouterMappingService()
     var disabled = AppConfig.default
@@ -4166,18 +6912,27 @@ func testFailedMappingCompensationPersistsAndRecoversJournal() throws {
         initialConfig: disabled,
         localNetworkService: MockLocalNetworkService(),
         routerMappingService: recoveredRouter,
-        emergencyMappingJournal: durableEmergencyJournal
+        emergencyMappingJournal: durableEmergencyJournal,
+        fallbackMappingJournal: durableFallbackJournal
     )
+    defer { stopAgentForCleanup(recoveredAgent) }
     recoveredAgent.runCheck()
+    let recoveredCleanupCompleted = waitUntil {
+        recoveredRouter.removalCalls.map(\.identifier)
+            == journaled.map(\.identifier)
+            && (try? recoveredStore.loadMappingRecoveryJournal()
+                .isEmpty) == true
+    }
     try expect(
-        waitUntil {
-            recoveredRouter.removalCalls.map(\.identifier) == journaled.map(\.identifier)
-                && (try? recoveredStore.loadMappingRecoveryJournal().isEmpty) == true
-        },
-        "The next launch must clean the journal before any new router mapping work"
+        recoveredCleanupCompleted,
+        "The next launch must clean the journal before any new router "
+            + "mapping work; removals="
+            + "\(recoveredRouter.removalCalls.map(\.identifier)), "
+            + "active=\(recoveredAgent.config.activeRouterMappings.map(\.identifier)), "
+            + "status=\(recoveredAgent.status.routerStatus.message)"
     )
     try expect(recoveredRouter.ensureCalls.isEmpty, "Recovery cleanup must not create a replacement mapping")
-    recoveredAgent.stop()
+    try stopAgent(recoveredAgent)
 }
 
 func testEmergencyJournalSurvivesPrimaryStoreAndDeleteFailure() throws {
@@ -4192,6 +6947,11 @@ func testEmergencyJournalSurvivesPrimaryStoreAndDeleteFailure() throws {
         recoveryDataWriter: { _, _ in throw InjectedStoreFailure() }
     )
     let durableEmergencyJournal = emergencyJournal(in: baseDirectory)
+    let durableFallbackJournal = EmergencyMappingJournal(
+        fileURL: baseDirectory.appendingPathComponent(
+            "fallback-router-mappings.json"
+        )
+    )
     var config = AppConfig.default
     config.remoteAccessEnabled = true
     config.dnsProvider = .disabled
@@ -4207,8 +6967,10 @@ func testEmergencyJournalSurvivesPrimaryStoreAndDeleteFailure() throws {
         initialConfig: config,
         localNetworkService: MockLocalNetworkService(),
         routerMappingService: failingRouter,
-        emergencyMappingJournal: durableEmergencyJournal
+        emergencyMappingJournal: durableEmergencyJournal,
+        fallbackMappingJournal: durableFallbackJournal
     )
+    defer { stopAgentForCleanup(firstAgent) }
     firstAgent.runCheck()
     try expect(
         waitUntil {
@@ -4223,8 +6985,7 @@ func testEmergencyJournalSurvivesPrimaryStoreAndDeleteFailure() throws {
         emergencyMappings.first?.pcpNonce == config.pcpNonce,
         "The emergency journal must retain the complete PCP removal identity"
     )
-    firstAgent.stop()
-
+    try stopAgent(firstAgent)
     let recoveredRouter = MockRouterMappingService()
     let recoveredAgent = NetworkAgent(
         configStore: AppConfigStore(configURL: configURL),
@@ -4232,19 +6993,27 @@ func testEmergencyJournalSurvivesPrimaryStoreAndDeleteFailure() throws {
         initialConfig: .default,
         localNetworkService: MockLocalNetworkService(),
         routerMappingService: recoveredRouter,
-        emergencyMappingJournal: durableEmergencyJournal
+        emergencyMappingJournal: durableEmergencyJournal,
+        fallbackMappingJournal: durableFallbackJournal
     )
+    defer { stopAgentForCleanup(recoveredAgent) }
     recoveredAgent.runCheck()
+    let emergencyCleanupCompleted = waitUntil {
+        recoveredRouter.removalCalls.map(\.identifier)
+            == emergencyMappings.map(\.identifier)
+            && (try? durableEmergencyJournal.load().isEmpty)
+                == true
+    }
     try expect(
-        waitUntil {
-            recoveredRouter.removalCalls.map(\.identifier)
-                == emergencyMappings.map(\.identifier)
-                && (try? durableEmergencyJournal.load().isEmpty) == true
-        },
-        "A restart must load and remove emergency mappings before any replacement work"
+        emergencyCleanupCompleted,
+        "A restart must load and remove emergency mappings before any "
+            + "replacement work; removals="
+            + "\(recoveredRouter.removalCalls.map(\.identifier)), "
+            + "active=\(recoveredAgent.config.activeRouterMappings.map(\.identifier)), "
+            + "status=\(recoveredAgent.status.routerStatus.message)"
     )
     try expect(recoveredRouter.ensureCalls.isEmpty, "Emergency recovery must not create a new router mapping")
-    recoveredAgent.stop()
+    try stopAgent(recoveredAgent)
 }
 
 func testRecoveryIdentitySurvivesEveryJournalAndDeleteFailure() throws {
@@ -4287,23 +7056,35 @@ func testRecoveryIdentitySurvivesEveryJournalAndDeleteFailure() throws {
     let failingRouter = MockRouterMappingService()
     failingRouter.setRecoveryFailure(recovery)
     failingRouter.failAllRemovals = true
+    let firstCheckCompleted = DispatchSemaphore(value: 0)
     let firstAgent = NetworkAgent(
         configStore: store,
         keychain: inMemoryKeychain(),
         initialConfig: config,
+        checkCompletionObserver: {
+            firstCheckCompleted.signal()
+        },
         localNetworkService: MockLocalNetworkService(),
         routerMappingService: failingRouter,
         emergencyMappingJournal: failingEmergency,
         fallbackMappingJournal: durableFallback
     )
+    defer { stopAgentForCleanup(firstAgent) }
     firstAgent.runCheck()
     try expect(
-        waitUntil {
-            failingRouter.ensureCalls == [.ipv4]
-                && failingRouter.removalCalls.map(\.identifier).contains(uncleanMapping.identifier)
-                && (try? durableFallback.load().map(\.identifier)) == [uncleanMapping.identifier]
-        },
-        "Emergency and primary journal failures plus delete failure must reach the durable fallback"
+        firstCheckCompleted.wait(
+            timeout: .now() + .seconds(3)
+        ) == .success,
+        "The first total-journal-failure check must explicitly complete"
+    )
+    try expect(
+        failingRouter.ensureCalls == [.ipv4]
+            && failingRouter.removalCalls.map(\.identifier)
+                .contains(uncleanMapping.identifier)
+            && (try? durableFallback.load().map(\.identifier))
+                == [uncleanMapping.identifier],
+        "Emergency and primary journal failures plus delete failure "
+            + "must reach the durable fallback before assertions"
     )
     let failureDetail = firstAgent.status.routerStatus.detail
     try expect(failureDetail.contains(uncleanMapping.identifier), "The surfaced error must retain the full mapping identity")
@@ -4313,37 +7094,51 @@ func testRecoveryIdentitySurvivesEveryJournalAndDeleteFailure() throws {
 
     firstAgent.runCheck()
     try expect(
-        waitUntil {
-            failingRouter.removalCalls.count >= 2
-        },
-        "A later check must retry the in-memory recovery identity"
+        firstCheckCompleted.wait(
+            timeout: .now() + .seconds(3)
+        ) == .success,
+        "The in-memory recovery retry must explicitly complete"
+    )
+    try expect(
+        failingRouter.removalCalls.count >= 2,
+        "A later completed check must retry the in-memory recovery identity"
     )
     try expect(
         failingRouter.ensureCalls == [.ipv4],
         "An in-memory recovery identity must block every new mapping attempt"
     )
-    firstAgent.stop()
-
+    try stopAgent(firstAgent)
     let recoveredRouter = MockRouterMappingService()
+    let recoveredCheckCompleted = DispatchSemaphore(value: 0)
     let recoveredAgent = NetworkAgent(
         configStore: AppConfigStore(configURL: configURL),
         keychain: inMemoryKeychain(),
         initialConfig: .default,
+        checkCompletionObserver: {
+            recoveredCheckCompleted.signal()
+        },
         localNetworkService: MockLocalNetworkService(),
         routerMappingService: recoveredRouter,
         emergencyMappingJournal: emergencyJournal(in: baseDirectory),
         fallbackMappingJournal: durableFallback
     )
+    defer { stopAgentForCleanup(recoveredAgent) }
     recoveredAgent.runCheck()
     try expect(
-        waitUntil {
-            recoveredRouter.removalCalls.map(\.identifier) == [uncleanMapping.identifier]
-                && (try? durableFallback.load().isEmpty) == true
-        },
-        "A restart must recover the third-journal identity and clear it after idempotent cleanup"
+        recoveredCheckCompleted.wait(
+            timeout: .now() + .seconds(3)
+        ) == .success,
+        "The restarted fallback recovery check must explicitly complete"
+    )
+    try expect(
+        recoveredRouter.removalCalls.map(\.identifier)
+            == [uncleanMapping.identifier]
+            && (try? durableFallback.load().isEmpty) == true,
+        "A completed restart must recover the third-journal identity "
+            + "and clear it after idempotent cleanup"
     )
     try expect(recoveredRouter.ensureCalls.isEmpty, "Fallback recovery must finish before any new mapping")
-    recoveredAgent.stop()
+    try stopAgent(recoveredAgent)
 }
 
 func testRecoveryJournalsUseSecureAtomicPermissions() throws {
@@ -4467,6 +7262,7 @@ func testUnknownRecoverySourcesFailClosed() throws {
         emergencyMappingJournal: primaryEmergency,
         fallbackMappingJournal: primaryFallback
     )
+    defer { stopAgentForCleanup(primaryAgent) }
     try expectFailClosed(primaryAgent, router: primaryRouter, sourceName: "Primary recovery journal")
     try primaryStore.saveMappingRecoveryJournal([])
     primaryAgent.runCheck()
@@ -4476,8 +7272,7 @@ func testUnknownRecoverySourcesFailClosed() throws {
         },
         "Recovery state must unlock only after all three sources read and clean successfully"
     )
-    primaryAgent.stop()
-
+    try stopAgent(primaryAgent)
     let emergencyRoot = try makeTemporaryDirectory(named: "emergency-journal-unreadable")
     defer { try? FileManager.default.removeItem(at: emergencyRoot) }
     let emergencyURL = emergencyRoot.appendingPathComponent("emergency/mappings.json")
@@ -4501,13 +7296,13 @@ func testUnknownRecoverySourcesFailClosed() throws {
             fileURL: emergencyRoot.appendingPathComponent("fallback/mappings.json")
         )
     )
+    defer { stopAgentForCleanup(emergencyAgent) }
     try expectFailClosed(
         emergencyAgent,
         router: emergencyRouter,
         sourceName: "Emergency recovery journal"
     )
-    emergencyAgent.stop()
-
+    try stopAgent(emergencyAgent)
     let fallbackRoot = try makeTemporaryDirectory(named: "fallback-journal-permissions")
     defer { try? FileManager.default.removeItem(at: fallbackRoot) }
     let fallbackURL = fallbackRoot.appendingPathComponent("fallback/mappings.json")
@@ -4529,12 +7324,13 @@ func testUnknownRecoverySourcesFailClosed() throws {
         emergencyMappingJournal: emergencyJournal(in: fallbackRoot),
         fallbackMappingJournal: insecureFallback
     )
+    defer { stopAgentForCleanup(fallbackAgent) }
     try expectFailClosed(
         fallbackAgent,
         router: fallbackRouter,
         sourceName: "Fallback recovery journal"
     )
-    fallbackAgent.stop()
+    try stopAgent(fallbackAgent)
 }
 
 func testDisabledSideEffectsNeverReadProductionRecoverySources() throws {
@@ -4583,11 +7379,12 @@ func testDisabledSideEffectsNeverReadProductionRecoverySources() throws {
         emergencyMappingJournal: emergency,
         fallbackMappingJournal: fallback
     )
+    defer { stopAgentForCleanup(agent) }
     agent.runCheck()
     try expect(primaryReads.current == 0, "Disabled side effects must not read the primary production journal")
     try expect(emergencyReads.current == 0, "Disabled side effects must not read the emergency production journal")
     try expect(fallbackReads.current == 0, "Disabled side effects must not read the fallback production journal")
-    agent.stop()
+    try stopAgent(agent)
 }
 
 func testManagedMappingIdentifierIncludesProtocolRemovalIdentity() throws {
@@ -4640,6 +7437,7 @@ func testDisabledSideEffectsNeverTouchInjectedLANServices() throws {
         localNetworkService: local,
         routerMappingService: router
     )
+    defer { stopAgentForCleanup(agent) }
 
     agent.start()
     agent.runCheck()
@@ -4699,7 +7497,13 @@ let tests: [(String, () throws -> Void)] = [
     ("check coalescing and interval storm resistance", testCheckCoalescingPreventsQueuedStorms),
     ("stale check cancellation before router side effects", testConfigMutationInvalidatesAnOldCheckBeforeRouterSideEffects),
     ("linearized final side-effect window", testSideEffectGateLinearizesTheFinalCheckWindow),
+    ("stop and disable cancel router transactions", testStopAndDisableCooperativelyCancelRouterTransaction),
+    ("disabled recovery skips non-cleanup network work", testDisabledRecoveryCheckSkipsAllNonCleanupNetworkWork),
+    ("disabled persisted active mapping recovery matrix", testDisabledPersistedActiveMappingRecoveryMatrix),
     ("router WAN public IPv4 selection", testRouterWANIPv4RequiresPublicRoutability),
+    ("automatic PCP mapping supplies verified router WAN", testAutomaticPCPMappingSuppliesVerifiedRouterWAN),
+    ("current-check mapping proof family matrix", testCurrentCheckMappingProofFamilyMatrix),
+    ("DDNS waits for durable unexpired mapping proof", testDDNSWaitsForDurableUnexpiredMappingProof),
     ("asynchronous settings persistence", testPersistSettingsAsyncNeverBlocksTheMainThread),
     ("superseded save mapping checkpoint merge", testSupersededSavePreservesCompletedMappingCleanup),
     ("local-origin TCP status semantics", testLocalOriginTCPStatusSemantics),
@@ -4711,9 +7515,14 @@ let tests: [(String, () throws -> Void)] = [
     ("post-cleanup persistence truth", testPostCleanupPersistenceFailureKeepsTruthfulMappingState),
     ("temporary access cleanup retry", testTemporaryAccessExpiryDoesNotHideCleanupFailure),
     ("independent temporary access expiration", testTemporaryAccessUsesIndependentExpirationTimer),
+    ("mapping deadlines drive unified wake", testMappingDeadlinesDriveUnifiedWakeAndPersistedRecovery),
+    ("monotonic lease deadlines and conservative restore", testMonotonicLeaseDeadlinesIgnoreWallClockAndRestoreConservatively),
+    ("cross-boot wall rollback after runtime fails closed", testCrossBootWallRollbackAfterRuntimeFailsClosed),
     ("temporary access expiration ignores Keychain prompts", testTemporaryAccessExpirationDoesNotWaitForKeychainAuthorization),
     ("temporary access shortens existing router lease", testTemporaryAccessRevokesAnExistingOverlongLease),
     ("mapping renewal and address reconciliation", testMappingRenewalWindowAndAddressChangeReconciliation),
+    ("effective address change safety gate", testEffectiveAddressChangeBlocksReplacementUntilSafe),
+    ("NAT-PMP reset rebuilds serially", testNATPMPGatewayResetRebuildsOneMappingAtATime),
     ("mapping checkpoint compensation", testMappingCreationIsCompensatedWhenCheckpointWriteFails),
     ("mapping recovery journal", testFailedMappingCompensationPersistsAndRecoversJournal),
     ("emergency mapping journal", testEmergencyJournalSurvivesPrimaryStoreAndDeleteFailure),

@@ -175,6 +175,13 @@ enum RouterMappingAddressFamily: String, Codable, CaseIterable {
     }
 }
 
+enum RouterMappingRecoveryState: String, Codable {
+    case effectiveClientAddressChanged
+    case wallClockRollback
+    case clockContinuityUnverified
+    case upnpIdentityChanged
+}
+
 struct ActiveRouterMapping: Codable, Equatable {
     var transport: RouterMappingTransport
     var addressFamily: RouterMappingAddressFamily
@@ -182,10 +189,27 @@ struct ActiveRouterMapping: Codable, Equatable {
     var gatewayAddress: String
     var internalPort: UInt16
     var externalPort: UInt16
+    var routerExternalAddress: String? = nil
     var pinholeID: UInt16?
     var pcpNonce: String?
     var leaseExpiresAt: Date
     var renewAfter: Date
+    var routerEpoch: UInt32? = nil
+    var routerEpochObservedAt: Date? = nil
+    var routerEpochObservedUptime: TimeInterval? = nil
+    var routerEpochBootIdentifier: String? = nil
+    var routerEpochHealthCheckAfter: Date? = nil
+    var routerEpochHealthCheckUptime: TimeInterval? = nil
+    var leaseExpiresUptime: TimeInterval? = nil
+    var renewAfterUptime: TimeInterval? = nil
+    var leaseBootIdentifier: String? = nil
+    var leaseAnchorWallTime: Date? = nil
+    var leaseRemainingAtAnchor: TimeInterval? = nil
+    var renewRemainingAtAnchor: TimeInterval? = nil
+    var recoveryState: RouterMappingRecoveryState? = nil
+    var replacementLocalAddress: String? = nil
+    var recoverySafeAfterUptime: TimeInterval? = nil
+    var recoveryBootIdentifier: String? = nil
 
     var identifier: String {
         [
@@ -206,8 +230,11 @@ struct ActiveRouterMapping: Codable, Equatable {
         localAddress: String,
         gatewayAddress: String
     ) -> Bool {
+        let localAddressMatches = transport == .pcp
+            || transport == .natpmp
+            || self.localAddress == localAddress
         guard addressFamily == family,
-              self.localAddress == localAddress,
+              localAddressMatches,
               self.gatewayAddress == gatewayAddress,
               internalPort == config.internalPort else {
             return false
@@ -302,6 +329,10 @@ struct AppConfig: Codable {
     var checkIntervalSeconds: TimeInterval
     var externalProbeHost: String
     var accessExpiresAt: Date?
+    var accessExpiresUptime: TimeInterval? = nil
+    var accessBootIdentifier: String? = nil
+    var accessAnchorWallTime: Date? = nil
+    var accessRemainingAtAnchor: TimeInterval? = nil
     var ipv6PinholeID: UInt16? = nil
     var pcpNonce: String? = nil
     var activeRouterMappings: [ActiveRouterMapping]
@@ -345,6 +376,10 @@ struct AppConfig: Codable {
         case checkIntervalSeconds
         case externalProbeHost
         case accessExpiresAt
+        case accessExpiresUptime
+        case accessBootIdentifier
+        case accessAnchorWallTime
+        case accessRemainingAtAnchor
         case ipv6PinholeID
         case pcpNonce
         case activeRouterMappings
@@ -368,6 +403,10 @@ struct AppConfig: Codable {
         checkIntervalSeconds: TimeInterval,
         externalProbeHost: String,
         accessExpiresAt: Date?,
+        accessExpiresUptime: TimeInterval? = nil,
+        accessBootIdentifier: String? = nil,
+        accessAnchorWallTime: Date? = nil,
+        accessRemainingAtAnchor: TimeInterval? = nil,
         ipv6PinholeID: UInt16? = nil,
         pcpNonce: String? = nil,
         activeRouterMappings: [ActiveRouterMapping] = [],
@@ -389,6 +428,10 @@ struct AppConfig: Codable {
         self.checkIntervalSeconds = Self.normalizedCheckInterval(checkIntervalSeconds)
         self.externalProbeHost = externalProbeHost
         self.accessExpiresAt = accessExpiresAt
+        self.accessExpiresUptime = accessExpiresUptime
+        self.accessBootIdentifier = accessBootIdentifier
+        self.accessAnchorWallTime = accessAnchorWallTime
+        self.accessRemainingAtAnchor = accessRemainingAtAnchor
         self.ipv6PinholeID = ipv6PinholeID
         self.pcpNonce = pcpNonce
         self.activeRouterMappings = activeRouterMappings
@@ -418,6 +461,10 @@ struct AppConfig: Codable {
         checkIntervalSeconds = Self.normalizedCheckInterval(decodedCheckInterval)
         externalProbeHost = try container.decodeIfPresent(String.self, forKey: .externalProbeHost) ?? defaults.externalProbeHost
         accessExpiresAt = try container.decodeIfPresent(Date.self, forKey: .accessExpiresAt)
+        accessExpiresUptime = try container.decodeIfPresent(TimeInterval.self, forKey: .accessExpiresUptime)
+        accessBootIdentifier = try container.decodeIfPresent(String.self, forKey: .accessBootIdentifier)
+        accessAnchorWallTime = try container.decodeIfPresent(Date.self, forKey: .accessAnchorWallTime)
+        accessRemainingAtAnchor = try container.decodeIfPresent(TimeInterval.self, forKey: .accessRemainingAtAnchor)
         ipv6PinholeID = try container.decodeIfPresent(UInt16.self, forKey: .ipv6PinholeID)
         pcpNonce = try container.decodeIfPresent(String.self, forKey: .pcpNonce)
         activeRouterMappings = try container.decodeIfPresent([ActiveRouterMapping].self, forKey: .activeRouterMappings) ?? []
@@ -442,6 +489,10 @@ struct AppConfig: Codable {
         try container.encode(Self.normalizedCheckInterval(checkIntervalSeconds), forKey: .checkIntervalSeconds)
         try container.encode(externalProbeHost, forKey: .externalProbeHost)
         try container.encodeIfPresent(accessExpiresAt, forKey: .accessExpiresAt)
+        try container.encodeIfPresent(accessExpiresUptime, forKey: .accessExpiresUptime)
+        try container.encodeIfPresent(accessBootIdentifier, forKey: .accessBootIdentifier)
+        try container.encodeIfPresent(accessAnchorWallTime, forKey: .accessAnchorWallTime)
+        try container.encodeIfPresent(accessRemainingAtAnchor, forKey: .accessRemainingAtAnchor)
         try container.encodeIfPresent(ipv6PinholeID, forKey: .ipv6PinholeID)
         try container.encodeIfPresent(pcpNonce, forKey: .pcpNonce)
         try container.encode(activeRouterMappings, forKey: .activeRouterMappings)
