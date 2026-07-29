@@ -20,6 +20,7 @@ struct UISnapshotRenderer {
         try FileManager.default.createDirectory(at: outputDir, withIntermediateDirectories: true)
         try removeOldSnapshots(in: outputDir)
 
+        NSTimeZone.default = TimeZone(secondsFromGMT: 0)!
         _ = NSApplication.shared
         NSApp.setActivationPolicy(.prohibited)
 
@@ -54,12 +55,19 @@ struct UISnapshotRenderer {
                     let popoverSize = popover.preferredContentSize
                     let popoverURL = outputDir.appendingPathComponent("\(theme.name)-popover-\(scenario.name).png")
                     render(view: popover.view, size: popoverSize, to: popoverURL)
+                    validatePopoverLayout(
+                        popover.view,
+                        scenarioName: scenario.name,
+                        themeName: theme.name
+                    )
                     rendered.append((popoverURL, popoverSize))
 
                     let settings = SettingsWindowController(agent: agent, autoLoadCloudflare: false)
                     settings.update(
                         config: scenario.config,
-                        token: scenario.config.dnsProvider == .cloudflare ? "****************" : ""
+                        tokenState: scenario.config.dnsProvider == .cloudflare
+                            ? .available("****************")
+                            : .missing
                     )
                     settings.setCloudflareZonesForPreview([
                         CloudflareZoneSummary(
@@ -97,6 +105,10 @@ struct UISnapshotRenderer {
             }
         }
 
+        validateRuntimeAppearanceSwitch(
+            root: root,
+            scenario: scenarios[0]
+        )
         try createCompatibilityCopies(in: outputDir)
         try createDocumentationCopies(
             from: outputDir,
@@ -110,6 +122,7 @@ struct UISnapshotRenderer {
     }
 
     private static func makeScenarios() -> [SnapshotScenario] {
+        let snapshotDate = Date(timeIntervalSince1970: 1_719_849_600)
         let readyConfig = makeBaseConfig()
         let readyStatus = AppStatus(
             ddnsStatus: .ok("remote.example.com -> 203.0.113.42"),
@@ -130,7 +143,7 @@ struct UISnapshotRenderer {
             connectionURL: "vnc://203.0.113.42:45900",
             connectionURLIPv4: "vnc://203.0.113.42:45900",
             connectionURLIPv6: "vnc://remote.example.com:5900",
-            lastCheckedAt: Date()
+            lastCheckedAt: snapshotDate
         )
 
         var offConfig = makeBaseConfig()
@@ -152,7 +165,7 @@ struct UISnapshotRenderer {
             externalPort: 58940,
             connectionURL: "vnc://203.0.113.42:58940",
             connectionURLIPv4: "vnc://203.0.113.42:58940",
-            lastCheckedAt: Date()
+            lastCheckedAt: snapshotDate
         )
 
         var errorConfig = makeBaseConfig()
@@ -180,7 +193,7 @@ struct UISnapshotRenderer {
             externalPort: 45900,
             connectionURL: "vnc://203.0.113.42:45900",
             connectionURLIPv4: "vnc://203.0.113.42:45900",
-            lastCheckedAt: Date()
+            lastCheckedAt: snapshotDate
         )
 
         var longIPv6Config = makeBaseConfig()
@@ -205,7 +218,7 @@ struct UISnapshotRenderer {
             connectionURL: "vnc://203.0.113.42:45900",
             connectionURLIPv4: "vnc://203.0.113.42:45900",
             connectionURLIPv6: "vnc://[\(longIPv6)]:5900",
-            lastCheckedAt: Date()
+            lastCheckedAt: snapshotDate
         )
 
         var customProxyConfig = makeBaseConfig()
@@ -231,7 +244,7 @@ struct UISnapshotRenderer {
             connectionURL: "vnc://203.0.113.42:45900",
             connectionURLIPv4: "vnc://203.0.113.42:45900",
             connectionURLIPv6: "vnc://remote.example.com:5900",
-            lastCheckedAt: Date()
+            lastCheckedAt: snapshotDate
         )
 
         var invalidCustomProxyConfig = makeBaseConfig()
@@ -249,7 +262,7 @@ struct UISnapshotRenderer {
             externalPort: 45900,
             connectionURL: "vnc://203.0.113.42:45900",
             connectionURLIPv4: "vnc://203.0.113.42:45900",
-            lastCheckedAt: Date()
+            lastCheckedAt: snapshotDate
         )
 
         return [
@@ -317,24 +330,385 @@ struct UISnapshotRenderer {
     }
 
     private static func render(view: NSView, size: NSSize, to url: URL) {
+        let data = renderedPNGData(view: view, size: size)
+        do {
+            try data.write(to: url, options: [.atomic])
+        } catch {
+            fatalError("Could not write \(url.path): \(error)")
+        }
+    }
+
+    private static func renderedPNGData(view: NSView, size: NSSize) -> Data {
         view.frame = NSRect(origin: .zero, size: size)
         view.bounds = NSRect(origin: .zero, size: size)
         view.layoutSubtreeIfNeeded()
 
         guard let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else {
-            fatalError("Could not create bitmap representation for \(url.lastPathComponent)")
+            fatalError("Could not create bitmap representation")
         }
         rep.size = size
         view.cacheDisplay(in: view.bounds, to: rep)
 
         guard let data = rep.representation(using: .png, properties: [:]) else {
-            fatalError("Could not encode PNG for \(url.lastPathComponent)")
+            fatalError("Could not encode PNG")
+        }
+        return data
+    }
+
+    private static func validateRuntimeAppearanceSwitch(
+        root: URL,
+        scenario: SnapshotScenario
+    ) {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard let aqua = NSAppearance(named: .aqua),
+              let dark = NSAppearance(named: .darkAqua) else {
+            fatalError("Could not create runtime appearance fixtures")
+        }
+        let outputDirectory = root.appendingPathComponent(
+            "build/ui-appearance-switch",
+            isDirectory: true
+        )
+        try? FileManager.default.removeItem(at: outputDirectory)
+        do {
+            try FileManager.default.createDirectory(
+                at: outputDirectory,
+                withIntermediateDirectories: true
+            )
+        } catch {
+            fatalError("Could not create appearance-switch output: \(error)")
         }
 
+        let agent = NetworkAgent(
+            configStore: AppConfigStore(),
+            keychain: KeychainStore.isolatedValidationStore(
+                service: "io.github.naifuliang.gatebeam.appearance-validation"
+            ),
+            initialConfig: scenario.config
+        )
+        let popover = StatusPopoverViewController(
+            agent: agent,
+            openSettings: {},
+            quit: {}
+        )
+        popover.loadViewIfNeeded()
+        popover.update(config: scenario.config)
+        popover.update(status: scenario.status)
+
+        let settings = SettingsWindowController(agent: agent, autoLoadCloudflare: false)
+        settings.update(
+            config: scenario.config,
+            tokenState: .available("****************")
+        )
+        settings.setCloudflareZonesForPreview([
+            CloudflareZoneSummary(
+                id: "0123456789abcdef0123456789abcdef",
+                name: "example.com",
+                status: "active"
+            )
+        ])
+        settings.update(status: scenario.status)
+        guard let settingsView = settings.window?.contentView else {
+            fatalError("Runtime appearance settings view is missing")
+        }
+
+        let popoverSize = popover.preferredContentSize
+        let settingsSize = NSSize(width: 880, height: 880)
+        let popoverAquaBefore = appearanceSnapshot(
+            view: popover.view,
+            size: popoverSize,
+            appearance: aqua,
+            name: "popover-aqua-before",
+            outputDirectory: outputDirectory,
+            validateColors: {
+                validatePopoverAppearanceColors(
+                    popover.view,
+                    appearance: aqua,
+                    context: "popover Aqua before"
+                )
+            }
+        )
+        let popoverDark = appearanceSnapshot(
+            view: popover.view,
+            size: popoverSize,
+            appearance: dark,
+            name: "popover-dark",
+            outputDirectory: outputDirectory,
+            validateColors: {
+                validatePopoverAppearanceColors(
+                    popover.view,
+                    appearance: dark,
+                    context: "popover Dark"
+                )
+            }
+        )
+        let popoverAquaAfter = appearanceSnapshot(
+            view: popover.view,
+            size: popoverSize,
+            appearance: aqua,
+            name: "popover-aqua-after",
+            outputDirectory: outputDirectory,
+            validateColors: {
+                validatePopoverAppearanceColors(
+                    popover.view,
+                    appearance: aqua,
+                    context: "popover Aqua after"
+                )
+            }
+        )
+
+        let settingsAquaBefore = appearanceSnapshot(
+            view: settingsView,
+            size: settingsSize,
+            appearance: aqua,
+            name: "settings-aqua-before",
+            outputDirectory: outputDirectory,
+            validateColors: {
+                validateSettingsAppearanceColors(
+                    settingsView,
+                    appearance: aqua,
+                    context: "settings Aqua before"
+                )
+            }
+        )
+        let settingsDark = appearanceSnapshot(
+            view: settingsView,
+            size: settingsSize,
+            appearance: dark,
+            name: "settings-dark",
+            outputDirectory: outputDirectory,
+            validateColors: {
+                validateSettingsAppearanceColors(
+                    settingsView,
+                    appearance: dark,
+                    context: "settings Dark"
+                )
+            }
+        )
+        let settingsAquaAfter = appearanceSnapshot(
+            view: settingsView,
+            size: settingsSize,
+            appearance: aqua,
+            name: "settings-aqua-after",
+            outputDirectory: outputDirectory,
+            validateColors: {
+                validateSettingsAppearanceColors(
+                    settingsView,
+                    appearance: aqua,
+                    context: "settings Aqua after"
+                )
+            }
+        )
+
+        assertAppearancePixels(
+            aquaBefore: popoverAquaBefore,
+            dark: popoverDark,
+            aquaAfter: popoverAquaAfter,
+            context: "popover"
+        )
+        assertAppearancePixels(
+            aquaBefore: settingsAquaBefore,
+            dark: settingsDark,
+            aquaAfter: settingsAquaAfter,
+            context: "settings"
+        )
+        settings.close()
+    }
+
+    private static func appearanceSnapshot(
+        view: NSView,
+        size: NSSize,
+        appearance: NSAppearance,
+        name: String,
+        outputDirectory: URL,
+        validateColors: () -> Void
+    ) -> Data {
+        NSApp.appearance = appearance
+        appearance.performAsCurrentDrawingAppearance {
+            view.appearance = appearance
+            // Offscreen validation has no window to deliver AppKit's normal callback.
+            // Invoke the same root-view hook that a live appearance change dispatches.
+            view.viewDidChangeEffectiveAppearance()
+            view.layoutSubtreeIfNeeded()
+            validateColors()
+        }
+        let data = renderedPNGData(view: view, size: size)
         do {
-            try data.write(to: url, options: [.atomic])
+            try data.write(
+                to: outputDirectory.appendingPathComponent("\(name).png"),
+                options: [.atomic]
+            )
         } catch {
-            fatalError("Could not write \(url.path): \(error)")
+            fatalError("Could not write \(name) appearance screenshot: \(error)")
+        }
+        return decodedPixelData(from: data, context: name)
+    }
+
+    private static func decodedPixelData(from png: Data, context: String) -> Data {
+        guard let rep = NSBitmapImageRep(data: png),
+              let bitmap = rep.bitmapData else {
+            fatalError("\(context): could not decode screenshot pixels")
+        }
+        return Data(
+            bytes: bitmap,
+            count: rep.bytesPerRow * rep.pixelsHigh
+        )
+    }
+
+    private static func assertAppearancePixels(
+        aquaBefore: Data,
+        dark: Data,
+        aquaAfter: Data,
+        context: String
+    ) {
+        guard aquaBefore != dark else {
+            fatalError("\(context): Aqua and Dark screenshots have identical pixels")
+        }
+        guard aquaBefore == aquaAfter else {
+            fatalError("\(context): Aqua pixels were not restored after Dark → Aqua")
+        }
+    }
+
+    private static func validatePopoverAppearanceColors(
+        _ root: NSView,
+        appearance: NSAppearance,
+        context: String
+    ) {
+        let views = descendants(of: root)
+        guard let hero = view(identifiedBy: "hero-card", in: views),
+              let address = view(
+                  identifiedBy: "connection-address-container",
+                  in: views
+              ),
+              let pill = view(identifiedBy: "status-pill", in: views),
+              let statusDot = view(identifiedBy: "status-dot-ddns", in: views) else {
+            fatalError("\(context): required popover appearance views are missing")
+        }
+        for target in [hero, address, pill, statusDot] {
+            assertEffectiveAppearance(target, equals: appearance, context: context)
+        }
+        assertLayerColor(
+            hero.layer?.backgroundColor,
+            equals: resolvedColor(.controlBackgroundColor, for: hero),
+            context: "\(context) hero background"
+        )
+        assertLayerColor(
+            hero.layer?.borderColor,
+            equals: resolvedColor(
+                .separatorColor.withAlphaComponent(0.45),
+                for: hero
+            ),
+            context: "\(context) hero border"
+        )
+        assertLayerColor(
+            address.layer?.backgroundColor,
+            equals: resolvedColor(.textBackgroundColor, for: address),
+            context: "\(context) address background"
+        )
+        assertLayerColor(
+            pill.layer?.backgroundColor,
+            equals: resolvedColor(
+                .systemGreen.withAlphaComponent(0.14),
+                for: pill
+            ),
+            context: "\(context) status pill"
+        )
+        assertLayerColor(
+            statusDot.layer?.backgroundColor,
+            equals: resolvedColor(.systemGreen, for: statusDot),
+            context: "\(context) DDNS status dot"
+        )
+    }
+
+    private static func validateSettingsAppearanceColors(
+        _ root: NSView,
+        appearance: NSAppearance,
+        context: String
+    ) {
+        let views = descendants(of: root)
+        guard let panel = view(
+                  identifiedBy: "settings-panel-access-&-health",
+                  in: views
+              ),
+              let footer = view(identifiedBy: "settings-footer", in: views),
+              let statusDot = view(
+                  identifiedBy: "settings-status-dot-ddns",
+                  in: views
+              ) else {
+            fatalError("\(context): required settings appearance views are missing")
+        }
+        for target in [root, panel, footer, statusDot] {
+            assertEffectiveAppearance(target, equals: appearance, context: context)
+        }
+        assertLayerColor(
+            root.layer?.backgroundColor,
+            equals: resolvedColor(.windowBackgroundColor, for: root),
+            context: "\(context) root background"
+        )
+        assertLayerColor(
+            footer.layer?.backgroundColor,
+            equals: resolvedColor(.windowBackgroundColor, for: footer),
+            context: "\(context) footer background"
+        )
+        assertLayerColor(
+            panel.layer?.backgroundColor,
+            equals: resolvedColor(.controlBackgroundColor, for: panel),
+            context: "\(context) panel background"
+        )
+        assertLayerColor(
+            panel.layer?.borderColor,
+            equals: resolvedColor(
+                .separatorColor.withAlphaComponent(0.25),
+                for: panel
+            ),
+            context: "\(context) panel border"
+        )
+        assertLayerColor(
+            statusDot.layer?.backgroundColor,
+            equals: resolvedColor(.systemGreen, for: statusDot),
+            context: "\(context) DDNS status dot"
+        )
+    }
+
+    private static func resolvedColor(_ color: NSColor, for view: NSView) -> CGColor {
+        var result = color.cgColor
+        view.effectiveAppearance.performAsCurrentDrawingAppearance {
+            result = color.cgColor
+        }
+        return result
+    }
+
+    private static func assertEffectiveAppearance(
+        _ view: NSView,
+        equals expected: NSAppearance,
+        context: String
+    ) {
+        let candidates: [NSAppearance.Name] = [.aqua, .darkAqua]
+        guard view.effectiveAppearance.bestMatch(from: candidates)
+            == expected.bestMatch(from: candidates) else {
+            fatalError("\(context): effective appearance did not propagate to \(view)")
+        }
+    }
+
+    private static func assertLayerColor(
+        _ actual: CGColor?,
+        equals expected: CGColor,
+        context: String
+    ) {
+        guard let actual,
+              let actualColor = NSColor(cgColor: actual)?.usingColorSpace(.deviceRGB),
+              let expectedColor = NSColor(cgColor: expected)?.usingColorSpace(.deviceRGB) else {
+            fatalError("\(context): layer color is unavailable")
+        }
+        let delta = max(
+            abs(actualColor.redComponent - expectedColor.redComponent),
+            abs(actualColor.greenComponent - expectedColor.greenComponent),
+            abs(actualColor.blueComponent - expectedColor.blueComponent),
+            abs(actualColor.alphaComponent - expectedColor.alphaComponent)
+        )
+        guard delta < 0.003 else {
+            fatalError(
+                "\(context): layer color \(actualColor) does not match \(expectedColor)"
+            )
         }
     }
 
@@ -385,13 +759,35 @@ struct UISnapshotRenderer {
         assertVisible(intervalHelp, inside: scrollView.contentView, context: "\(context) interval help")
         assertVisible(saveButton, inside: contentView, context: "\(context) save button")
 
+        if scenarioName == "off" {
+            guard let connection = view(
+                      identifiedBy: "settings-connection-url",
+                      in: views
+                  ) as? NSTextField,
+                  let copyButton = view(
+                      identifiedBy: "settings-copy-url",
+                      in: views
+                  ) as? NSButton else {
+                fatalError("\(context): settings off-state connection controls are missing")
+            }
+            guard connection.stringValue == RemoteConnectionURLPolicy.unavailableText,
+                  !connection.stringValue.contains("vnc://"),
+                  !copyButton.isEnabled else {
+                fatalError("\(context): settings must hide stale VNC data and disable copy while access is off")
+            }
+        }
+
         if scenarioName == "invalid-custom-proxy" {
             guard let errorLabel = textField(containing: [
                 "Use http://host:port or socks5://host:port."
             ], in: views), !errorLabel.isHidden else {
                 fatalError("\(context): invalid proxy error is not visible")
             }
-            assertVisible(errorLabel, inside: scrollView.contentView, context: "\(context) proxy error")
+            assertFullyVisible(
+                errorLabel,
+                inside: scrollView.contentView,
+                context: "\(context) proxy error"
+            )
         }
 
         let originalFrame = contentView.frame
@@ -410,6 +806,159 @@ struct UISnapshotRenderer {
         contentView.frame = originalFrame
         contentView.bounds = NSRect(origin: .zero, size: originalFrame.size)
         contentView.layoutSubtreeIfNeeded()
+    }
+
+    private static func validatePopoverLayout(
+        _ contentView: NSView,
+        scenarioName: String,
+        themeName: String
+    ) {
+        let context = "\(themeName) popover \(scenarioName)"
+        let views = descendants(of: contentView)
+        guard let heroCard = view(identifiedBy: "hero-card", in: views),
+              let heroHeadline = view(identifiedBy: "hero-headline", in: views) as? NSTextField,
+              let heroDetail = view(identifiedBy: "hero-detail", in: views) as? NSTextField,
+              let addressContainer = view(
+                  identifiedBy: "connection-address-container",
+                  in: views
+              ),
+              let primaryRow = view(identifiedBy: "primary-connection-row", in: views),
+              let primaryURL = view(identifiedBy: "primary-connection-url", in: views),
+              let primaryCopy = view(
+                  identifiedBy: "copy-primary-connection-url",
+                  in: views
+              ),
+              let secondaryRow = view(
+                  identifiedBy: "secondary-connection-row",
+                  in: views
+              ),
+              let secondaryURL = view(
+                  identifiedBy: "secondary-connection-url",
+                  in: views
+              ),
+              let secondaryCopy = view(
+                  identifiedBy: "copy-secondary-connection-url",
+                  in: views
+              ),
+              let healthGrid = view(
+                  identifiedBy: "connection-health-grid",
+                  in: views
+              ) else {
+            fatalError("\(context): required connection layout views are missing")
+        }
+
+        let heroRect = heroCard.convert(heroCard.bounds, to: contentView)
+        guard abs(heroRect.minX - 18) < 0.75,
+              abs(contentView.bounds.maxX - heroRect.maxX - 18) < 0.75 else {
+            fatalError("\(context): hero card does not preserve the 18-point outer inset")
+        }
+        assertTextDrawingContained(
+            heroHeadline,
+            inside: heroCard,
+            minimumHorizontalInset: 13,
+            context: "\(context) hero headline"
+        )
+        assertTextDrawingContained(
+            heroDetail,
+            inside: heroCard,
+            minimumHorizontalInset: 13,
+            context: "\(context) hero subtitle"
+        )
+        let heroDetailRect = textDrawingRect(for: heroDetail, in: contentView)
+        guard heroDetailRect.minX >= 31 else {
+            fatalError(
+                "\(context): hero subtitle begins at x=\(heroDetailRect.minX), "
+                + "below the required card-relative content inset"
+            )
+        }
+
+        assertFullyVisible(
+            addressContainer,
+            inside: contentView,
+            context: "\(context) address container"
+        )
+        assertFullyVisible(primaryRow, inside: addressContainer, context: "\(context) primary row")
+        assertFullyVisible(primaryURL, inside: addressContainer, context: "\(context) primary URL")
+        assertFullyVisible(primaryCopy, inside: addressContainer, context: "\(context) primary copy")
+        assertNoOverlap(primaryURL, primaryCopy, in: addressContainer, context: "\(context) primary URL")
+
+        let expectedHeight: CGFloat = secondaryRow.isHidden ? 36 : 64
+        guard abs(addressContainer.frame.height - expectedHeight) < 0.5 else {
+            fatalError(
+                "\(context): address container height \(addressContainer.frame.height) "
+                + "does not match stable \(expectedHeight)-point layout"
+            )
+        }
+
+        if !secondaryRow.isHidden {
+            assertFullyVisible(
+                secondaryRow,
+                inside: addressContainer,
+                context: "\(context) secondary row"
+            )
+            assertFullyVisible(
+                secondaryURL,
+                inside: addressContainer,
+                context: "\(context) secondary URL"
+            )
+            assertFullyVisible(
+                secondaryCopy,
+                inside: addressContainer,
+                context: "\(context) secondary copy"
+            )
+            assertNoOverlap(
+                secondaryURL,
+                secondaryCopy,
+                in: addressContainer,
+                context: "\(context) secondary URL"
+            )
+        }
+
+        let addressRect = addressContainer.convert(addressContainer.bounds, to: contentView)
+        let healthRect = healthGrid.convert(healthGrid.bounds, to: contentView)
+        guard !addressRect.intersects(healthRect) else {
+            fatalError("\(context): address container overlaps the following health card")
+        }
+
+        let tileMessages = views.compactMap { $0 as? NSTextField }.filter {
+            $0.identifier?.rawValue.hasPrefix("status-message-") == true
+        }
+        guard tileMessages.count == 4 else {
+            fatalError("\(context): expected four identified status messages")
+        }
+        for message in tileMessages {
+            guard let tile = ancestor(
+                of: message,
+                identifiedByPrefix: "status-tile-"
+            ) else {
+                fatalError("\(context): status message has no identified tile")
+            }
+            assertTextDrawingContained(
+                message,
+                inside: tile,
+                minimumHorizontalInset: 8,
+                context: "\(context) \(message.identifier?.rawValue ?? "status message")"
+            )
+        }
+
+        if scenarioName == "off" {
+            guard let primaryLabel = primaryURL as? NSTextField,
+                  let primaryButton = primaryCopy as? NSButton,
+                  primaryLabel.stringValue == RemoteConnectionURLPolicy.unavailableText,
+                  !primaryLabel.stringValue.contains("vnc://"),
+                  !primaryButton.isEnabled,
+                  secondaryRow.isHidden else {
+                fatalError("\(context): popover must hide stale VNC data and disable copy while access is off")
+            }
+        }
+
+        if scenarioName == "long-ipv6" {
+            guard let label = secondaryURL as? NSTextField,
+                  label.lineBreakMode == .byTruncatingMiddle,
+                  label.intrinsicContentSize.width > label.frame.width else {
+                fatalError("\(context): long IPv6 URL is not constrained to middle truncation")
+            }
+        }
     }
 
     private static func prepareBottomScrolledSettings(
@@ -480,6 +1029,81 @@ struct UISnapshotRenderer {
     private static func textField(containing candidates: [String], in views: [NSView]) -> NSTextField? {
         views.compactMap { $0 as? NSTextField }.first { field in
             candidates.contains { field.stringValue.contains($0) }
+        }
+    }
+
+    private static func view(identifiedBy identifier: String, in views: [NSView]) -> NSView? {
+        let target = NSUserInterfaceItemIdentifier(identifier)
+        return views.first { $0.identifier == target }
+    }
+
+    private static func ancestor(
+        of view: NSView,
+        identifiedByPrefix prefix: String
+    ) -> NSView? {
+        var candidate = view.superview
+        while let current = candidate {
+            if current.identifier?.rawValue.hasPrefix(prefix) == true {
+                return current
+            }
+            candidate = current.superview
+        }
+        return nil
+    }
+
+    private static func textDrawingRect(
+        for field: NSTextField,
+        in container: NSView
+    ) -> NSRect {
+        let drawingBounds = field.cell?.drawingRect(forBounds: field.bounds) ?? field.bounds
+        let storage = NSTextStorage(attributedString: field.attributedStringValue)
+        let layoutManager = NSLayoutManager()
+        let textContainer = NSTextContainer(size: drawingBounds.size)
+        textContainer.lineFragmentPadding = 0
+        textContainer.maximumNumberOfLines = max(1, field.maximumNumberOfLines)
+        textContainer.lineBreakMode = field.lineBreakMode
+        layoutManager.addTextContainer(textContainer)
+        storage.addLayoutManager(layoutManager)
+        layoutManager.ensureLayout(for: textContainer)
+        let usedRect = layoutManager.usedRect(for: textContainer).offsetBy(
+            dx: drawingBounds.minX,
+            dy: drawingBounds.minY
+        )
+        return field.convert(usedRect, to: container)
+    }
+
+    private static func assertTextDrawingContained(
+        _ field: NSTextField,
+        inside container: NSView,
+        minimumHorizontalInset: CGFloat,
+        context: String
+    ) {
+        let rect = textDrawingRect(for: field, in: container)
+        let outerBounds = container.bounds.insetBy(dx: -0.75, dy: -0.75)
+        guard rect.width > 0,
+              rect.height > 0,
+              outerBounds.contains(rect) else {
+            fatalError("\(context) actual text bounds \(rect) leave container \(container.bounds)")
+        }
+        guard rect.minX >= minimumHorizontalInset - 0.75,
+              rect.maxX <= container.bounds.maxX - minimumHorizontalInset + 0.75 else {
+            fatalError(
+                "\(context) actual text bounds \(rect) do not preserve "
+                + "the \(minimumHorizontalInset)-point horizontal content inset"
+            )
+        }
+    }
+
+    private static func assertNoOverlap(
+        _ leadingView: NSView,
+        _ trailingView: NSView,
+        in container: NSView,
+        context: String
+    ) {
+        let leadingRect = leadingView.convert(leadingView.bounds, to: container)
+        let trailingRect = trailingView.convert(trailingView.bounds, to: container)
+        guard !leadingRect.intersects(trailingRect) else {
+            fatalError("\(context) overlaps its fixed copy button")
         }
     }
 
