@@ -72,7 +72,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         agent.onConfigChanged = { [weak self] config in
             guard let self else { return }
             self.render(status: self.agent.status, config: config)
-            self.settingsWindowController?.update(config: config, token: self.agent.cloudflareToken())
+            self.settingsWindowController?.update(
+                config: config,
+                tokenState: self.agent.cloudflareTokenState
+            )
             self.statusPopoverController?.update(config: config)
         }
     }
