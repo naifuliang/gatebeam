@@ -27,9 +27,102 @@ struct CloudflareZoneSummary: Codable, Equatable {
     let status: String
 }
 
+enum CloudflarePermissionGuidance {
+    static let dnsWriteDenied = "Cloudflare denied DNS access for the selected zone. Grant Zone/DNS/Edit and Zone/Zone/Read to this token for the target zone."
+}
+
+enum CloudflareOperation: String, Equatable {
+    case verifyToken
+    case listZones
+    case readZone
+    case listDNSRecords
+    case createDNSRecord
+    case updateDNSRecord
+
+    var localizedAction: String {
+        switch self {
+        case .verifyToken:
+            return "verifying the API token"
+        case .listZones:
+            return "listing zones"
+        case .readZone:
+            return "reading the selected zone"
+        case .listDNSRecords:
+            return "reading DNS records"
+        case .createDNSRecord:
+            return "creating the DNS record"
+        case .updateDNSRecord:
+            return "updating the DNS record"
+        }
+    }
+}
+
+enum CloudflareServiceFailure: Equatable {
+    case transport
+    case invalidResponse(httpStatus: Int)
+    case rejected(httpStatus: Int, safeCodes: [Int])
+    case permissionDenied
+}
+
+enum CloudflareConfigurationIssue: Equatable {
+    case missingToken
+    case emptyRecordName
+    case recordOutsideZone
+    case multipleRecords(CloudflareDNSRecordType)
+    case invalidPublicIPv4
+    case invalidGlobalIPv6
+    case inactiveToken
+    case invalidZoneID
+}
+
+enum CloudflareError: Error, LocalizedError, Equatable {
+    case service(operation: CloudflareOperation, failure: CloudflareServiceFailure)
+    case configuration(CloudflareConfigurationIssue)
+
+    var errorDescription: String? {
+        switch self {
+        case .service(_, .permissionDenied):
+            return CloudflarePermissionGuidance.dnsWriteDenied
+        case .service(let operation, .transport):
+            return "Could not contact Cloudflare while \(operation.localizedAction). Check the selected connection route and try again."
+        case .service(let operation, .invalidResponse):
+            return "Cloudflare returned an invalid response while \(operation.localizedAction)."
+        case .service(let operation, .rejected):
+            return "Cloudflare rejected the request while \(operation.localizedAction). Review the token permissions and try again."
+        case .configuration(let issue):
+            switch issue {
+            case .missingToken:
+                return "Cloudflare API token is missing."
+            case .emptyRecordName:
+                return "DNS record name is empty."
+            case .recordOutsideZone:
+                return "The DNS record is not inside the selected Cloudflare zone."
+            case .multipleRecords(let type):
+                return "Multiple \(type.rawValue) records exist for this name. Keep one record for DDNS."
+            case .invalidPublicIPv4:
+                return "IPv4 address is not publicly routable."
+            case .invalidGlobalIPv6:
+                return "IPv6 address is not a valid global IPv6 address."
+            case .inactiveToken:
+                return "Cloudflare API token is not active."
+            case .invalidZoneID:
+                return "Cloudflare Zone ID must be 32 hexadecimal characters."
+            }
+        }
+    }
+
+    func containsSafeCode(_ code: Int) -> Bool {
+        guard case .service(_, .rejected(_, let safeCodes)) = self else {
+            return false
+        }
+        return safeCodes.contains(code)
+    }
+}
+
 final class CloudflareDNSProvider {
     private let http: HTTPRequesting
     private let decoder = JSONDecoder()
+    private static let safeErrorCodeAllowlist: Set<Int> = [6003]
 
     init(http: HTTPRequesting = HTTPClient()) {
         self.http = http
@@ -53,19 +146,15 @@ final class CloudflareDNSProvider {
                 URLQueryItem(name: "order", value: "name"),
                 URLQueryItem(name: "direction", value: "asc")
             ]
-            let response = try http.request(
+            let pageResult: ([CloudflareZone], CloudflareResultInfo?) = try apiRequestPage(
                 url: components.url!,
                 headers: authorizationHeaders(token: token),
-                timeout: 15
+                operation: .listZones
             )
-            let envelope: CloudflareEnvelope<[CloudflareZone]> = try decodeEnvelope(
-                response,
-                context: "List zones"
-            )
-            zones.append(contentsOf: try requireResult(envelope, response: response, context: "List zones").map {
+            zones.append(contentsOf: pageResult.0.map {
                 CloudflareZoneSummary(id: $0.id, name: $0.name, status: $0.status)
             })
-            totalPages = max(1, envelope.resultInfo?.totalPages ?? 1)
+            totalPages = max(1, pageResult.1?.totalPages ?? 1)
             page += 1
         } while page <= totalPages
 
@@ -76,7 +165,7 @@ final class CloudflareDNSProvider {
         try validateZoneID(zoneID)
         let normalizedRecordName = normalizeDNSName(recordName)
         guard !normalizedRecordName.isEmpty else {
-            throw CloudflareError.configuration("DNS record name is empty")
+            throw CloudflareError.configuration(.emptyRecordName)
         }
 
         try verifyActiveToken(token)
@@ -84,20 +173,20 @@ final class CloudflareDNSProvider {
         let zone: CloudflareZone = try apiRequest(
             url: URL(string: "https://api.cloudflare.com/client/v4/zones/\(zoneID)")!,
             headers: authorizationHeaders(token: token),
-            context: "Read zone"
+            operation: .readZone
         )
         let zoneName = normalizeDNSName(zone.name)
         guard normalizedRecordName == zoneName || normalizedRecordName.hasSuffix(".\(zoneName)") else {
-            throw CloudflareError.configuration("DNS record \(recordName) is not inside zone \(zone.name)")
+            throw CloudflareError.configuration(.recordOutsideZone)
         }
 
         let ipv4Records = try listRecords(type: .a, zoneID: zoneID, recordName: normalizedRecordName, token: token)
         let ipv6Records = try listRecords(type: .aaaa, zoneID: zoneID, recordName: normalizedRecordName, token: token)
         guard ipv4Records.count <= 1 else {
-            throw CloudflareError.configuration("Multiple A records exist for \(recordName); keep one record for DDNS")
+            throw CloudflareError.configuration(.multipleRecords(.a))
         }
         guard ipv6Records.count <= 1 else {
-            throw CloudflareError.configuration("Multiple AAAA records exist for \(recordName); keep one record for DDNS")
+            throw CloudflareError.configuration(.multipleRecords(.aaaa))
         }
 
         return CloudflareValidationResult(
@@ -112,14 +201,14 @@ final class CloudflareDNSProvider {
 
     func upsertARecord(zoneID: String, recordName: String, ipAddress: String, token: String) throws -> CloudflareDNSResult {
         guard PublicIPService.isPublicIPv4(ipAddress) else {
-            throw CloudflareError.configuration("IPv4 address is not publicly routable: \(ipAddress)")
+            throw CloudflareError.configuration(.invalidPublicIPv4)
         }
         return try upsertRecord(type: .a, zoneID: zoneID, recordName: recordName, address: ipAddress, token: token)
     }
 
     func upsertAAAARecord(zoneID: String, recordName: String, ipAddress: String, token: String) throws -> CloudflareDNSResult {
         guard PublicIPService.isGlobalIPv6(ipAddress) else {
-            throw CloudflareError.configuration("Invalid global IPv6 address: \(ipAddress)")
+            throw CloudflareError.configuration(.invalidGlobalIPv6)
         }
         return try upsertRecord(type: .aaaa, zoneID: zoneID, recordName: recordName, address: ipAddress, token: token)
     }
@@ -134,12 +223,12 @@ final class CloudflareDNSProvider {
         try validateZoneID(zoneID)
         let normalizedRecordName = normalizeDNSName(recordName)
         guard !normalizedRecordName.isEmpty else {
-            throw CloudflareError.configuration("DNS record name is empty")
+            throw CloudflareError.configuration(.emptyRecordName)
         }
 
         let records = try listRecords(type: type, zoneID: zoneID, recordName: normalizedRecordName, token: token)
         guard records.count <= 1 else {
-            throw CloudflareError.configuration("Multiple \(type.rawValue) records exist for \(recordName); keep one record for DDNS")
+            throw CloudflareError.configuration(.multipleRecords(type))
         }
 
         if let existing = records.first {
@@ -180,7 +269,7 @@ final class CloudflareDNSProvider {
         return try apiRequest(
             url: components.url!,
             headers: authorizationHeaders(token: token),
-            context: "List DNS record"
+            operation: .listDNSRecords
         )
     }
 
@@ -198,7 +287,7 @@ final class CloudflareDNSProvider {
             method: "POST",
             headers: writeHeaders(token: token),
             body: try JSONEncoder().encode(payload),
-            context: "Create DNS record"
+            operation: .createDNSRecord
         )
         return CloudflareDNSResult(changed: true, recordID: record.id, content: address, message: "Created \(type.rawValue) record \(recordName)")
     }
@@ -218,7 +307,7 @@ final class CloudflareDNSProvider {
             method: "PATCH",
             headers: writeHeaders(token: token),
             body: try JSONEncoder().encode(payload),
-            context: "Update DNS record"
+            operation: .updateDNSRecord
         )
         return CloudflareDNSResult(changed: true, recordID: record.id, content: address, message: "Updated \(type.rawValue) record to \(address)")
     }
@@ -228,30 +317,68 @@ final class CloudflareDNSProvider {
         method: String = "GET",
         headers: [String: String],
         body: Data? = nil,
-        context: String
+        operation: CloudflareOperation
     ) throws -> Result {
-        let response = try http.request(url: url, method: method, headers: headers, body: body, timeout: 15)
-        let envelope: CloudflareEnvelope<Result> = try decodeEnvelope(response, context: context)
-        return try requireResult(envelope, response: response, context: context)
+        try apiRequestPage(
+            url: url,
+            method: method,
+            headers: headers,
+            body: body,
+            operation: operation
+        ).0
+    }
+
+    private func apiRequestPage<Result: Decodable>(
+        url: URL,
+        method: String = "GET",
+        headers: [String: String],
+        body: Data? = nil,
+        operation: CloudflareOperation
+    ) throws -> (Result, CloudflareResultInfo?) {
+        let response: HTTPResponse
+        do {
+            response = try http.request(
+                url: url,
+                method: method,
+                headers: headers,
+                body: body,
+                timeout: 15
+            )
+        } catch {
+            throw CloudflareError.service(operation: operation, failure: .transport)
+        }
+        if response.statusCode == 403 {
+            throw CloudflareError.service(operation: operation, failure: .permissionDenied)
+        }
+        let envelope: CloudflareEnvelope<Result> = try decodeEnvelope(
+            response,
+            operation: operation
+        )
+        let result = try requireResult(
+            envelope,
+            response: response,
+            operation: operation
+        )
+        return (result, envelope.resultInfo)
     }
 
     private func verifyActiveToken(_ token: String) throws {
         guard !token.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw CloudflareError.configuration("Cloudflare API token is empty")
+            throw CloudflareError.configuration(.missingToken)
         }
         do {
             let tokenResult: CloudflareTokenResult = try apiRequest(
                 url: URL(string: "https://api.cloudflare.com/client/v4/user/tokens/verify")!,
                 headers: authorizationHeaders(token: token),
-                context: "Verify token"
+                operation: .verifyToken
             )
             guard tokenResult.status == "active" else {
-                throw CloudflareError.configuration("Cloudflare API token is \(tokenResult.status)")
+                throw CloudflareError.configuration(.inactiveToken)
             }
         } catch let error as CloudflareError {
             // Account-owned tokens use an account-specific verify endpoint. Without an
             // account ID, the following zone request is the authoritative permission check.
-            if token.hasPrefix("cfut_"), error.localizedDescription.contains("6003") {
+            if token.hasPrefix("cfut_"), error.containsSafeCode(6003) {
                 return
             }
             throw error
@@ -260,28 +387,40 @@ final class CloudflareDNSProvider {
 
     private func decodeEnvelope<Result: Decodable>(
         _ response: HTTPResponse,
-        context: String
+        operation: CloudflareOperation
     ) throws -> CloudflareEnvelope<Result> {
         do {
             return try decoder.decode(CloudflareEnvelope<Result>.self, from: response.data)
         } catch {
-            let detail = response.text.trimmingCharacters(in: .whitespacesAndNewlines).prefix(300)
-            throw CloudflareError.api("\(context) returned an invalid response (HTTP \(response.statusCode)): \(detail)")
+            throw CloudflareError.service(
+                operation: operation,
+                failure: .invalidResponse(httpStatus: response.statusCode)
+            )
         }
     }
 
     private func requireResult<Result>(
         _ envelope: CloudflareEnvelope<Result>,
         response: HTTPResponse,
-        context: String
+        operation: CloudflareOperation
     ) throws -> Result {
-        guard (200...299).contains(response.statusCode), envelope.success, let result = envelope.result else {
-            let messages = envelope.errors.map { message in
-                if let code = message.code { return "\(code): \(message.message)" }
-                return message.message
-            }.joined(separator: "; ")
-            let detail = messages.isEmpty ? "HTTP \(response.statusCode)" : messages
-            throw CloudflareError.api("\(context) failed: \(detail)")
+        guard (200...299).contains(response.statusCode), envelope.success else {
+            let safeCodes = envelope.errors.compactMap(\.code).filter {
+                Self.safeErrorCodeAllowlist.contains($0)
+            }
+            throw CloudflareError.service(
+                operation: operation,
+                failure: .rejected(
+                    httpStatus: response.statusCode,
+                    safeCodes: Array(Set(safeCodes)).sorted()
+                )
+            )
+        }
+        guard let result = envelope.result else {
+            throw CloudflareError.service(
+                operation: operation,
+                failure: .invalidResponse(httpStatus: response.statusCode)
+            )
         }
         return result
     }
@@ -289,7 +428,7 @@ final class CloudflareDNSProvider {
     private func validateZoneID(_ zoneID: String) throws {
         let allowed = CharacterSet(charactersIn: "0123456789abcdefABCDEF")
         guard zoneID.count == 32, zoneID.unicodeScalars.allSatisfy(allowed.contains) else {
-            throw CloudflareError.configuration("Cloudflare Zone ID must be 32 hexadecimal characters")
+            throw CloudflareError.configuration(.invalidZoneID)
         }
     }
 
@@ -310,17 +449,6 @@ final class CloudflareDNSProvider {
         var headers = authorizationHeaders(token: token)
         headers["Content-Type"] = "application/json"
         return headers
-    }
-}
-
-enum CloudflareError: Error, LocalizedError {
-    case api(String)
-    case configuration(String)
-
-    var errorDescription: String? {
-        switch self {
-        case .api(let message), .configuration(let message): return message
-        }
     }
 }
 
@@ -383,5 +511,4 @@ private struct CloudflareRecordWrite: Codable {
 
 private struct CloudflareAPIMessage: Decodable {
     let code: Int?
-    let message: String
 }
