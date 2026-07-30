@@ -8,9 +8,9 @@ The `0.5.0` Developer Preview is an ad-hoc signed app with an unsigned, non-nota
 
 ## Reporting A Vulnerability
 
-Please do not open a public issue for a vulnerability that could expose credentials, DNS control, router administration, or remote desktop access.
+Do not open a public issue for a vulnerability that could expose credentials, DNS control, router administration, or remote desktop access.
 
-Use GitHub's private vulnerability reporting feature for this repository when it is enabled. If private reporting is not available, contact the repository maintainers through the contact method listed in the repository profile and include a concise description, affected version, reproduction steps, impact, and any suggested mitigation.
+Report it through [GitHub Private Vulnerability Reporting](https://github.com/naifuliang/gatebeam/security/advisories/new) and include a concise description, affected version, reproduction steps, impact, and any suggested mitigation.
 
 Do not include real API tokens, personal hostnames, user public IP addresses, router backups, or Keychain exports in a report. Redact logs and screenshots before sharing them.
 
@@ -24,7 +24,7 @@ Cloudflare tokens are stored only in the versioned service `io.github.naifuliang
 - A Developer Preview must use the default ad-hoc exact-build `cdhash` requirement. An identifier-only requirement is forbidden because any local program can ad-hoc sign itself with the same identifier.
 - Background reads use a noninteractive authentication context. A denial is latched, so timers and diagnostics do not repeatedly prompt.
 - Only the **Authorize Token** Settings action may present authorization UI, refresh the current item's ACL, or read the older `com.local.RemoteControlNetwork.secure-v2` item. Migration writes and verifies the new item before deleting the legacy item; cleanup failure is reported rather than hidden.
-- UI validation, snapshots, and integration tests use independent injected services/backends. The code-signing test uses a temporary Keychain and removes it after proving that a different same-identifier build cannot read the item.
+- UI validation, snapshots, and integration tests use independent injected services/backends. Current automated coverage validates the Keychain model and isolation policy, no-UI query contracts, migration behavior, and code-signing requirements. The code-signing test does not access a Keychain and does not prove that a different same-identifier build cannot read a real item. The disposable-user/VM real-Keychain matrix specified in [ADR 0001](docs/adr/0001-modern-keychain-storage.md) has not yet been run.
 
 `SecAccess` is a deprecated but still public macOS API for file-keychain ACLs. It is used here because the preview requires unattended background access and lacks a stable Developer ID entitlement identity. If Apple removes this API before Gatebeam can require Developer ID distribution, preview storage must become session-only rather than falling back to a weak persistent identity.
 

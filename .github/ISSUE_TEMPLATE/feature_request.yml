@@ -4,6 +4,11 @@ title: "[Feature] "
 labels:
   - enhancement
 body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the workflow without including an API token, domain, hostname,
+        public IP address, router backup, Keychain content, or account details.
   - type: textarea
     id: problem
     attributes:
@@ -25,10 +30,35 @@ body:
     attributes:
       label: Alternatives considered
       description: Share other approaches or workarounds you have tried.
-  - type: checkboxes
-    id: scope
+  - type: dropdown
+    id: area
     attributes:
-      label: Scope check
+      label: Product area
       options:
-        - label: This request does not include credentials, private hostnames, or public IP addresses.
+        - Cloudflare DDNS
+        - IPv4 or IPv6 discovery
+        - Proxy policy
+        - Router compatibility
+        - Temporary access
+        - Security or privacy
+        - Menu-bar or settings UI
+        - Installation or updates
+        - Repository or release process
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: safety
+    attributes:
+      label: Safety and failure behavior
+      description: |
+        If relevant, explain how the feature should fail closed, clean up router
+        state, protect credentials, preserve rollback, or avoid false public
+        reachability claims.
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy confirmation
+      options:
+        - label: This request contains no API token, domain, hostname, public IP address, router backup, Keychain data, or personal information.
           required: true

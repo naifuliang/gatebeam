@@ -1,0 +1,305 @@
+name: Release final-artifact validation
+
+on:
+  workflow_dispatch:
+    inputs:
+      ci_run_id:
+        description: Successful push CI run ID for this exact tag commit
+        required: true
+        type: string
+      bootstrap:
+        description: First immutable formal release with no rollback history
+        required: true
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+concurrency:
+  group: gatebeam-formal-release
+  cancel-in-progress: false
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  build-candidate:
+    name: Build, sign, notarize, and freeze final candidate
+    runs-on: macos-14
+    timeout-minutes: 90
+    environment: formal-release
+    outputs:
+      artifact-id: ${{ steps.upload-candidate.outputs.artifact-id }}
+      artifact-digest: ${{ steps.upload-candidate.outputs.artifact-digest }}
+      artifact-name: ${{ steps.prepare.outputs.artifact-name }}
+      attestation-name: ${{ steps.prepare.outputs.attestation-name }}
+      candidate-directory: ${{ steps.prepare.outputs.candidate-directory }}
+      version: ${{ steps.prepare.outputs.version }}
+
+    steps:
+      - name: Check out release source
+        # actions/checkout v4.4.0, verified against the official release ref.
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify release invocation
+        shell: zsh -f {0}
+        env:
+          CI_RUN_ID: ${{ inputs.ci_run_id }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF_TYPE" == "tag" ]]
+          [[ "$GITHUB_REF" == "refs/tags/$GITHUB_REF_NAME" ]]
+          [[ "$GITHUB_SHA" == "$(/usr/bin/git rev-parse "$GITHUB_REF_NAME^{commit}")" ]]
+          [[ "$GITHUB_WORKFLOW_SHA" == "$GITHUB_SHA" ]]
+          [[ "$CI_RUN_ID" =~ '^[1-9][0-9]*$' ]]
+          version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Resources/Info.plist)"
+          [[ "$GITHUB_REF_NAME" == "v$version" ]]
+          [[ "$(/usr/bin/git cat-file -t "refs/tags/$GITHUB_REF_NAME")" == "tag" ]]
+          [[ "$(/usr/bin/git rev-list --parents -n 1 HEAD | /usr/bin/wc -w | /usr/bin/tr -d '[:space:]')" == "3" ]]
+          [[ -z "$(/usr/bin/git status --porcelain=v1 --untracked-files=all)" ]]
+
+      - name: Configure signing and notarization credentials
+        shell: zsh -f {0}
+        env:
+          GITHUB_RUNTIME_TOKEN: ${{ github.token }}
+          SIGNING_P12_BASE64: ${{ secrets.GATEBEAM_DEVELOPER_ID_P12_BASE64 }}
+          SIGNING_P12_PASSWORD: ${{ secrets.GATEBEAM_DEVELOPER_ID_P12_PASSWORD }}
+          NOTARY_KEY_BASE64: ${{ secrets.GATEBEAM_NOTARY_PRIVATE_KEY_BASE64 }}
+          NOTARY_KEY_ID: ${{ secrets.GATEBEAM_NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.GATEBEAM_NOTARY_ISSUER_ID }}
+          APP_IDENTITY: ${{ vars.GATEBEAM_CODE_SIGN_IDENTITY }}
+          INSTALLER_IDENTITY: ${{ vars.GATEBEAM_INSTALLER_SIGN_IDENTITY }}
+          TEAM_ID: ${{ vars.GATEBEAM_DEVELOPER_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          umask 077
+          for value in \
+            "$GITHUB_RUNTIME_TOKEN" \
+            "$SIGNING_P12_BASE64" \
+            "$SIGNING_P12_PASSWORD" \
+            "$NOTARY_KEY_BASE64" \
+            "$NOTARY_KEY_ID" \
+            "$NOTARY_ISSUER_ID"
+          do
+            [[ -n "$value" ]]
+            print -r -- "::""add-mask::$value"
+          done
+          [[ "$TEAM_ID" =~ '^[A-Z0-9]{10}$' ]]
+          [[ "$APP_IDENTITY" == "Developer ID Application: "*"($TEAM_ID)" ]]
+          [[ "$INSTALLER_IDENTITY" == "Developer ID Installer: "*"($TEAM_ID)" ]]
+
+          keychain_path="$RUNNER_TEMP/gatebeam-signing.keychain-db"
+          keychain_password="$(/usr/bin/uuidgen)-$(/usr/bin/uuidgen)"
+          certificate_path="$RUNNER_TEMP/gatebeam-signing.p12"
+          notary_key_path="$RUNNER_TEMP/AuthKey_${NOTARY_KEY_ID}.p8"
+          token_path="$RUNNER_TEMP/gatebeam-github-token"
+          notary_profile="GatebeamFormal-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          print -rn -- "$SIGNING_P12_BASE64" | /usr/bin/base64 --decode >"$certificate_path"
+          print -rn -- "$NOTARY_KEY_BASE64" | /usr/bin/base64 --decode >"$notary_key_path"
+          print -rn -- "$GITHUB_RUNTIME_TOKEN" >"$token_path"
+          /bin/chmod 600 "$certificate_path" "$notary_key_path" "$token_path"
+
+          /usr/bin/security create-keychain -p "$keychain_password" "$keychain_path"
+          /usr/bin/security set-keychain-settings -lut 7200 "$keychain_path"
+          /usr/bin/security unlock-keychain -p "$keychain_password" "$keychain_path"
+          /usr/bin/security import "$certificate_path" \
+            -k "$keychain_path" \
+            -P "$SIGNING_P12_PASSWORD" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/productsign
+          /usr/bin/security set-key-partition-list \
+            -S apple-tool:,apple: \
+            -s \
+            -k "$keychain_password" \
+            "$keychain_path" >/dev/null
+          /usr/bin/security list-keychains -d user -s "$keychain_path"
+          /usr/bin/security default-keychain -d user -s "$keychain_path"
+          /usr/bin/security find-identity -v -p codesigning "$keychain_path" |
+            /usr/bin/grep -F -- "$APP_IDENTITY" >/dev/null
+          /usr/bin/security find-identity -v "$keychain_path" |
+            /usr/bin/grep -F -- "$INSTALLER_IDENTITY" >/dev/null
+
+          /usr/bin/xcrun notarytool store-credentials "$notary_profile" \
+            --key "$notary_key_path" \
+            --key-id "$NOTARY_KEY_ID" \
+            --issuer "$NOTARY_ISSUER_ID" \
+            --keychain "$keychain_path" >/dev/null
+
+          /bin/rm -f -- "$certificate_path" "$notary_key_path"
+          {
+            print -r -- "GATEBEAM_SIGNING_KEYCHAIN=$keychain_path"
+            print -r -- "GATEBEAM_GITHUB_TOKEN_FILE=$token_path"
+            print -r -- "GATEBEAM_NOTARY_PROFILE=$notary_profile"
+          } >>"$GITHUB_ENV"
+
+      - name: Prepare hash-bound final candidate
+        id: prepare
+        shell: zsh -f {0}
+        env:
+          GATEBEAM_CODE_SIGN_IDENTITY: ${{ vars.GATEBEAM_CODE_SIGN_IDENTITY }}
+          GATEBEAM_INSTALLER_SIGN_IDENTITY: ${{ vars.GATEBEAM_INSTALLER_SIGN_IDENTITY }}
+          GATEBEAM_DEVELOPER_TEAM_ID: ${{ vars.GATEBEAM_DEVELOPER_TEAM_ID }}
+          GATEBEAM_RELEASE_CI_RUN_ID: ${{ inputs.ci_run_id }}
+          GATEBEAM_RELEASE_BOOTSTRAP: ${{ inputs.bootstrap == 'true' && '1' || '0' }}
+        run: |
+          set -euo pipefail
+          ./scripts/prepare_release_candidate.sh
+          version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Resources/Info.plist)"
+          candidate_directory="$GITHUB_WORKSPACE/dist/release-$version"
+          artifact_name="gatebeam-final-candidate-v${version}-${GITHUB_SHA}-run${GITHUB_RUN_ID}-attempt${GITHUB_RUN_ATTEMPT}"
+          attestation_name="gatebeam-clean-machine-attestation-v${version}-${GITHUB_SHA}-run${GITHUB_RUN_ID}-attempt${GITHUB_RUN_ATTEMPT}"
+          /usr/bin/python3 -I -E -s scripts/release_artifact_contract.py validate-candidate \
+            --root "$candidate_directory" \
+            --repository-id "$GITHUB_REPOSITORY_ID" \
+            --workflow-ref "$GITHUB_WORKFLOW_REF" \
+            --workflow-sha "$GITHUB_WORKFLOW_SHA" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --commit "$GITHUB_SHA" \
+            --tag "$GITHUB_REF_NAME" \
+            --artifact-name "$artifact_name" \
+            --attestation-name "$attestation_name"
+          {
+            print -r -- "version=$version"
+            print -r -- "candidate-directory=$candidate_directory"
+            print -r -- "artifact-name=$artifact_name"
+            print -r -- "attestation-name=$attestation_name"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Upload final candidate
+        id: upload-candidate
+        # actions/upload-artifact v4.6.2, pinned to the verified release commit.
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ${{ steps.prepare.outputs.artifact-name }}
+          path: |
+            ${{ steps.prepare.outputs.candidate-directory }}/Gatebeam-${{ steps.prepare.outputs.version }}.zip
+            ${{ steps.prepare.outputs.candidate-directory }}/Gatebeam-${{ steps.prepare.outputs.version }}.pkg
+            ${{ steps.prepare.outputs.candidate-directory }}/Gatebeam-${{ steps.prepare.outputs.version }}.dmg
+            ${{ steps.prepare.outputs.candidate-directory }}/SHA256SUMS
+            ${{ steps.prepare.outputs.candidate-directory }}/release-manifest.json
+            ${{ steps.prepare.outputs.candidate-directory }}/candidate-envelope.json
+            ${{ steps.prepare.outputs.candidate-directory }}/validation
+          if-no-files-found: error
+          include-hidden-files: false
+          compression-level: 0
+          retention-days: 7
+
+      - name: Cleanup signing credentials
+        if: always()
+        shell: zsh -f {0}
+        run: |
+          set +e
+          [[ -z "${GATEBEAM_GITHUB_TOKEN_FILE:-}" ]] ||
+            /bin/rm -f -- "$GATEBEAM_GITHUB_TOKEN_FILE"
+          if [[ -n "${GATEBEAM_SIGNING_KEYCHAIN:-}" ]]; then
+            /usr/bin/security delete-keychain "$GATEBEAM_SIGNING_KEYCHAIN" >/dev/null 2>&1
+            /bin/rm -f -- "$GATEBEAM_SIGNING_KEYCHAIN"
+          fi
+
+  clean-machine:
+    name: Validate frozen candidate on clean macOS
+    needs: build-candidate
+    runs-on: macos-14
+    timeout-minutes: 45
+    outputs:
+      attestation-artifact-id: ${{ steps.upload-attestation.outputs.artifact-id }}
+      attestation-artifact-digest: ${{ steps.upload-attestation.outputs.artifact-digest }}
+
+    steps:
+      - name: Check out release source
+        # actions/checkout v4.4.0, verified against the official release ref.
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Download exact final candidate
+        # actions/download-artifact v4.3.0, pinned to the verified release commit.
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          artifact-ids: ${{ needs.build-candidate.outputs.artifact-id }}
+          path: ${{ runner.temp }}/gatebeam-final-candidate
+
+      - name: Validate signature, notarization, install, upgrade, rollback, and uninstall
+        shell: zsh -f {0}
+        env:
+          GATEBEAM_CANDIDATE_ARTIFACT_ID: ${{ needs.build-candidate.outputs.artifact-id }}
+          GATEBEAM_CANDIDATE_ARTIFACT_DIGEST: ${{ needs.build-candidate.outputs.artifact-digest }}
+          GATEBEAM_CANDIDATE_ARTIFACT_NAME: ${{ needs.build-candidate.outputs.artifact-name }}
+          GATEBEAM_ATTESTATION_ARTIFACT_NAME: ${{ needs.build-candidate.outputs.attestation-name }}
+        run: |
+          set -euo pipefail
+          /bin/mkdir -p "$RUNNER_TEMP/gatebeam-attestation"
+          ./scripts/validate_final_candidate.sh \
+            "$RUNNER_TEMP/gatebeam-final-candidate" \
+            "$RUNNER_TEMP/gatebeam-attestation/clean-machine-attestation.json"
+
+      - name: Upload clean-machine attestation
+        id: upload-attestation
+        # actions/upload-artifact v4.6.2, pinned to the verified release commit.
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ${{ needs.build-candidate.outputs.attestation-name }}
+          path: ${{ runner.temp }}/gatebeam-attestation/clean-machine-attestation.json
+          if-no-files-found: error
+          include-hidden-files: false
+          compression-level: 0
+          retention-days: 30
+
+  publish-release:
+    name: Publish exact validated bytes immutably
+    needs:
+      - build-candidate
+      - clean-machine
+    runs-on: macos-14
+    timeout-minutes: 45
+    environment: formal-release
+    permissions:
+      actions: read
+      contents: write
+
+    steps:
+      - name: Check out release source for publisher
+        # actions/checkout v4.4.0, verified against the official release ref.
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Configure private publisher token
+        shell: zsh -f {0}
+        env:
+          GITHUB_RUNTIME_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          umask 077
+          [[ -n "$GITHUB_RUNTIME_TOKEN" ]]
+          print -r -- "::""add-mask::$GITHUB_RUNTIME_TOKEN"
+          token_path="$RUNNER_TEMP/gatebeam-publisher-token"
+          print -rn -- "$GITHUB_RUNTIME_TOKEN" >"$token_path"
+          /bin/chmod 600 "$token_path"
+          print -r -- "GATEBEAM_GITHUB_TOKEN_FILE=$token_path" >>"$GITHUB_ENV"
+
+      - name: Publish exact validated bytes immutably
+        shell: zsh -f {0}
+        env:
+          GATEBEAM_RELEASE_CI_RUN_ID: ${{ inputs.ci_run_id }}
+          GATEBEAM_RELEASE_CLEAN_MACHINE_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          ./scripts/release_formal.sh
+
+      - name: Cleanup publisher token
+        if: always()
+        shell: zsh -f {0}
+        run: |
+          set +e
+          [[ -z "${GATEBEAM_GITHUB_TOKEN_FILE:-}" ]] ||
+            /bin/rm -f -- "$GATEBEAM_GITHUB_TOKEN_FILE"

@@ -1,4 +1,5 @@
 import Foundation
+import Darwin
 
 final class MockHTTPClient: HTTPRequesting {
     var requests: [HTTPRequest] = []
@@ -17,6 +18,18 @@ final class MockHTTPClient: HTTPRequesting {
     }
 }
 
+final class ThrowingHTTPClient: HTTPRequesting {
+    let error: Error
+
+    init(error: Error) {
+        self.error = error
+    }
+
+    func request(_ request: HTTPRequest) throws -> HTTPResponse {
+        throw error
+    }
+}
+
 struct TestFailure: Error, LocalizedError {
     let message: String
 
@@ -27,8 +40,12 @@ struct TestFailure: Error, LocalizedError {
     var errorDescription: String? { message }
 }
 
-func response(_ json: String, status: Int = 200) -> HTTPResponse {
-    HTTPResponse(statusCode: status, data: Data(json.utf8), headers: [:])
+func response(
+    _ json: String,
+    status: Int = 200,
+    headers: [AnyHashable: Any] = [:]
+) -> HTTPResponse {
+    HTTPResponse(statusCode: status, data: Data(json.utf8), headers: headers)
 }
 
 func pcpDeletionResponse(for request: Data, resultCode: UInt8 = 0) -> Data {
@@ -50,6 +67,211 @@ func natPMPDeletionResponse(for request: Data, resultCode: UInt16 = 0) -> Data {
     return result
 }
 
+func pcpAnnounceResponse(
+    resultCode: UInt8 = 0,
+    epoch: UInt32 = 0
+) -> Data {
+    var result = Data(repeating: 0, count: 24)
+    result[0] = 2
+    result[1] = 0x80
+    result[3] = resultCode
+    result[8] = UInt8((epoch >> 24) & 0xff)
+    result[9] = UInt8((epoch >> 16) & 0xff)
+    result[10] = UInt8((epoch >> 8) & 0xff)
+    result[11] = UInt8(epoch & 0xff)
+    return result
+}
+
+func pcpMappingResponse(
+    for request: Data,
+    resultCode: UInt8 = 0,
+    epoch: UInt32 = 0
+) -> Data {
+    var result = request
+    result[1] = 0x81
+    result[3] = resultCode
+    result.replaceSubrange(8..<24, with: Data(repeating: 0, count: 16))
+    result[8] = UInt8((epoch >> 24) & 0xff)
+    result[9] = UInt8((epoch >> 16) & 0xff)
+    result[10] = UInt8((epoch >> 8) & 0xff)
+    result[11] = UInt8(epoch & 0xff)
+    if request.count >= 60,
+       request[4..<8].contains(where: { $0 != 0 }) {
+        let clientAddress = PCPMessageCodec.addressString(
+            Data(request[8..<24])
+        )
+        if clientAddress?.contains(":") == true,
+           clientAddress?.contains(".") == false {
+            result.replaceSubrange(
+                44..<60,
+                with: Data([
+                    0x26, 0x06, 0x47, 0x00,
+                    0x47, 0x00, 0, 0,
+                    0, 0, 0, 0,
+                    0, 0, 0x11, 0x11
+                ])
+            )
+        } else {
+            result.replaceSubrange(
+                44..<60,
+                with: Data([
+                    0, 0, 0, 0,
+                    0, 0, 0, 0,
+                    0, 0, 0xff, 0xff,
+                    192, 0, 2, 53
+                ])
+            )
+        }
+    }
+    return result
+}
+
+func natPMPExternalAddressResponse(
+    resultCode: UInt16 = 0,
+    address: [UInt8] = [203, 0, 113, 42],
+    epoch: UInt32 = 0
+) -> Data {
+    var result = Data(repeating: 0, count: 12)
+    result[1] = 128
+    result[2] = UInt8((resultCode >> 8) & 0xff)
+    result[3] = UInt8(resultCode & 0xff)
+    result[4] = UInt8((epoch >> 24) & 0xff)
+    result[5] = UInt8((epoch >> 16) & 0xff)
+    result[6] = UInt8((epoch >> 8) & 0xff)
+    result[7] = UInt8(epoch & 0xff)
+    result.replaceSubrange(8..<12, with: address)
+    return result
+}
+
+func natPMPMappingResponse(
+    for request: Data,
+    resultCode: UInt16 = 0,
+    epoch: UInt32 = 0
+) -> Data {
+    var result = natPMPDeletionResponse(for: request, resultCode: resultCode)
+    result[4] = UInt8((epoch >> 24) & 0xff)
+    result[5] = UInt8((epoch >> 16) & 0xff)
+    result[6] = UInt8((epoch >> 8) & 0xff)
+    result[7] = UInt8(epoch & 0xff)
+    result.replaceSubrange(12..<16, with: request[8..<12])
+    return result
+}
+
+func natPMPVersionNegotiationResponse(epoch: UInt32 = 0) -> Data {
+    var result = Data([0, 0, 0, 1, 0, 0, 0, 0])
+    result[4] = UInt8((epoch >> 24) & 0xff)
+    result[5] = UInt8((epoch >> 16) & 0xff)
+    result[6] = UInt8((epoch >> 8) & 0xff)
+    result[7] = UInt8(epoch & 0xff)
+    return result
+}
+
+func automaticMappingConfig() -> AppConfig {
+    var config = AppConfig.default
+    config.mappingProtocolPreference = .automatic
+    config.preferredAddressFamily = .ipv4
+    config.internalPort = 5900
+    config.externalPort = 45900
+    config.mappingLeaseSeconds = 3600
+    config.pcpNonce = Data(repeating: 13, count: 12).base64EncodedString()
+    return config
+}
+
+func automaticTestRetryPolicy() -> RouterMappingRetryPolicy {
+    RouterMappingRetryPolicy(
+        pcpMaximumAttempts: 2,
+        natPMPMaximumAttempts: 4
+    )
+}
+
+func automaticUPnPService(gateway: String) -> UPnPService {
+    UPnPService(
+        serviceType: "urn:schemas-upnp-org:service:WANIPConnection:1",
+        controlURL: URL(string: "http://\(gateway):5000/upnp/control/WANIPConn1")!,
+        gatewayIdentity: gateway,
+        descriptionURL: URL(string: "http://\(gateway):5000/rootDesc.xml")!,
+        deviceIdentity: "uuid:gatebeam-automatic-router"
+    )
+}
+
+func encodedUPnPBindingFixture(
+    service: UPnPService,
+    gateway: String
+) throws -> String {
+    guard let descriptionURL = service.descriptionURL,
+          let deviceIdentity = service.deviceIdentity else {
+        throw TestFailure("UPnP binding fixture needs complete identity")
+    }
+    var object: [String: Any] = [
+        "serviceType": service.serviceType,
+        "controlURL": service.controlURL.absoluteString,
+        "gatewayIdentity": gateway,
+        "descriptionURL": descriptionURL.absoluteString,
+        "deviceIdentity": deviceIdentity,
+        "allowsCrossFamilyControl": service.allowsCrossFamilyControl
+    ]
+    if let ssdpBootID = service.ssdpBootID {
+        object["ssdpBootID"] = ssdpBootID
+    }
+    if let ssdpConfigID = service.ssdpConfigID {
+        object["ssdpConfigID"] = ssdpConfigID
+    }
+    let data = try JSONSerialization.data(withJSONObject: object)
+    return "gatebeam-upnp-v1:" + data.base64EncodedString()
+}
+
+func upnpDescriptionFixture(
+    service: UPnPService,
+    deviceIdentity: String? = nil,
+    controlURL: URL? = nil
+) throws -> Data {
+    guard let identity = deviceIdentity ?? service.deviceIdentity else {
+        throw TestFailure("UPnP description fixture needs a UDN")
+    }
+    return Data("""
+    <root>
+      <device>
+        <UDN>\(identity)</UDN>
+        <serviceList>
+          <service>
+            <serviceType>\(service.serviceType)</serviceType>
+            <controlURL>\((controlURL ?? service.controlURL).absoluteString)</controlURL>
+          </service>
+        </serviceList>
+      </device>
+    </root>
+    """.utf8)
+}
+
+func successfulAutomaticUPnPSOAPResponse(
+    action: String,
+    localAddress: String,
+    internalPort: UInt16
+) throws -> HTTPResponse {
+    switch action {
+    case "AddPortMapping":
+        return response("")
+    case "GetSpecificPortMappingEntry":
+        return response("""
+        <response>
+          <NewInternalClient>\(localAddress)</NewInternalClient>
+          <NewInternalPort>\(internalPort)</NewInternalPort>
+          <NewEnabled>1</NewEnabled>
+          <NewPortMappingDescription>Gatebeam</NewPortMappingDescription>
+          <NewLeaseDuration>3600</NewLeaseDuration>
+        </response>
+        """)
+    case "GetExternalIPAddress":
+        return response("""
+        <response>
+          <NewExternalIPAddress>8.8.4.4</NewExternalIPAddress>
+        </response>
+        """)
+    default:
+        throw TestFailure("Unexpected automatic UPnP action \(action)")
+    }
+}
+
 func upnpNoSuchEntryResponse() -> HTTPResponse {
     response("""
     <s:Envelope>
@@ -69,6 +291,17 @@ func upnpNoSuchEntryResponse() -> HTTPResponse {
 
 func expect(_ condition: @autoclosure () -> Bool, _ message: String) throws {
     guard condition() else { throw TestFailure(message) }
+}
+
+func testReadUInt16(_ data: Data, at index: Int) -> UInt16 {
+    (UInt16(data[index]) << 8) | UInt16(data[index + 1])
+}
+
+func testReadUInt32(_ data: Data, at index: Int) -> UInt32 {
+    (UInt32(data[index]) << 24)
+        | (UInt32(data[index + 1]) << 16)
+        | (UInt32(data[index + 2]) << 8)
+        | UInt32(data[index + 3])
 }
 
 func testCreatesMissingRecord() throws {
@@ -271,6 +504,33 @@ func mappingFixture(
     )
 }
 
+func trackedNATPMPFixture(
+    suffix: UInt16,
+    epoch: UInt32,
+    now: Date,
+    uptime: TimeInterval,
+    boot: String
+) -> ActiveRouterMapping {
+    var mapping = mappingFixture(
+        transport: .natpmp,
+        family: .ipv4,
+        suffix: suffix
+    )
+    mapping.routerEpoch = epoch
+    mapping.routerEpochObservedAt = now
+    mapping.routerEpochObservedUptime = uptime
+    mapping.routerEpochBootIdentifier = boot
+    mapping.leaseExpiresAt = now.addingTimeInterval(60)
+    mapping.renewAfter = now.addingTimeInterval(30)
+    mapping.leaseExpiresUptime = uptime + 60
+    mapping.renewAfterUptime = uptime + 30
+    mapping.leaseBootIdentifier = boot
+    mapping.leaseAnchorWallTime = now
+    mapping.leaseRemainingAtAnchor = 60
+    mapping.renewRemainingAtAnchor = 30
+    return mapping
+}
+
 func testRemovalReportPreservesEveryProtocolAndFamilyResult() throws {
     struct InjectedRemovalFailure: Error, LocalizedError {
         let errorDescription: String? = "injected delete failure"
@@ -305,6 +565,236 @@ func testRemovalReportPreservesEveryProtocolAndFamilyResult() throws {
         report.failureDescription.contains("IPv4 UPnP")
             && report.failureDescription.contains("IPv6 UPnP"),
         "Failure detail must identify both address family and protocol"
+    )
+}
+
+func testProtocolMappingsProduceBoundCurrentCheckProofs() throws {
+    let wallTime = Date(timeIntervalSince1970: 15_000)
+    let uptime: TimeInterval = 100
+    let boot = "proof-binding-boot"
+    var config = automaticMappingConfig()
+    config.mappingLeaseSeconds = 60
+
+    func expectCompleteUncheckpointedProof(
+        _ result: PortMappingResult,
+        family: RouterMappingAddressFamily,
+        transport: RouterMappingTransport,
+        effectiveSource: String,
+        wanAddress: String
+    ) throws {
+        let proof = result.currentCheckProof
+        try expect(
+            proof.family == family
+                && proof.transport == transport
+                && proof.identity.mappingIdentifier
+                    == result.activeMapping.identifier
+                && proof.identity.effectiveSourceAddress
+                    == effectiveSource
+                && proof.identity.gatewayAddress
+                    == result.activeMapping.gatewayAddress
+                && proof.identity.internalPort
+                    == result.activeMapping.internalPort
+                && proof.identity.externalPort
+                    == result.activeMapping.externalPort
+                && proof.boundWANAddress == wanAddress
+                && proof.leaseExpiresUptime
+                    == result.activeMapping.leaseExpiresUptime
+                && proof.sideEffectSafetyMargin == 0.25
+                && proof.sideEffectDeadlineUptime
+                    == proof.leaseExpiresUptime - 0.25,
+            "\(transport.displayName) proof must bind the persisted mapping identity and WAN evidence"
+        )
+        try expect(
+            proof.mappingIdentityVerified
+                && proof.boundWANEvidenceVerified
+                && proof.sameBootVerified
+                && proof.leaseVerified
+                && proof.epochOrIGDContinuityVerified
+                && !proof.checkpointed
+                && !proof.isVerified,
+            "\(transport.displayName) proof must require the NetworkAgent checkpoint before DDNS"
+        )
+    }
+
+    config.mappingProtocolPreference = .pcp
+    let pcpEffective = "10.0.0.20"
+    let pcp = RouterMappingService(
+        udpTransactionHandler: {
+            _, _, _, _, payloadBuilder, acceptsResponse in
+            let payload = try payloadBuilder(pcpEffective)
+            let response = pcpMappingResponse(
+                for: payload,
+                epoch: 50
+            )
+            let accepted = try acceptsResponse(response)
+            try expect(
+                accepted,
+                "PCP proof fixture response must match"
+            )
+            return response
+        },
+        nowProvider: { wallTime },
+        monotonicUptimeProvider: { uptime },
+        bootIdentifierProvider: { boot }
+    )
+    let pcpResult = try pcp.ensureMapping(
+        config: config,
+        localAddress: "192.0.2.20",
+        gatewayAddress: "192.0.2.1"
+    )
+    try expectCompleteUncheckpointedProof(
+        pcpResult,
+        family: .ipv4,
+        transport: .pcp,
+        effectiveSource: pcpEffective,
+        wanAddress: "192.0.2.53"
+    )
+
+    config.mappingProtocolPreference = .natpmp
+    let natEffective = "10.0.0.30"
+    var natActions: [String] = []
+    let natPMP = RouterMappingService(
+        udpTransactionHandler: {
+            _, _, _, _, payloadBuilder, acceptsResponse in
+            let payload = try payloadBuilder(natEffective)
+            let response: Data
+            if payload == Data([0, 0]) {
+                natActions.append("external-address")
+                response = natPMPExternalAddressResponse(
+                    address: [192, 0, 2, 54],
+                    epoch: 60
+                )
+            } else {
+                natActions.append("map")
+                response = natPMPMappingResponse(
+                    for: payload,
+                    epoch: 60
+                )
+            }
+            let accepted = try acceptsResponse(response)
+            try expect(
+                accepted,
+                "NAT-PMP proof fixture response must match"
+            )
+            return response
+        },
+        nowProvider: { wallTime },
+        monotonicUptimeProvider: { uptime },
+        bootIdentifierProvider: { boot }
+    )
+    let natResult = try natPMP.ensureMapping(
+        config: config,
+        localAddress: "192.0.2.30",
+        gatewayAddress: "192.0.2.1"
+    )
+    try expect(
+        natActions == ["external-address", "map"],
+        "NAT-PMP must bind one pre-MAP WAN query to the same effective source without a drifting second query"
+    )
+    try expectCompleteUncheckpointedProof(
+        natResult,
+        family: .ipv4,
+        transport: .natpmp,
+        effectiveSource: natEffective,
+        wanAddress: "192.0.2.54"
+    )
+
+    config.mappingProtocolPreference = .upnp
+    let upnpService = automaticUPnPService(
+        gateway: "192.0.2.1"
+    )
+    var discoveryCalls = 0
+    var upnpActions: [String] = []
+    let upnp = RouterMappingService(
+        upnpDiscoveryHandler: {
+            discoveryCalls += 1
+            return [upnpService]
+        },
+        upnpDescriptionHandler: { url in
+            try expect(
+                url == upnpService.descriptionURL,
+                "UPnP refresh must load only the persisted IGD description URL"
+            )
+            return try upnpDescriptionFixture(
+                service: upnpService
+            )
+        },
+        soapRequestHandler: { url, serviceType, action, _ in
+            try expect(
+                url == upnpService.controlURL
+                    && serviceType == upnpService.serviceType,
+                "UPnP proof requests must remain bound to the original IGD service"
+            )
+            upnpActions.append(action)
+            switch action {
+            case "AddPortMapping":
+                return response("")
+            case "GetSpecificPortMappingEntry":
+                return response("""
+                <response>
+                  <NewInternalClient>192.0.2.40</NewInternalClient>
+                  <NewInternalPort>5900</NewInternalPort>
+                  <NewEnabled>1</NewEnabled>
+                  <NewPortMappingDescription>Gatebeam</NewPortMappingDescription>
+                  <NewLeaseDuration>60</NewLeaseDuration>
+                </response>
+                """)
+            case "GetExternalIPAddress":
+                return response(
+                    "<response><NewExternalIPAddress>192.0.2.55</NewExternalIPAddress></response>"
+                )
+            default:
+                throw TestFailure(
+                    "Unexpected UPnP proof action \(action)"
+                )
+            }
+        },
+        nowProvider: { wallTime },
+        monotonicUptimeProvider: { uptime },
+        bootIdentifierProvider: { boot }
+    )
+    let upnpResult = try upnp.ensureMapping(
+        config: config,
+        localAddress: "192.0.2.40",
+        gatewayAddress: "192.0.2.1"
+    )
+    try expectCompleteUncheckpointedProof(
+        upnpResult,
+        family: .ipv4,
+        transport: .upnp,
+        effectiveSource: "192.0.2.40",
+        wanAddress: "192.0.2.55"
+    )
+    try expect(
+        upnpResult.activeMapping.pcpNonce?.isEmpty == false
+            && upnpResult.currentCheckProof.identity.protocolBinding
+                == upnpResult.activeMapping.pcpNonce,
+        "UPnP proof must persist and bind the original IGD identity"
+    )
+
+    let discoveryCountBeforeRefresh = discoveryCalls
+    let refreshed = try upnp.verifyMappingsForCurrentCheck([
+        upnpResult.activeMapping
+    ])
+    try expect(
+        discoveryCalls == discoveryCountBeforeRefresh
+            && refreshed.errors.isEmpty
+            && refreshed.currentCheckProofs.count == 1
+            && refreshed.currentCheckProofs[0].identity
+                == upnpResult.currentCheckProof.identity
+            && refreshed.currentCheckProofs[0].boundWANAddress
+                == "192.0.2.55",
+        "UPnP current-check proof must refresh through the persisted IGD without rediscovery drift"
+    )
+    try expect(
+        upnpActions == [
+            "AddPortMapping",
+            "GetSpecificPortMappingEntry",
+            "GetExternalIPAddress",
+            "GetSpecificPortMappingEntry",
+            "GetExternalIPAddress"
+        ],
+        "UPnP create and refresh must verify the exact rule and WAN evidence in order"
     )
 }
 
@@ -633,7 +1123,9 @@ func testUPnPIPv6RepeatedDeleteIsIdempotentOnlyForFirewallService() throws {
         controlURL: controlURL,
         gatewayIdentity: gateway,
         descriptionURL: descriptionURL,
-        deviceIdentity: deviceIdentity
+        deviceIdentity: deviceIdentity,
+        ssdpBootID: "101",
+        ssdpConfigID: "7"
     )
     var config = AppConfig.default
     config.mappingProtocolPreference = .upnp
@@ -668,6 +1160,7 @@ func testUPnPIPv6RepeatedDeleteIsIdempotentOnlyForFirewallService() throws {
     var identityChecks = 0
     var deleteCalls = 0
     let remover = RouterMappingService(
+        upnpDiscoveryHandler: { [service] },
         upnpDescriptionHandler: { requestedURL in
             identityChecks += 1
             try expect(requestedURL == descriptionURL, "Repeated deletion must verify the original IPv6 IGD")
@@ -772,21 +1265,297 @@ func testAutomaticMappingPreservesRecoveryIdentity() throws {
     }
 }
 
-func testAutomaticStopsAfterUncertainPCPOrNATPMPRequest() throws {
-    var config = AppConfig.default
-    config.mappingProtocolPreference = .automatic
-    config.preferredAddressFamily = .ipv4
-    config.internalPort = 5900
-    config.externalPort = 45900
-    config.mappingLeaseSeconds = 3600
-    config.pcpNonce = Data(repeating: 13, count: 12).base64EncodedString()
+func testAutomaticFallsBackToUPnPWhenUDPProtocolsDoNotRespond() throws {
+    let config = automaticMappingConfig()
+    let gateway = "192.0.2.1"
+    let localAddress = "192.0.2.20"
+    let service = automaticUPnPService(gateway: gateway)
+    var udpRequests: [Data] = []
+    var udpTimeouts: [TimeInterval] = []
+    var upnpActions: [String] = []
 
-    var pcpCalls = 0
-    let uncertainPCP = RouterMappingService(
-        udpRequestHandler: { _, _, _, _ in
-            pcpCalls += 1
-            throw RouterMappingError.uncertainAfterSend("Injected PCP response loss")
+    let mapper = RouterMappingService(
+        upnpDiscoveryHandler: { [service] },
+        soapRequestHandler: { _, _, action, _ in
+            upnpActions.append(action)
+            return try successfulAutomaticUPnPSOAPResponse(
+                action: action,
+                localAddress: localAddress,
+                internalPort: config.internalPort
+            )
+        },
+        udpRequestHandler: { request, _, _, timeout in
+            udpRequests.append(request)
+            udpTimeouts.append(timeout)
+            throw RouterMappingError.uncertainAfterSend("Injected unsupported UDP protocol")
+        },
+        retryRandomizationProvider: { 0 },
+        retryPolicy: automaticTestRetryPolicy()
+    )
+
+    let result = try mapper.ensureMapping(
+        config: config,
+        localAddress: localAddress,
+        gatewayAddress: gateway
+    )
+
+    try expect(result.activeMapping.transport == .upnp, "UPnP-only router must succeed in Auto")
+    try expect(
+        udpRequests.filter { $0.first == 2 && $0.count == 24 }.count == 3,
+        "PCP capability probe must make only three short ANNOUNCE attempts"
+    )
+    try expect(
+        udpRequests.filter { $0 == Data([0, 0]) }.count == 3,
+        "NAT-PMP capability probe must make only three short External Address attempts"
+    )
+    try expect(
+        udpRequests.allSatisfy { $0.count == 24 || $0 == Data([0, 0]) },
+        "Unsupported UDP probes must never send a MAP request"
+    )
+    try expect(
+        udpTimeouts == [0.25, 0.5, 1, 0.25, 0.5, 1],
+        "Auto capability probing must be bounded to 1.75 seconds per UDP protocol"
+    )
+    try expect(
+        upnpActions == [
+            "AddPortMapping",
+            "GetSpecificPortMappingEntry",
+            "GetExternalIPAddress"
+        ],
+        "UPnP fallback must create and verify the mapping"
+    )
+}
+
+func testAutomaticUsesNATPMPOnlyAfterExternalAddressProbe() throws {
+    let config = automaticMappingConfig()
+    var actions: [String] = []
+    var upnpAttempted = false
+    let mapper = RouterMappingService(
+        upnpDiscoveryHandler: {
+            upnpAttempted = true
+            return []
+        },
+        udpRequestHandler: { request, _, _, _ in
+            if request.first == 2 {
+                actions.append("pcp-announce")
+                return pcpAnnounceResponse(resultCode: 4)
+            }
+            if request == Data([0, 0]) {
+                actions.append("natpmp-external-address")
+                return natPMPExternalAddressResponse(
+                    address: [192, 0, 2, 53]
+                )
+            }
+            actions.append("natpmp-map")
+            return natPMPMappingResponse(for: request)
         }
+    )
+
+    let result = try mapper.ensureMapping(
+        config: config,
+        localAddress: "192.0.2.20",
+        gatewayAddress: "192.0.2.1"
+    )
+
+    try expect(result.activeMapping.transport == .natpmp, "NAT-PMP-only router must succeed")
+    try expect(
+        actions == ["pcp-announce", "natpmp-external-address", "natpmp-map"],
+        "NAT-PMP MAP must be sent only after a successful External Address probe"
+    )
+    try expect(
+        result.routerExternalAddress == "192.0.2.53",
+        "Probe address must be reused"
+    )
+    try expect(!upnpAttempted, "UPnP must not run after a verified NAT-PMP mapping")
+}
+
+func testAutomaticRecognizesNATPMPVersionNegotiationImmediately() throws {
+    let config = automaticMappingConfig()
+    var actions: [String] = []
+    var timeouts: [TimeInterval] = []
+    let mapper = RouterMappingService(
+        udpRequestHandler: { request, _, _, timeout in
+            timeouts.append(timeout)
+            if request.first == 2 {
+                actions.append("pcp-version-negotiation")
+                return natPMPVersionNegotiationResponse(epoch: 40)
+            }
+            if request == Data([0, 0]) {
+                actions.append("natpmp-external-address")
+                return natPMPExternalAddressResponse(
+                    address: [192, 0, 2, 54],
+                    epoch: 40
+                )
+            }
+            actions.append("natpmp-map")
+            return natPMPMappingResponse(for: request, epoch: 40)
+        },
+        retryRandomizationProvider: { 0 }
+    )
+
+    let result = try mapper.ensureMapping(
+        config: config,
+        localAddress: "192.0.2.20",
+        gatewayAddress: "192.0.2.1"
+    )
+    try expect(
+        result.activeMapping.transport == .natpmp,
+        "NAT-PMP version negotiation must switch directly to NAT-PMP"
+    )
+    try expect(
+        actions == [
+            "pcp-version-negotiation",
+            "natpmp-external-address",
+            "natpmp-map"
+        ],
+        "A conclusive version response must stop PCP retries immediately"
+    )
+    try expect(
+        timeouts == [0.25, 0.25, 0.25],
+        "Version negotiation must consume only the first PCP capability attempt"
+    )
+}
+
+func testAutomaticUsesPCPOnlyAfterAnnounceProbe() throws {
+    let config = automaticMappingConfig()
+    var actions: [String] = []
+    var upnpAttempted = false
+    let mapper = RouterMappingService(
+        upnpDiscoveryHandler: {
+            upnpAttempted = true
+            return []
+        },
+        udpRequestHandler: { request, _, _, _ in
+            if request.count == 24 {
+                actions.append("pcp-announce")
+                return pcpAnnounceResponse()
+            }
+            actions.append("pcp-map")
+            return pcpMappingResponse(for: request)
+        }
+    )
+
+    let result = try mapper.ensureMapping(
+        config: config,
+        localAddress: "192.0.2.20",
+        gatewayAddress: "192.0.2.1"
+    )
+
+    try expect(result.activeMapping.transport == .pcp, "PCP-only router must succeed")
+    try expect(
+        result.activeMapping.routerExternalAddress
+            == result.routerExternalAddress,
+        "PCP MAP must persist its verified router external address with the lease"
+    )
+    try expect(
+        actions == ["pcp-announce", "pcp-map"],
+        "PCP MAP must be sent only after a successful ANNOUNCE probe"
+    )
+    try expect(!upnpAttempted, "No fallback may run after a verified PCP mapping")
+}
+
+func testAutomaticRetransmitsAfterSingleProbePacketLoss() throws {
+    let config = automaticMappingConfig()
+    var actions: [String] = []
+    var timeouts: [TimeInterval] = []
+    let mapper = RouterMappingService(
+        udpRequestHandler: { request, _, _, timeout in
+            timeouts.append(timeout)
+            if request.count == 24 {
+                actions.append("pcp-announce")
+                if actions.count == 1 {
+                    throw RouterMappingError.uncertainAfterSend(
+                        "Injected first-packet loss"
+                    )
+                }
+                return pcpAnnounceResponse()
+            }
+            actions.append("pcp-map")
+            return pcpMappingResponse(for: request)
+        },
+        retryRandomizationProvider: { 0 },
+        retryPolicy: automaticTestRetryPolicy()
+    )
+
+    let result = try mapper.ensureMapping(
+        config: config,
+        localAddress: "192.0.2.20",
+        gatewayAddress: "192.0.2.1"
+    )
+
+    try expect(result.activeMapping.transport == .pcp, "Single packet loss must recover")
+    try expect(
+        actions == ["pcp-announce", "pcp-announce", "pcp-map"],
+        "The same harmless ANNOUNCE probe must be retried before MAP"
+    )
+    try expect(
+        timeouts == [0.25, 0.5, 3],
+        "Auto ANNOUNCE must use its short budget while explicit MAP keeps PCP timing"
+    )
+}
+
+func testAutomaticReportsAllProtocolsUnsupportedWithoutSendingMAP() throws {
+    let config = automaticMappingConfig()
+    var udpRequests: [Data] = []
+    var upnpDiscoveryCount = 0
+    let mapper = RouterMappingService(
+        upnpDiscoveryHandler: {
+            upnpDiscoveryCount += 1
+            throw RouterMappingError.protocolFailure("Injected UPnP unsupported")
+        },
+        udpRequestHandler: { request, _, _, _ in
+            udpRequests.append(request)
+            if request.first == 2 {
+                return pcpAnnounceResponse(resultCode: 4)
+            }
+            return natPMPExternalAddressResponse(resultCode: 5)
+        }
+    )
+
+    do {
+        _ = try mapper.ensureMapping(
+            config: config,
+            localAddress: "192.0.2.20",
+            gatewayAddress: "192.0.2.1"
+        )
+        throw TestFailure("All unsupported protocols must fail")
+    } catch let error as RouterMappingError {
+        guard case .allProtocolsFailed(let detail) = error else {
+            throw TestFailure("Expected aggregate Auto failure, got \(error)")
+        }
+        try expect(
+            detail.contains("PCP") && detail.contains("NAT-PMP") && detail.contains("UPnP"),
+            "Aggregate failure must identify all attempted protocols"
+        )
+    }
+    try expect(
+        udpRequests.allSatisfy { $0.count == 24 || $0 == Data([0, 0]) },
+        "Conclusive unsupported responses must never lead to MAP"
+    )
+    try expect(upnpDiscoveryCount == 1, "UPnP must be the final fallback")
+}
+
+func testAutomaticStopsFallbackOnlyAfterConfirmedProtocolMAPIsUncertain() throws {
+    let config = automaticMappingConfig()
+
+    var pcpActions: [String] = []
+    var pcpMapRequests: [Data] = []
+    var pcpUPnPAttempted = false
+    let uncertainPCP = RouterMappingService(
+        upnpDiscoveryHandler: {
+            pcpUPnPAttempted = true
+            return []
+        },
+        udpRequestHandler: { request, _, _, _ in
+            if request.count == 24 {
+                pcpActions.append("pcp-announce")
+                return pcpAnnounceResponse()
+            }
+            pcpActions.append("pcp-map")
+            pcpMapRequests.append(request)
+            throw RouterMappingError.uncertainAfterSend("Injected PCP MAP response loss")
+        },
+        retryPolicy: automaticTestRetryPolicy()
     )
     do {
         _ = try uncertainPCP.ensureMapping(
@@ -794,34 +1563,46 @@ func testAutomaticStopsAfterUncertainPCPOrNATPMPRequest() throws {
             localAddress: "192.0.2.20",
             gatewayAddress: "192.0.2.1"
         )
-        throw TestFailure("Uncertain PCP creation must require recovery")
+        throw TestFailure("Confirmed PCP MAP response loss must require recovery")
     } catch let recovery as RouterMappingRecoveryRequiredError {
-        try expect(pcpCalls == 1, "Automatic must stop immediately after uncertain PCP creation")
-        try expect(recovery.mapping.transport == .pcp, "PCP uncertainty must retain PCP identity")
-        try expect(recovery.mapping.gatewayAddress == "192.0.2.1", "PCP uncertainty must retain the gateway")
-        try expect(recovery.mapping.internalPort == 5900, "PCP uncertainty must retain the internal port")
-        try expect(recovery.mapping.externalPort == 45900, "PCP uncertainty must retain the candidate external port")
-        try expect(recovery.mapping.pcpNonce == config.pcpNonce, "PCP uncertainty must retain the nonce")
+        try expect(
+            pcpActions == ["pcp-announce", "pcp-map", "pcp-map"],
+            "PCP MAP must exhaust its bounded retransmissions with the same transaction"
+        )
+        try expect(
+            pcpMapRequests.count == 2
+                && pcpMapRequests.dropFirst().allSatisfy { $0 == pcpMapRequests[0] },
+            "Every PCP retransmission must preserve the Mapping Nonce and exact request"
+        )
+        try expect(recovery.mapping.transport == .pcp, "Recovery must retain PCP identity")
+        try expect(recovery.mapping.pcpNonce == config.pcpNonce, "Recovery must retain PCP nonce")
+        try expect(!pcpUPnPAttempted, "No fallback may run after uncertain PCP MAP")
     }
 
-    var udpActions: [String] = []
-    var upnpDiscoveryCount = 0
+    var natPMPActions: [String] = []
+    var natPMPMapRequests: [Data] = []
+    var natPMPUPnPAttempted = false
     let uncertainNATPMP = RouterMappingService(
         upnpDiscoveryHandler: {
-            upnpDiscoveryCount += 1
+            natPMPUPnPAttempted = true
             return []
         },
-        udpRequestHandler: { payload, _, _, _ in
-            if payload.first == 2 {
-                udpActions.append("pcp-rejected")
-                var rejected = payload
-                rejected[1] = 0x81
-                rejected[3] = 2
-                return rejected
+        udpRequestHandler: { request, _, _, _ in
+            if request.first == 2 {
+                natPMPActions.append("pcp-unsupported")
+                return pcpAnnounceResponse(resultCode: 4)
             }
-            udpActions.append("natpmp-uncertain")
-            throw RouterMappingError.uncertainAfterSend("Injected NAT-PMP response loss")
-        }
+            if request == Data([0, 0]) {
+                natPMPActions.append("natpmp-probe")
+                return natPMPExternalAddressResponse()
+            }
+            natPMPActions.append("natpmp-map")
+            natPMPMapRequests.append(request)
+            throw RouterMappingError.uncertainAfterSend(
+                "Injected NAT-PMP MAP response loss"
+            )
+        },
+        retryPolicy: automaticTestRetryPolicy()
     )
     do {
         _ = try uncertainNATPMP.ensureMapping(
@@ -829,18 +1610,2924 @@ func testAutomaticStopsAfterUncertainPCPOrNATPMPRequest() throws {
             localAddress: "192.0.2.20",
             gatewayAddress: "192.0.2.1"
         )
-        throw TestFailure("Uncertain NAT-PMP creation must require recovery")
+        throw TestFailure("Confirmed NAT-PMP MAP response loss must require recovery")
     } catch let recovery as RouterMappingRecoveryRequiredError {
         try expect(
-            udpActions == ["pcp-rejected", "natpmp-uncertain"],
-            "A clear PCP rejection may fall back, but uncertain NAT-PMP must stop Automatic"
+            natPMPActions == [
+                "pcp-unsupported",
+                "natpmp-probe",
+                "natpmp-map",
+                "natpmp-map",
+                "natpmp-map",
+                "natpmp-map"
+            ],
+            "NAT-PMP MAP must exhaust its bounded retransmissions"
         )
-        try expect(upnpDiscoveryCount == 0, "UPnP must not run after uncertain NAT-PMP creation")
-        try expect(recovery.mapping.transport == .natpmp, "NAT-PMP uncertainty must retain protocol identity")
-        try expect(recovery.mapping.gatewayAddress == "192.0.2.1", "NAT-PMP uncertainty must retain the gateway")
-        try expect(recovery.mapping.internalPort == 5900, "NAT-PMP uncertainty must retain the internal port")
-        try expect(recovery.mapping.externalPort == 45900, "NAT-PMP uncertainty must retain the candidate external port")
+        try expect(
+            natPMPMapRequests.count == 4
+                && natPMPMapRequests.dropFirst().allSatisfy {
+                    $0 == natPMPMapRequests[0]
+                },
+            "Every NAT-PMP retransmission must preserve the exact idempotent request"
+        )
+        try expect(
+            recovery.mapping.transport == .natpmp,
+            "Recovery must retain NAT-PMP identity"
+        )
+        try expect(!natPMPUPnPAttempted, "No fallback may run after uncertain NAT-PMP MAP")
     }
+
+    var cancellationActions: [String] = []
+    var cancellationFallbackAttempted = false
+    let cancelledAfterPCPMAP = RouterMappingService(
+        upnpDiscoveryHandler: {
+            cancellationFallbackAttempted = true
+            return []
+        },
+        udpRequestHandler: { request, _, _, _ in
+            if request.count == 24 {
+                cancellationActions.append("pcp-announce")
+                return pcpAnnounceResponse()
+            }
+            cancellationActions.append("pcp-map-cancelled")
+            throw RouterMappingError.cancelledAfterSend
+        },
+        retryPolicy: automaticTestRetryPolicy()
+    )
+    do {
+        _ = try cancelledAfterPCPMAP.ensureMapping(
+            config: config,
+            localAddress: "192.0.2.20",
+            gatewayAddress: "192.0.2.1"
+        )
+        throw TestFailure("Cancellation after PCP MAP must require recovery")
+    } catch let recovery as RouterMappingRecoveryRequiredError {
+        try expect(
+            cancellationActions == ["pcp-announce", "pcp-map-cancelled"],
+            "Cancellation after send must stop without another MAP"
+        )
+        try expect(
+            recovery.mapping.transport == .pcp,
+            "Cancellation after send must retain PCP recovery identity"
+        )
+        try expect(
+            !cancellationFallbackAttempted,
+            "Cancellation after MAP must never trigger fallback"
+        )
+    }
+}
+
+func testAutomaticCancellationStopsRetriesAndFallback() throws {
+    let config = automaticMappingConfig()
+    var cancelled = false
+    var udpCallCount = 0
+    var upnpAttempted = false
+    let mapper = RouterMappingService(
+        upnpDiscoveryHandler: {
+            upnpAttempted = true
+            return []
+        },
+        udpRequestHandler: { _, _, _, _ in
+            udpCallCount += 1
+            cancelled = true
+            throw RouterMappingError.uncertainAfterSend("Injected wait cancellation")
+        },
+        cancellationHandler: { cancelled },
+        retryPolicy: automaticTestRetryPolicy()
+    )
+
+    do {
+        _ = try mapper.ensureMapping(
+            config: config,
+            localAddress: "192.0.2.20",
+            gatewayAddress: "192.0.2.1"
+        )
+        throw TestFailure("Cancellation must stop automatic mapping")
+    } catch RouterMappingError.cancelled {
+        try expect(udpCallCount == 1, "Cancellation must stop before retransmission")
+        try expect(!upnpAttempted, "Cancellation must not trigger another protocol")
+    }
+}
+
+func testAutomaticFallsBackWhenTransportNeverSentMAP() throws {
+    let config = automaticMappingConfig()
+    let gateway = "192.0.2.1"
+    let localAddress = "192.0.2.20"
+    let service = automaticUPnPService(gateway: gateway)
+
+    var transactions: [String] = []
+    let sendFailure = RouterMappingService(
+        upnpDiscoveryHandler: { [service] },
+        soapRequestHandler: { _, _, action, _ in
+            try successfulAutomaticUPnPSOAPResponse(
+                action: action,
+                localAddress: localAddress,
+                internalPort: config.internalPort
+            )
+        },
+        udpTransactionHandler: {
+            _, _, _, sourceAddressHint, payloadBuilder, acceptsResponse in
+            let payload = try payloadBuilder(sourceAddressHint ?? "192.0.2.20")
+            if payload.first == 2, payload.count == 24 {
+                transactions.append("pcp-probe")
+                let response = pcpAnnounceResponse()
+                let accepted = try acceptsResponse(response)
+                try expect(accepted, "PCP probe response must match")
+                return response
+            }
+            if payload.first == 2 {
+                transactions.append("pcp-map-send-failed")
+            } else {
+                transactions.append("natpmp-send-failed")
+            }
+            throw RouterMappingUDPError(
+                underlying: .socket("Injected send() failure"),
+                requestMayHaveReachedRouter: false
+            )
+        },
+        retryPolicy: automaticTestRetryPolicy()
+    )
+    let result = try sendFailure.ensureMapping(
+        config: config,
+        localAddress: localAddress,
+        gatewayAddress: gateway
+    )
+    try expect(result.activeMapping.transport == .upnp, "Unsent MAP must allow fallback")
+    try expect(
+        transactions == [
+            "pcp-probe",
+            "pcp-map-send-failed",
+            "natpmp-send-failed"
+        ],
+        "A confirmed protocol with an unsent MAP must continue through safe fallbacks"
+    )
+
+    var unsafeFallbackAttempted = false
+    let mayHaveReachedRouter = RouterMappingService(
+        upnpDiscoveryHandler: {
+            unsafeFallbackAttempted = true
+            return [service]
+        },
+        udpTransactionHandler: {
+            _, _, _, sourceAddressHint, payloadBuilder, acceptsResponse in
+            let payload = try payloadBuilder(
+                sourceAddressHint ?? "192.0.2.20"
+            )
+            if payload.first == 2, payload.count == 24 {
+                let response = pcpAnnounceResponse()
+                let accepted = try acceptsResponse(response)
+                try expect(accepted, "PCP ANNOUNCE must confirm support")
+                return response
+            }
+            throw RouterMappingUDPError(
+                underlying: .timeout("Injected MAP response loss"),
+                requestMayHaveReachedRouter: true
+            )
+        },
+        retryPolicy: automaticTestRetryPolicy()
+    )
+    do {
+        _ = try mayHaveReachedRouter.ensureMapping(
+            config: config,
+            localAddress: localAddress,
+            gatewayAddress: gateway
+        )
+        throw TestFailure("A MAP that may have reached the router must be uncertain")
+    } catch let recovery as RouterMappingRecoveryRequiredError {
+        try expect(
+            recovery.mapping.transport == .pcp,
+            "Transport evidence must preserve PCP recovery identity"
+        )
+        try expect(
+            !unsafeFallbackAttempted,
+            "Transport evidence that MAP may have arrived must block fallback"
+        )
+    }
+}
+
+func testProductionSocketStagesPreserveUnsentEvidence() throws {
+    var config = automaticMappingConfig()
+    config.mappingProtocolPreference = .pcp
+    let receiverFD = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+    guard receiverFD >= 0 else {
+        throw TestFailure("Could not create the loopback UDP receiver")
+    }
+    defer { _ = Darwin.close(receiverFD) }
+    var receiver = sockaddr_in()
+    receiver.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+    receiver.sin_family = sa_family_t(AF_INET)
+    receiver.sin_port = 0
+    receiver.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
+    let bindStatus = withUnsafePointer(to: &receiver) {
+        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+            Darwin.bind(
+                receiverFD,
+                $0,
+                socklen_t(MemoryLayout<sockaddr_in>.size)
+            )
+        }
+    }
+    guard bindStatus == 0 else {
+        throw TestFailure("Could not bind the loopback UDP receiver")
+    }
+    var receiverLength = socklen_t(MemoryLayout<sockaddr_in>.size)
+    let nameStatus = withUnsafeMutablePointer(to: &receiver) {
+        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+            getsockname(receiverFD, $0, &receiverLength)
+        }
+    }
+    guard nameStatus == 0 else {
+        throw TestFailure("Could not read the loopback UDP receiver port")
+    }
+    let receiverPort = UInt16(bigEndian: receiver.sin_port)
+
+    func expectUnsent(
+        _ label: String,
+        operations: RouterMappingUDPSocketOperations
+    ) throws -> String {
+        let mapper = RouterMappingService(
+            retryRandomizationProvider: { 0 },
+            retryPolicy: RouterMappingRetryPolicy(
+                pcpMaximumAttempts: 2,
+                natPMPMaximumAttempts: 1,
+                pcpInitialRetryInterval: 0.01
+            ),
+            routerControlPort: receiverPort,
+            socketOperations: operations
+        )
+        do {
+            _ = try mapper.ensureMapping(
+                config: config,
+                localAddress: "192.0.2.20",
+                gatewayAddress: "127.0.0.1"
+            )
+            throw TestFailure("\(label) failure must not create a mapping")
+        } catch let error as RouterMappingUDPError {
+            try expect(
+                !error.requestMayHaveReachedRouter,
+                "\(label) failure must prove no datagram reached the router"
+            )
+            return error.underlying.localizedDescription
+        }
+    }
+
+    var socketCalls = 0
+    var socketFailure = RouterMappingUDPSocketOperations.system
+    socketFailure.makeSocket = { _, _, _ in
+        socketCalls += 1
+        errno = EMFILE
+        return -1
+    }
+    let socketError = try expectUnsent("socket()", operations: socketFailure)
+    try expect(socketCalls > 0, "The production socket factory must be exercised")
+    try expect(
+        socketError.contains("socket() failed"),
+        "The socket() injection must fail at the production socket stage"
+    )
+
+    var connectCalls = 0
+    var connectCloseCalls = 0
+    var connectFailure = RouterMappingUDPSocketOperations.system
+    connectFailure.connectSocket = { _, _, _ in
+        connectCalls += 1
+        errno = ENETUNREACH
+        return -1
+    }
+    connectFailure.closeSocket = {
+        connectCloseCalls += 1
+        _ = Darwin.close($0)
+    }
+    let connectError = try expectUnsent("connect()", operations: connectFailure)
+    try expect(
+        connectCalls > 0 && connectCloseCalls == connectCalls,
+        "Every production socket whose connect fails must be closed"
+    )
+    try expect(
+        connectError.contains("connect() failed"),
+        "The connect() injection must fail at the production connect stage"
+    )
+
+    var sendCalls = 0
+    var sendCloseCalls = 0
+    var sendFailure = RouterMappingUDPSocketOperations.system
+    sendFailure.sendDatagram = { _, _, _ in
+        sendCalls += 1
+        errno = ENOBUFS
+        return -1
+    }
+    sendFailure.closeSocket = {
+        sendCloseCalls += 1
+        _ = Darwin.close($0)
+    }
+    let sendError = try expectUnsent("send()", operations: sendFailure)
+    try expect(
+        sendError.contains("send() failed"),
+        "The send() injection must fail at the production send stage; got \(sendError)"
+    )
+    try expect(
+        sendCloseCalls > 0 && sendCalls == sendCloseCalls * 2,
+        "Production send failures must exhaust the configured budget on every closed socket candidate (send=\(sendCalls), close=\(sendCloseCalls))"
+    )
+}
+
+func testPCPBuilderUsesConnectedSourceAddress() throws {
+    var config = automaticMappingConfig()
+    config.pcpNonce = Data(repeating: 41, count: 12).base64EncodedString()
+
+    func run(
+        localAddressHint: String,
+        selectedSourceAddress: String,
+        family: AddressFamilyPreference
+    ) throws -> PortMappingResult {
+        var hints: [String?] = []
+        var payloadAddresses: [String?] = []
+        let mapper = RouterMappingService(
+            udpTransactionHandler: {
+                _, _, _, sourceAddressHint, payloadBuilder, acceptsResponse in
+                hints.append(sourceAddressHint)
+                let payload = try payloadBuilder(selectedSourceAddress)
+                payloadAddresses.append(
+                    PCPMessageCodec.addressString(Data(payload[8..<24]))
+                )
+                let response = payload.count == 24
+                    ? pcpAnnounceResponse()
+                    : pcpMappingResponse(for: payload)
+                let accepted = try acceptsResponse(response)
+                try expect(accepted, "Built PCP response must match")
+                return response
+            },
+            retryRandomizationProvider: { 0 },
+            retryPolicy: automaticTestRetryPolicy()
+        )
+        config.preferredAddressFamily = family
+        let result: PortMappingResult
+        if family == .ipv6 {
+            result = try mapper.ensureIPv6Pinhole(
+                config: config,
+                localAddress: localAddressHint,
+                gatewayAddress: "fe80::1%en0"
+            )
+        } else {
+            result = try mapper.ensureMapping(
+                config: config,
+                localAddress: localAddressHint,
+                gatewayAddress: "192.0.2.1"
+            )
+        }
+        try expect(
+            hints == [localAddressHint, localAddressHint],
+            "The injection layer must receive the caller's source-address hint"
+        )
+        try expect(
+            payloadAddresses == [selectedSourceAddress, selectedSourceAddress],
+            "ANNOUNCE and MAP must encode the connect-selected source address"
+        )
+        try expect(
+            result.activeMapping.localAddress == selectedSourceAddress,
+            "A successful PCP mapping must persist the effective client address"
+        )
+        return result
+    }
+
+    let ipv4Result = try run(
+        localAddressHint: "192.0.2.20",
+        selectedSourceAddress: "10.0.0.20",
+        family: .ipv4
+    )
+    try expect(
+        ipv4Result.activeMapping.transport == .pcp,
+        "IPv4 PCP must use the connected source address"
+    )
+    let ipv6Result = try run(
+        localAddressHint: "2001:db8::20",
+        selectedSourceAddress: "2001:db8:1::20",
+        family: .ipv6
+    )
+    try expect(
+        ipv6Result.activeMapping.transport == .pcp,
+        "IPv6 PCP must use the connected source address"
+    )
+}
+
+func testPCPEffectiveIdentityPersistsThroughLifecycle() throws {
+    let hint = "2001:db8::20"
+    let effective = "fe80::20%en7"
+    let gateway = "fe80::1%en7"
+    let bootIdentifier = "boot-pcp-effective-identity"
+    var wallTime = Date(timeIntervalSince1970: 20_000)
+    var uptime: TimeInterval = 100
+    var routerEpoch: UInt32 = 100
+    var sourceHints: [String?] = []
+    var selectedSources: [String] = []
+    var payloadSources: [String?] = []
+    var requestedLifetimes: [UInt32] = []
+
+    var config = automaticMappingConfig()
+    config.mappingProtocolPreference = .pcp
+    config.preferredAddressFamily = .ipv6
+    config.mappingLeaseSeconds = 60
+    let mapper = RouterMappingService(
+        udpTransactionHandler: {
+            _, _, _, sourceAddressHint, payloadBuilder, acceptsResponse in
+            sourceHints.append(sourceAddressHint)
+            selectedSources.append(effective)
+            let payload = try payloadBuilder(effective)
+            payloadSources.append(
+                PCPMessageCodec.addressString(Data(payload[8..<24]))
+            )
+            let response: Data
+            if payload.count == 24 {
+                response = pcpAnnounceResponse(epoch: routerEpoch)
+            } else {
+                requestedLifetimes.append(testReadUInt32(payload, at: 4))
+                response = pcpMappingResponse(
+                    for: payload,
+                    epoch: routerEpoch
+                )
+            }
+            let accepted = try acceptsResponse(response)
+            try expect(
+                accepted,
+                "The effective-identity response must match its PCP request"
+            )
+            return response
+        },
+        nowProvider: { wallTime },
+        monotonicUptimeProvider: { uptime },
+        bootIdentifierProvider: { bootIdentifier },
+        retryRandomizationProvider: { 0 }
+    )
+
+    let created = try mapper.ensureIPv6Pinhole(
+        config: config,
+        localAddress: hint,
+        gatewayAddress: gateway
+    ).activeMapping
+    try expect(
+        created.localAddress == effective,
+        "Creation must replace the caller hint with the scoped effective address"
+    )
+    try expect(
+        created.isCompatible(
+            with: config,
+            family: .ipv6,
+            localAddress: hint,
+            gatewayAddress: gateway
+        ),
+        "PCP compatibility must be anchored to its effective identity"
+    )
+
+    wallTime = wallTime.addingTimeInterval(10)
+    uptime += 10
+    routerEpoch += 10
+    let health = try mapper.refreshMappingEpochs([created])
+    try expect(
+        health.invalidatedMappings.isEmpty
+            && health.refreshedMappings.first?.localAddress == effective,
+        "Epoch health must retain the same effective PCP identity"
+    )
+    guard let refreshed = health.refreshedMappings.first else {
+        throw TestFailure("The healthy PCP mapping was not returned")
+    }
+
+    wallTime = wallTime.addingTimeInterval(10)
+    uptime += 10
+    routerEpoch += 10
+    let renewed = try mapper.renewMapping(
+        config: config,
+        mapping: refreshed
+    ).activeMapping
+    try expect(
+        renewed.localAddress == effective,
+        "Renewal must preserve the effective PCP client address"
+    )
+
+    let removal = mapper.removeMappings([renewed])
+    try expect(
+        removal.allSucceeded,
+        "Deletion with the persisted effective PCP identity must succeed"
+    )
+    try expect(
+        sourceHints == [hint, effective, effective, effective],
+        "Create may start from hint A, but health, renewal, and delete must all use effective B"
+    )
+    try expect(
+        selectedSources.allSatisfy { $0 == effective },
+        "Every transaction must retain the scoped effective source address"
+    )
+    try expect(
+        payloadSources.allSatisfy { $0 == "fe80::20" },
+        "Every PCP payload must encode effective B rather than hint A"
+    )
+    try expect(
+        requestedLifetimes == [60, 60, 0],
+        "The lifecycle must contain create, renew, and strict delete MAP requests"
+    )
+
+    var mapReachedResponseStage = false
+    let changedRouteMapper = RouterMappingService(
+        udpTransactionHandler: {
+            _, _, _, _, payloadBuilder, _ in
+            _ = try payloadBuilder("fe80::21%en7")
+            mapReachedResponseStage = true
+            throw TestFailure(
+                "A changed effective identity must fail before MAP is sent"
+            )
+        },
+        nowProvider: { wallTime },
+        monotonicUptimeProvider: { uptime },
+        bootIdentifierProvider: { bootIdentifier }
+    )
+    do {
+        _ = try changedRouteMapper.renewMapping(
+            config: config,
+            mapping: renewed
+        )
+        throw TestFailure(
+            "Renewal from a different effective PCP address must fail"
+        )
+    } catch let error as RouterMappingError {
+        try expect(
+            error.localizedDescription.contains(
+                "effective client address changed"
+            ),
+            "Renewal must explain the effective PCP identity change"
+        )
+    }
+    let changedDelete = changedRouteMapper.removeMappings([renewed])
+    try expect(
+        !mapReachedResponseStage
+            && changedDelete.remainingMappings == [renewed],
+        "Changed-route delete must send nothing and retain the tracked B identity"
+    )
+}
+
+func testAddressChangeReasonAutoWANBudgetAndRenewalDeadline() throws {
+    let baseline = Date(timeIntervalSince1970: 60_000)
+    var mapping = mappingFixture(
+        transport: .pcp,
+        family: .ipv4,
+        suffix: 20
+    )
+    mapping.localAddress = "192.0.2.20"
+    mapping.gatewayAddress = "192.0.2.1"
+    mapping.routerEpoch = 100
+    mapping.routerEpochObservedAt = baseline
+    mapping.routerEpochObservedUptime = 100
+    mapping.routerEpochBootIdentifier = "boot-address-change"
+    mapping.leaseBootIdentifier = "boot-address-change"
+    mapping.leaseExpiresUptime = 160
+    mapping.renewAfterUptime = 130
+
+    let driftMapper = RouterMappingService(
+        udpTransactionHandler: {
+            _, _, _, _, payloadBuilder, acceptsResponse in
+            let payload = try payloadBuilder("192.0.2.21")
+            try expect(
+                payload.count == 24,
+                "Address drift health check must remain a harmless ANNOUNCE"
+            )
+            let response = pcpAnnounceResponse(epoch: 110)
+            let accepted = try acceptsResponse(response)
+            try expect(
+                accepted,
+                "Address drift ANNOUNCE response must parse"
+            )
+            return response
+        },
+        nowProvider: { baseline.addingTimeInterval(10) },
+        monotonicUptimeProvider: { 110 },
+        bootIdentifierProvider: { "boot-address-change" }
+    )
+    let drift = try driftMapper.refreshMappingEpochs([mapping])
+    try expect(
+        drift.refreshedMappings.isEmpty
+            && drift.invalidations.count == 1,
+        "B to C must be reported as an invalidation"
+    )
+    guard case .effectiveClientAddressChanged(let replacement) =
+            drift.invalidations[0].reason else {
+        throw TestFailure(
+            "B to C must not be merged with router Epoch state loss"
+        )
+    }
+    try expect(
+        replacement == "192.0.2.21"
+            && drift.invalidations[0].mapping.localAddress
+                == "192.0.2.20",
+        "The invalidation must retain orphan B and report replacement C"
+    )
+
+    var natOnlyTimeouts: [TimeInterval] = []
+    let natOnlyWAN = RouterMappingService(
+        upnpDiscoveryHandler: {
+            throw TestFailure(
+                "NAT-PMP-only WAN discovery must not require UPnP"
+            )
+        },
+        udpRequestHandler: { request, _, _, timeout in
+            try expect(
+                request == Data([0, 0]),
+                "Auto WAN discovery must use the harmless NAT-PMP External Address request"
+            )
+            natOnlyTimeouts.append(timeout)
+            return natPMPExternalAddressResponse(
+                address: [100, 64, 1, 20],
+                epoch: 120
+            )
+        }
+    )
+    let natOnlyAddress = try natOnlyWAN
+        .externalIPv4AddressForAutomaticMapping(
+            gatewayAddress: "192.0.2.1"
+        )
+    try expect(
+        natOnlyAddress == "100.64.1.20"
+            && natOnlyTimeouts == [0.25],
+        "Auto WAN discovery must support NAT-PMP-only routers within the first short probe"
+    )
+
+    var fallbackTimeouts: [TimeInterval] = []
+    let fallbackService = automaticUPnPService(
+        gateway: "192.0.2.1"
+    )
+    let automaticWANFallback = RouterMappingService(
+        upnpDiscoveryHandler: { [fallbackService] },
+        soapRequestHandler: { _, _, action, _ in
+            try expect(
+                action == "GetExternalIPAddress",
+                "Auto WAN fallback must query UPnP only after the short NAT-PMP budget"
+            )
+            return response(
+                "<response><NewExternalIPAddress>203.0.113.42</NewExternalIPAddress></response>"
+            )
+        },
+        udpRequestHandler: { _, _, _, timeout in
+            fallbackTimeouts.append(timeout)
+            throw RouterMappingError.timeout(
+                "Injected NAT-PMP-only capability timeout"
+            )
+        }
+    )
+    let fallbackAddress = try automaticWANFallback
+        .externalIPv4AddressForAutomaticMapping(
+            gatewayAddress: "192.0.2.1"
+        )
+    try expect(
+        fallbackAddress == "203.0.113.42"
+            && fallbackTimeouts == [0.25, 0.5, 1],
+        "Auto WAN must cap NAT-PMP at 1.75 seconds before UPnP fallback"
+    )
+
+    var renewalIntervals: [TimeInterval] = []
+    var renewalConfig = automaticMappingConfig()
+    renewalConfig.mappingProtocolPreference = .pcp
+    renewalConfig.mappingLeaseSeconds = 60
+    let renewalMapper = RouterMappingService(
+        udpTransactionHandler: {
+            _, _, intervals, _, payloadBuilder, acceptsResponse in
+            renewalIntervals = intervals
+            let payload = try payloadBuilder("192.0.2.20")
+            let response = pcpMappingResponse(for: payload, epoch: 130)
+            let accepted = try acceptsResponse(response)
+            try expect(
+                accepted,
+                "Bounded renewal response must parse"
+            )
+            return response
+        },
+        nowProvider: { baseline.addingTimeInterval(30) },
+        monotonicUptimeProvider: { 130 },
+        bootIdentifierProvider: { "boot-address-change" },
+        retryRandomizationProvider: { 0 }
+    )
+    _ = try renewalMapper.renewMapping(
+        config: renewalConfig,
+        mapping: mapping
+    )
+    try expect(
+        renewalIntervals.reduce(0, +) <= 29.75
+            && renewalIntervals == [3, 6, 12, 8.75],
+        "PCP renewal retries must be clipped before the monotonic lease expiry"
+    )
+
+    var natMapping = mapping
+    natMapping.transport = .natpmp
+    natMapping.pcpNonce = nil
+    var natRenewalIntervals: [TimeInterval] = []
+    renewalConfig.mappingProtocolPreference = .natpmp
+    let natRenewalMapper = RouterMappingService(
+        udpTransactionHandler: {
+            _, _, intervals, _, payloadBuilder, acceptsResponse in
+            let payload = try payloadBuilder("192.0.2.20")
+            if payload == Data([0, 0]) {
+                return natPMPExternalAddressResponse(epoch: 130)
+            }
+            natRenewalIntervals = intervals
+            let response = natPMPMappingResponse(for: payload, epoch: 130)
+            let accepted = try acceptsResponse(response)
+            try expect(
+                accepted,
+                "Bounded NAT-PMP renewal response must parse"
+            )
+            return response
+        },
+        nowProvider: { baseline.addingTimeInterval(30) },
+        monotonicUptimeProvider: { 130 },
+        bootIdentifierProvider: { "boot-address-change" }
+    )
+    _ = try natRenewalMapper.renewMapping(
+        config: renewalConfig,
+        mapping: natMapping
+    )
+    try expect(
+        natRenewalIntervals.reduce(0, +) <= 29.75
+            && natRenewalIntervals == [
+                0.25, 0.5, 1, 2, 4, 8, 14
+            ],
+        "NAT-PMP renewal retries must be clipped before monotonic expiry"
+    )
+}
+
+func testOperationTokenCancellationGapAndAbsoluteDeadline() throws {
+    let config = automaticMappingConfig()
+    var cancelledMapper: RouterMappingService!
+    var mapPayloads = 0
+    var upnpFallbacks = 0
+    cancelledMapper = RouterMappingService(
+        upnpDiscoveryHandler: {
+            upnpFallbacks += 1
+            return []
+        },
+        udpTransactionHandler: {
+            _, _, _, sourceAddressHint, payloadBuilder, acceptsResponse in
+            let payload = try payloadBuilder(
+                sourceAddressHint ?? "192.0.2.20"
+            )
+            if payload.count == 24 {
+                let response = pcpAnnounceResponse()
+                let accepted = try acceptsResponse(response)
+                try expect(accepted, "ANNOUNCE response must parse")
+                cancelledMapper.cancelCurrentOperations()
+                return response
+            }
+            mapPayloads += 1
+            return pcpMappingResponse(for: payload)
+        },
+        retryRandomizationProvider: { 0 }
+    )
+    do {
+        _ = try cancelledMapper.ensureMapping(
+            config: config,
+            localAddress: "192.0.2.20",
+            gatewayAddress: "192.0.2.1"
+        )
+        throw TestFailure("Cancellation between ANNOUNCE and MAP must abort")
+    } catch RouterMappingError.cancelled {
+        // Expected.
+    }
+    try expect(
+        mapPayloads == 0 && upnpFallbacks == 0,
+        "CANCEL_GAP must send no MAP and start no fallback"
+    )
+
+    let service = automaticUPnPService(gateway: "192.0.2.1")
+    var cancelledUPnP: RouterMappingService!
+    var soapActions: [String] = []
+    cancelledUPnP = RouterMappingService(
+        upnpDiscoveryHandler: {
+            cancelledUPnP.cancelCurrentOperations()
+            return [service]
+        },
+        soapRequestHandler: { _, _, action, _ in
+            soapActions.append(action)
+            return response("<response/>")
+        }
+    )
+    var upnpConfig = config
+    upnpConfig.mappingProtocolPreference = .upnp
+    do {
+        _ = try cancelledUPnP.ensureMapping(
+            config: upnpConfig,
+            localAddress: "192.0.2.20",
+            gatewayAddress: "192.0.2.1"
+        )
+        throw TestFailure("Cancelled SSDP discovery must abort UPnP")
+    } catch RouterMappingError.cancelled {
+        // Expected.
+    }
+    try expect(
+        soapActions.isEmpty,
+        "Cancellation after SSDP must prevent every SOAP MAP request"
+    )
+
+    var removalMapper: RouterMappingService!
+    var removalCalls = 0
+    removalMapper = RouterMappingService(
+        removalHandler: { _ in
+            removalCalls += 1
+            removalMapper.cancelCurrentOperations()
+        }
+    )
+    let removalReport = removalMapper.removeMappings([
+        mappingFixture(transport: .upnp, family: .ipv4, suffix: 23),
+        mappingFixture(transport: .upnp, family: .ipv4, suffix: 24)
+    ])
+    try expect(
+        removalCalls == 1 && removalReport.remainingMappings.count == 2,
+        "One remove token must stop before a second deletion after cancel"
+    )
+
+    var refreshMapper: RouterMappingService!
+    var refreshCalls = 0
+    refreshMapper = RouterMappingService(
+        udpTransactionHandler: {
+            _, _, _, sourceAddressHint, payloadBuilder, acceptsResponse in
+            refreshCalls += 1
+            let payload = try payloadBuilder(
+                sourceAddressHint ?? "192.0.2.20"
+            )
+            try expect(
+                payload.count == 24,
+                "Epoch refresh cancellation must use harmless ANNOUNCE"
+            )
+            let response = pcpAnnounceResponse(epoch: 20)
+            let accepted = try acceptsResponse(response)
+            try expect(accepted, "Epoch ANNOUNCE response must parse")
+            refreshMapper.cancelCurrentOperations()
+            return response
+        }
+    )
+    do {
+        _ = try refreshMapper.refreshMappingEpochs([
+            mappingFixture(
+                transport: .pcp,
+                family: .ipv4,
+                suffix: 25
+            ),
+            mappingFixture(
+                transport: .pcp,
+                family: .ipv4,
+                suffix: 26
+            )
+        ])
+        throw TestFailure("Cancelled Epoch refresh must abort")
+    } catch RouterMappingError.cancelled {
+        // Expected.
+    }
+    try expect(
+        refreshCalls == 1,
+        "One refresh token must stop before probing a second mapping"
+    )
+
+    let baseline = Date(timeIntervalSince1970: 70_000)
+    let boot = "absolute-renewal-deadline"
+    var uptime: TimeInterval = 130
+    var pcpCalls = 0
+    let deadlineMapper = RouterMappingService(
+        udpRequestHandler: { request, _, _, _ in
+            pcpCalls += 1
+            uptime = 160
+            throw RouterMappingError.uncertainAfterSend(
+                "Injected process suspension after send"
+            )
+        },
+        nowProvider: { baseline },
+        monotonicUptimeProvider: { uptime },
+        bootIdentifierProvider: { boot },
+        retryRandomizationProvider: { 0 }
+    )
+    var pcp = mappingFixture(
+        transport: .pcp,
+        family: .ipv4,
+        suffix: 20
+    )
+    pcp.leaseBootIdentifier = boot
+    pcp.renewAfterUptime = 130
+    pcp.leaseExpiresUptime = 160
+    pcp.leaseAnchorWallTime = baseline
+    pcp.leaseRemainingAtAnchor = 30
+    var renewalConfig = config
+    renewalConfig.mappingProtocolPreference = .pcp
+    renewalConfig.pcpNonce = pcp.pcpNonce
+    do {
+        _ = try deadlineMapper.renewMapping(
+            config: renewalConfig,
+            mapping: pcp
+        )
+        throw TestFailure("A suspended PCP renewal must become uncertain")
+    } catch is RouterMappingRecoveryRequiredError {
+        // Expected: one packet may have reached the router.
+    } catch {
+        throw TestFailure(
+            "PCP renewal must retain sent-MAP uncertainty, got "
+                + "\(type(of: error)): \(error.localizedDescription)"
+        )
+    }
+    try expect(
+        pcpCalls == 1,
+        "Absolute PCP deadline must prevent a retry after suspension"
+    )
+
+    uptime = 130
+    var natPMPCalls = 0
+    let deadlineNATPMP = RouterMappingService(
+        udpRequestHandler: { request, _, _, _ in
+            if request == Data([0, 0]) {
+                return natPMPExternalAddressResponse(
+                    address: [192, 0, 2, 53]
+                )
+            }
+            natPMPCalls += 1
+            uptime = 160
+            throw RouterMappingError.uncertainAfterSend(
+                "Injected NAT-PMP suspension after send"
+            )
+        },
+        nowProvider: { baseline },
+        monotonicUptimeProvider: { uptime },
+        bootIdentifierProvider: { boot }
+    )
+    var natPMP = mappingFixture(
+        transport: .natpmp,
+        family: .ipv4,
+        suffix: 22
+    )
+    natPMP.leaseBootIdentifier = boot
+    natPMP.renewAfterUptime = 130
+    natPMP.leaseExpiresUptime = 160
+    natPMP.leaseAnchorWallTime = baseline
+    natPMP.leaseRemainingAtAnchor = 30
+    renewalConfig.mappingProtocolPreference = .natpmp
+    do {
+        _ = try deadlineNATPMP.renewMapping(
+            config: renewalConfig,
+            mapping: natPMP
+        )
+        throw TestFailure("A suspended NAT-PMP renewal must become uncertain")
+    } catch is RouterMappingRecoveryRequiredError {
+        // Expected: one packet may have reached the router.
+    } catch {
+        throw TestFailure(
+            "NAT-PMP renewal must retain sent-MAP uncertainty, got "
+                + "\(type(of: error)): \(error.localizedDescription)"
+        )
+    }
+    try expect(
+        natPMPCalls == 1,
+        "Absolute NAT-PMP deadline must prevent a retry after suspension"
+    )
+
+    uptime = 130
+    var upnpActions: [String] = []
+    let deadlineUPnP = RouterMappingService(
+        upnpDescriptionHandler: { _ in
+            try upnpDescriptionFixture(service: service)
+        },
+        soapRequestHandler: { _, _, action, _ in
+            upnpActions.append(action)
+            if action == "AddPortMapping" {
+                uptime = 160
+            }
+            return response("<response/>")
+        },
+        nowProvider: { baseline },
+        monotonicUptimeProvider: { uptime },
+        bootIdentifierProvider: { boot }
+    )
+    var upnp = mappingFixture(
+        transport: .upnp,
+        family: .ipv4,
+        suffix: 21
+    )
+    upnp.pcpNonce = try encodedUPnPBindingFixture(
+        service: service,
+        gateway: "192.0.2.1"
+    )
+    upnp.leaseBootIdentifier = boot
+    upnp.renewAfterUptime = 130
+    upnp.leaseExpiresUptime = 160
+    upnp.leaseAnchorWallTime = baseline
+    upnp.leaseRemainingAtAnchor = 30
+    renewalConfig.mappingProtocolPreference = .upnp
+    do {
+        _ = try deadlineUPnP.renewMapping(
+            config: renewalConfig,
+            mapping: upnp
+        )
+        throw TestFailure("A suspended UPnP renewal must stop")
+    } catch {
+        // Expected.
+    }
+    try expect(
+        upnpActions == ["AddPortMapping"],
+        "Absolute UPnP deadline must prevent verification or later sends"
+    )
+}
+
+func testUPnPRenewalRequiresPersistedIGDIdentity() throws {
+    let gateway = "192.0.2.1"
+    let baseline = Date(timeIntervalSince1970: 75_000)
+    let boot = "upnp-bound-renewal"
+
+    func mapping(
+        service: UPnPService,
+        family: RouterMappingAddressFamily,
+        localAddress: String,
+        pinholeID: UInt16? = nil
+    ) throws -> ActiveRouterMapping {
+        var result = ActiveRouterMapping(
+            transport: .upnp,
+            addressFamily: family,
+            localAddress: localAddress,
+            gatewayAddress: gateway,
+            internalPort: 5900,
+            externalPort: family == .ipv4 ? 45900 : 5900,
+            pinholeID: pinholeID,
+            pcpNonce: try encodedUPnPBindingFixture(
+                service: service,
+                gateway: gateway
+            ),
+            leaseExpiresAt: baseline.addingTimeInterval(60),
+            renewAfter: baseline
+        )
+        result.leaseBootIdentifier = boot
+        result.renewAfterUptime = 100
+        result.leaseExpiresUptime = 160
+        result.leaseAnchorWallTime = baseline
+        result.leaseRemainingAtAnchor = 60
+        return result
+    }
+
+    let ipv4Service = UPnPService(
+        serviceType:
+            "urn:schemas-upnp-org:service:WANIPConnection:1",
+        controlURL: URL(
+            string:
+                "http://192.0.2.1:5000/upnp/control/original-ipv4"
+        )!,
+        gatewayIdentity: gateway,
+        descriptionURL: URL(
+            string: "http://192.0.2.1:5000/original-root.xml"
+        )!,
+        deviceIdentity: "uuid:original-ipv4-igd"
+    )
+    let ipv4 = try mapping(
+        service: ipv4Service,
+        family: .ipv4,
+        localAddress: "192.0.2.20"
+    )
+    var discoveryCalls = 0
+    var soapCalls = 0
+    let replacedUDN = RouterMappingService(
+        upnpDiscoveryHandler: {
+            discoveryCalls += 1
+            return []
+        },
+        upnpDescriptionHandler: { url in
+            try expect(
+                url == ipv4Service.descriptionURL,
+                "IPv4 renew must verify only the persisted description URL"
+            )
+            return try upnpDescriptionFixture(
+                service: ipv4Service,
+                deviceIdentity: "uuid:replacement-ipv4-igd"
+            )
+        },
+        soapRequestHandler: { _, _, _, _ in
+            soapCalls += 1
+            return response("")
+        },
+        nowProvider: { baseline },
+        monotonicUptimeProvider: { 100 },
+        bootIdentifierProvider: { boot }
+    )
+    var config = automaticMappingConfig()
+    config.mappingProtocolPreference = .upnp
+    config.internalPort = ipv4.internalPort
+    config.externalPort = ipv4.externalPort
+    var ipv4Recovery: ActiveRouterMapping?
+    do {
+        _ = try replacedUDN.renewMapping(
+            config: config,
+            mapping: ipv4
+        )
+        throw TestFailure("A replacement IPv4 UDN must block renewal")
+    } catch let recovery as RouterMappingRecoveryRequiredError {
+        ipv4Recovery = recovery.mapping
+        try expect(
+            recovery.mapping.identifier == ipv4.identifier
+                && recovery.mapping.pcpNonce == ipv4.pcpNonce
+                && recovery.mapping.leaseExpiresUptime
+                    == ipv4.leaseExpiresUptime
+                && recovery.mapping.recoveryState
+                    == .upnpIdentityChanged,
+            "IPv4 identity failure must preserve the exact old recovery identity"
+        )
+    }
+    try expect(
+        discoveryCalls == 0 && soapCalls == 0,
+        "IPv4 renew must neither rediscover nor send AddPortMapping "
+            + "after a UDN mismatch"
+    )
+    guard let ipv4Recovery else {
+        throw TestFailure("IPv4 identity failure must return recovery")
+    }
+    let blockedCleanup = replacedUDN.removeMappings([ipv4Recovery])
+    try expect(
+        blockedCleanup.remainingMappings == [ipv4Recovery]
+            && soapCalls == 0,
+        "Changed IGD identity must keep blocking cleanup and replacement "
+            + "before the old monotonic lease expires"
+    )
+
+    var cleanupActions: [String] = []
+    let restoredOriginal = RouterMappingService(
+        upnpDescriptionHandler: { _ in
+            try upnpDescriptionFixture(service: ipv4Service)
+        },
+        soapRequestHandler: { _, _, action, _ in
+            cleanupActions.append(action)
+            if action == "GetSpecificPortMappingEntry" {
+                return response("""
+                <response>
+                  <NewInternalClient>192.0.2.20</NewInternalClient>
+                  <NewInternalPort>5900</NewInternalPort>
+                  <NewEnabled>1</NewEnabled>
+                  <NewPortMappingDescription>Gatebeam</NewPortMappingDescription>
+                </response>
+                """)
+            }
+            return response("")
+        },
+        nowProvider: { baseline.addingTimeInterval(20) },
+        monotonicUptimeProvider: { 120 },
+        bootIdentifierProvider: { boot }
+    )
+    try expect(
+        restoredOriginal.removeMappings([ipv4Recovery]).allSucceeded
+            && cleanupActions
+                == ["GetSpecificPortMappingEntry", "DeletePortMapping"],
+        "Restored exact IGD identity must allow safe cleanup before expiry"
+    )
+
+    var expiredIdentityChecks = 0
+    let expiredRecovery = RouterMappingService(
+        upnpDescriptionHandler: { _ in
+            expiredIdentityChecks += 1
+            throw TestFailure(
+                "Expired finite UPnP recovery needs no network request"
+            )
+        },
+        nowProvider: { baseline.addingTimeInterval(60) },
+        monotonicUptimeProvider: { 160 },
+        bootIdentifierProvider: { boot }
+    )
+    try expect(
+        expiredRecovery.removeMappings([ipv4Recovery]).allSucceeded
+            && expiredIdentityChecks == 0,
+        "Old UPnP recovery may clear at its monotonic finite-lease expiry"
+    )
+
+    var missingUDNSOAPCalls = 0
+    let missingUDN = RouterMappingService(
+        upnpDescriptionHandler: { _ in
+            Data("""
+            <root>
+              <device>
+                <serviceList>
+                  <service>
+                    <serviceType>\(ipv4Service.serviceType)</serviceType>
+                    <controlURL>\(ipv4Service.controlURL.absoluteString)</controlURL>
+                  </service>
+                </serviceList>
+              </device>
+            </root>
+            """.utf8)
+        },
+        soapRequestHandler: { _, _, _, _ in
+            missingUDNSOAPCalls += 1
+            return response("")
+        },
+        nowProvider: { baseline },
+        monotonicUptimeProvider: { 100 },
+        bootIdentifierProvider: { boot }
+    )
+    do {
+        _ = try missingUDN.renewMapping(
+            config: config,
+            mapping: ipv4
+        )
+        throw TestFailure("Missing current UDN must block renewal")
+    } catch is RouterMappingRecoveryRequiredError {
+        // Expected.
+    }
+    try expect(
+        missingUDNSOAPCalls == 0,
+        "Persisted UDN must not be substituted when the current description omits it"
+    )
+
+    let ipv6Service = UPnPService(
+        serviceType:
+            "urn:schemas-upnp-org:service:WANIPv6FirewallControl:1",
+        controlURL: URL(
+            string:
+                "http://192.0.2.1:5000/upnp/control/original-ipv6"
+        )!,
+        gatewayIdentity: gateway,
+        descriptionURL: URL(
+            string: "http://192.0.2.1:5000/original-v6-root.xml"
+        )!,
+        deviceIdentity: "uuid:original-ipv6-igd",
+        ssdpBootID: "201",
+        ssdpConfigID: "11"
+    )
+    let ipv6 = try mapping(
+        service: ipv6Service,
+        family: .ipv6,
+        localAddress: "2606:4700:4700::20",
+        pinholeID: 77
+    )
+    discoveryCalls = 0
+    soapCalls = 0
+    let changedControl = RouterMappingService(
+        upnpDiscoveryHandler: {
+            discoveryCalls += 1
+            return [
+                UPnPService(
+                    serviceType: ipv6Service.serviceType,
+                    controlURL: URL(
+                        string:
+                            "http://192.0.2.1:5000/upnp/control/replacement-ipv6"
+                    )!,
+                    gatewayIdentity: gateway,
+                    descriptionURL: ipv6Service.descriptionURL,
+                    deviceIdentity: ipv6Service.deviceIdentity,
+                    ssdpBootID: ipv6Service.ssdpBootID,
+                    ssdpConfigID: ipv6Service.ssdpConfigID
+                )
+            ]
+        },
+        upnpDescriptionHandler: { url in
+            try expect(
+                url == ipv6Service.descriptionURL,
+                "IPv6 renew must verify only the persisted description URL"
+            )
+            return try upnpDescriptionFixture(
+                service: ipv6Service,
+                controlURL: URL(
+                    string:
+                        "http://192.0.2.1:5000/upnp/control/replacement-ipv6"
+                )!
+            )
+        },
+        soapRequestHandler: { _, _, _, _ in
+            soapCalls += 1
+            return response("")
+        },
+        nowProvider: { baseline },
+        monotonicUptimeProvider: { 100 },
+        bootIdentifierProvider: { boot }
+    )
+    config.preferredAddressFamily = .ipv6
+    config.externalPort = ipv6.externalPort
+    config.ipv6PinholeID = ipv6.pinholeID
+    do {
+        _ = try changedControl.renewMapping(
+            config: config,
+            mapping: ipv6
+        )
+        throw TestFailure(
+            "A replacement IPv6 control URL must block renewal"
+        )
+    } catch let recovery as RouterMappingRecoveryRequiredError {
+        try expect(
+            recovery.mapping.identifier == ipv6.identifier
+                && recovery.mapping.pinholeID == 77
+                && recovery.mapping.recoveryState
+                    == .upnpIdentityChanged,
+            "IPv6 identity failure must preserve the old pinhole recovery identity"
+        )
+    }
+    try expect(
+        discoveryCalls == 1 && soapCalls == 0,
+        "IPv6 renew must rediscover SSDP identity but not send UpdatePinhole/AddPinhole "
+            + "after a control URL mismatch"
+    )
+
+    var boundIPv6Actions: [String] = []
+    let boundIPv6 = RouterMappingService(
+        upnpDiscoveryHandler: { [ipv6Service] },
+        upnpDescriptionHandler: { _ in
+            try upnpDescriptionFixture(service: ipv6Service)
+        },
+        soapRequestHandler: { _, _, action, _ in
+            boundIPv6Actions.append(action)
+            if action == "GetFirewallStatus" {
+                return response("""
+                <response>
+                  <FirewallEnabled>1</FirewallEnabled>
+                  <InboundPinholeAllowed>1</InboundPinholeAllowed>
+                </response>
+                """)
+            }
+            return response("")
+        },
+        nowProvider: { baseline },
+        monotonicUptimeProvider: { 100 },
+        bootIdentifierProvider: { boot }
+    )
+    let renewedIPv6 = try boundIPv6.renewMapping(
+        config: config,
+        mapping: ipv6
+    )
+    try expect(
+        boundIPv6Actions == ["GetFirewallStatus", "UpdatePinhole"]
+            && renewedIPv6.pinholeID == 77
+            && renewedIPv6.activeMapping.pcpNonce == ipv6.pcpNonce,
+        "Verified IPv6 renewal must stay on the original IGD and pinhole"
+    )
+}
+
+func testRealUPnPDescriptionRequestCancelsURLSession() throws {
+    let listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
+    guard listener >= 0 else {
+        throw TestFailure("Could not create loopback TCP listener")
+    }
+    var shouldReuse: Int32 = 1
+    _ = setsockopt(
+        listener,
+        SOL_SOCKET,
+        SO_REUSEADDR,
+        &shouldReuse,
+        socklen_t(MemoryLayout<Int32>.size)
+    )
+    var address = sockaddr_in()
+    address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+    address.sin_family = sa_family_t(AF_INET)
+    address.sin_port = 0
+    guard inet_pton(AF_INET, "127.0.0.1", &address.sin_addr) == 1 else {
+        close(listener)
+        throw TestFailure("Could not parse loopback TCP address")
+    }
+    let bound = withUnsafePointer(to: &address) {
+        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+            bind(
+                listener,
+                $0,
+                socklen_t(MemoryLayout<sockaddr_in>.size)
+            )
+        }
+    }
+    guard bound == 0, listen(listener, 1) == 0 else {
+        close(listener)
+        throw TestFailure("Could not bind loopback TCP listener")
+    }
+    var addressLength = socklen_t(MemoryLayout<sockaddr_in>.size)
+    let named = withUnsafeMutablePointer(to: &address) {
+        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+            getsockname(listener, $0, &addressLength)
+        }
+    }
+    guard named == 0 else {
+        close(listener)
+        throw TestFailure("Could not read loopback TCP port")
+    }
+    let port = UInt16(bigEndian: address.sin_port)
+    let requestArrived = DispatchSemaphore(value: 0)
+    let releaseServer = DispatchSemaphore(value: 0)
+    DispatchQueue.global(qos: .utility).async {
+        let client = accept(listener, nil, nil)
+        if client >= 0 {
+            var bytes = [UInt8](repeating: 0, count: 2_048)
+            _ = recv(client, &bytes, bytes.count, 0)
+            requestArrived.signal()
+            _ = releaseServer.wait(timeout: .now() + 2)
+            close(client)
+        }
+        close(listener)
+    }
+
+    let location = "http://127.0.0.1:\(port)/root.xml"
+    let ssdp = Data("""
+    HTTP/1.1 200 OK\r
+    LOCATION: \(location)\r
+    USN: uuid:gatebeam-cancel-router\r
+    \r
+    """.utf8)
+    var soapActions: [String] = []
+    let mapper = RouterMappingService(
+        soapRequestHandler: { _, _, action, _ in
+            soapActions.append(action)
+            return response("")
+        },
+        ssdpSearchHandler: { _ in [ssdp] }
+    )
+    var config = automaticMappingConfig()
+    config.mappingProtocolPreference = .upnp
+    let completion = DispatchSemaphore(value: 0)
+    let outcomeLock = NSLock()
+    var outcome: Error?
+    DispatchQueue.global(qos: .userInitiated).async {
+        defer { completion.signal() }
+        do {
+            _ = try mapper.ensureMapping(
+                config: config,
+                localAddress: "192.0.2.20",
+                gatewayAddress: "127.0.0.1"
+            )
+        } catch {
+            outcomeLock.lock()
+            outcome = error
+            outcomeLock.unlock()
+        }
+    }
+    guard requestArrived.wait(timeout: .now() + 2) == .success else {
+        releaseServer.signal()
+        throw TestFailure("URLSession did not reach the loopback server")
+    }
+    let started = ProcessInfo.processInfo.systemUptime
+    mapper.cancelCurrentOperations()
+    let completed = completion.wait(timeout: .now() + 0.75) == .success
+    let elapsed = ProcessInfo.processInfo.systemUptime - started
+    releaseServer.signal()
+    outcomeLock.lock()
+    let captured = outcome
+    outcomeLock.unlock()
+    try expect(
+        completed && elapsed < 0.75,
+        "Cancelling UPnP must interrupt a live URLSession request promptly"
+    )
+    try expect(
+        captured is RouterMappingError && soapActions.isEmpty,
+        "Cancelled description fetch must not proceed to any SOAP MAP"
+    )
+    if let mappingError = captured as? RouterMappingError {
+        guard case .cancelled = mappingError else {
+            throw TestFailure(
+                "Real URLSession cancellation must surface as cancelled"
+            )
+        }
+    }
+}
+
+func testNATPMPEffectiveIdentityPersistsAndDriftBlocksMAP() throws {
+    let hint = "192.0.2.20"
+    let effective = "10.0.0.20"
+    let gateway = "192.0.2.1"
+    let baseline = Date(timeIntervalSince1970: 80_000)
+    let boot = "natpmp-effective-source"
+    var uptime: TimeInterval = 100
+    var sourceHints: [String?] = []
+    var selectedSources: [String] = []
+    var mapper = RouterMappingService(
+        udpTransactionHandler: {
+            _, _, _, sourceAddressHint, payloadBuilder, acceptsResponse in
+            sourceHints.append(sourceAddressHint)
+            selectedSources.append(effective)
+            let payload = try payloadBuilder(effective)
+            let response: Data
+            if payload == Data([0, 0]) {
+                response = natPMPExternalAddressResponse(epoch: 100)
+            } else {
+                response = natPMPMappingResponse(
+                    for: payload,
+                    epoch: 100
+                )
+            }
+            let accepted = try acceptsResponse(response)
+            try expect(accepted, "NAT-PMP response must parse")
+            return response
+        },
+        nowProvider: { baseline },
+        monotonicUptimeProvider: { uptime },
+        bootIdentifierProvider: { boot }
+    )
+    var config = automaticMappingConfig()
+    config.mappingProtocolPreference = .natpmp
+    let created = try mapper.ensureMapping(
+        config: config,
+        localAddress: hint,
+        gatewayAddress: gateway
+    ).activeMapping
+    try expect(
+        created.localAddress == effective
+            && sourceHints.first == hint,
+        "NATPMP_HINT must be replaced by the real effective source"
+    )
+
+    uptime = created.renewAfterUptime ?? 130
+    let renewed = try mapper.renewMapping(
+        config: config,
+        mapping: created
+    ).activeMapping
+    try expect(
+        renewed.localAddress == effective
+            && sourceHints.last == effective
+            && selectedSources.allSatisfy { $0 == effective },
+        "NAT-PMP renew must remain bound to persisted effective identity"
+    )
+
+    var reachedDelete = false
+    let changed = RouterMappingService(
+        udpTransactionHandler: {
+            _, _, _, _, payloadBuilder, acceptsResponse in
+            let payload = try payloadBuilder("10.0.0.21")
+            if payload != Data([0, 0]) {
+                reachedDelete = true
+                throw TestFailure(
+                    "Address drift must fail before NAT-PMP delete"
+                )
+            }
+            let response = natPMPExternalAddressResponse(
+                epoch: renewed.routerEpoch ?? 0
+            )
+            let accepted = try acceptsResponse(response)
+            try expect(accepted, "NAT-PMP delete probe must parse")
+            return response
+        },
+        nowProvider: { baseline },
+        monotonicUptimeProvider: { uptime },
+        bootIdentifierProvider: { boot }
+    )
+    let deletion = changed.removeMappings([renewed])
+    try expect(
+        !reachedDelete && deletion.remainingMappings == [renewed],
+        "NAT-PMP delete must retain B when the effective source changed"
+    )
+
+    mapper = RouterMappingService(
+        udpTransactionHandler: {
+            _, _, _, _, payloadBuilder, acceptsResponse in
+            let payload = try payloadBuilder("10.0.0.21")
+            try expect(
+                payload == Data([0, 0]),
+                "NAT-PMP drift probe must be harmless"
+            )
+            let response = natPMPExternalAddressResponse(epoch: 110)
+            let accepted = try acceptsResponse(response)
+            try expect(accepted, "NAT-PMP drift response must parse")
+            return response
+        },
+        nowProvider: { baseline.addingTimeInterval(10) },
+        monotonicUptimeProvider: { uptime + 10 },
+        bootIdentifierProvider: { boot }
+    )
+    let drift = try mapper.refreshMappingEpochs([renewed])
+    guard case .effectiveClientAddressChanged(let replacement) =
+            drift.invalidations.first?.reason else {
+        throw TestFailure("NAT-PMP address drift needs orphan invalidation")
+    }
+    try expect(
+        replacement == "10.0.0.21"
+            && drift.invalidatedMappings == [renewed],
+        "NAT-PMP drift must retain original B and report C"
+    )
+}
+
+func testNATPMPDeletionRequiresProvenEpochContinuity() throws {
+    let baseline = Date(timeIntervalSince1970: 85_000)
+    let boot = "natpmp-delete-continuity"
+    let mapping = trackedNATPMPFixture(
+        suffix: 28,
+        epoch: 500,
+        now: baseline,
+        uptime: 100,
+        boot: boot
+    )
+
+    var resetPayloads: [Data] = []
+    let resetRouter = RouterMappingService(
+        udpTransactionHandler: {
+            _, _, _, _, payloadBuilder, acceptsResponse in
+            let payload = try payloadBuilder(mapping.localAddress)
+            resetPayloads.append(payload)
+            let response = natPMPExternalAddressResponse(epoch: 1)
+            let accepted = try acceptsResponse(response)
+            try expect(accepted, "Reset Epoch probe must parse")
+            return response
+        },
+        nowProvider: { baseline.addingTimeInterval(10) },
+        monotonicUptimeProvider: { 110 },
+        bootIdentifierProvider: { boot }
+    )
+    let resetReport = resetRouter.removeMappings([mapping])
+    try expect(
+        resetPayloads == [Data([0, 0])]
+            && resetReport.remainingMappings == [mapping],
+        "Old Epoch 500 and current Epoch 1 must never send lifetime=0"
+    )
+
+    var continuousPayloads: [Data] = []
+    let continuousRouter = RouterMappingService(
+        udpTransactionHandler: {
+            _, _, _, _, payloadBuilder, acceptsResponse in
+            let payload = try payloadBuilder(mapping.localAddress)
+            continuousPayloads.append(payload)
+            let response: Data
+            if payload == Data([0, 0]) {
+                response = natPMPExternalAddressResponse(epoch: 510)
+            } else {
+                response = natPMPMappingResponse(
+                    for: payload,
+                    epoch: 510
+                )
+            }
+            let accepted = try acceptsResponse(response)
+            try expect(accepted, "Continuous delete response must parse")
+            return response
+        },
+        nowProvider: { baseline.addingTimeInterval(10) },
+        monotonicUptimeProvider: { 110 },
+        bootIdentifierProvider: { boot }
+    )
+    let continuousReport =
+        continuousRouter.removeMappings([mapping])
+    try expect(
+        continuousReport.allSucceeded
+            && continuousPayloads.count == 2
+            && continuousPayloads[0] == Data([0, 0])
+            && testReadUInt32(
+                continuousPayloads[1],
+                at: 8
+            ) == 0,
+        "A continuous Epoch/source probe must precede the delete"
+    )
+
+    var crossBootCalls = 0
+    let crossBootRouter = RouterMappingService(
+        udpTransactionHandler: {
+            _, _, _, _, _, _ in
+            crossBootCalls += 1
+            throw TestFailure(
+                "Cross-boot unknown NAT-PMP identity must not use UDP"
+            )
+        },
+        nowProvider: { baseline.addingTimeInterval(10) },
+        monotonicUptimeProvider: { 10 },
+        bootIdentifierProvider: { "replacement-boot" }
+    )
+    let crossBootReport = crossBootRouter.removeMappings([mapping])
+    try expect(
+        crossBootCalls == 0
+            && crossBootReport.remainingMappings == [mapping],
+        "Cross-boot NAT-PMP deletion must wait for natural expiry"
+    )
+
+    var naturallyExpired = mapping
+    naturallyExpired.recoveryState = .clockContinuityUnverified
+    naturallyExpired.leaseBootIdentifier = "replacement-boot"
+    naturallyExpired.leaseExpiresUptime = 10
+    naturallyExpired.recoveryBootIdentifier = "replacement-boot"
+    naturallyExpired.recoverySafeAfterUptime = 20
+    var expiredCalls = 0
+    let expiredRouter = RouterMappingService(
+        udpTransactionHandler: {
+            _, _, _, _, _, _ in
+            expiredCalls += 1
+            throw TestFailure(
+                "Naturally expired NAT-PMP mapping needs no UDP"
+            )
+        },
+        nowProvider: { baseline.addingTimeInterval(20) },
+        monotonicUptimeProvider: { 20 },
+        bootIdentifierProvider: { "replacement-boot" }
+    )
+    let expiredReport =
+        expiredRouter.removeMappings([naturallyExpired])
+    try expect(
+        expiredCalls == 0 && expiredReport.allSucceeded,
+        "Recovery may clear only after its conservative monotonic "
+            + "natural-expiry deadline"
+    )
+}
+
+func testDeletionRequestsZeroSuggestedExternalFields() throws {
+    let baseline = Date(timeIntervalSince1970: 90_000)
+    let uptime: TimeInterval = 100
+    let boot = "delete-zero-fields"
+    let pcp = mappingFixture(transport: .pcp, family: .ipv4, suffix: 31)
+    let natPMP = trackedNATPMPFixture(
+        suffix: 32,
+        epoch: 500,
+        now: baseline,
+        uptime: uptime,
+        boot: boot
+    )
+    var requests: [Data] = []
+    let mapper = RouterMappingService(
+        udpTransactionHandler: {
+            _, _, _, sourceAddressHint, payloadBuilder, acceptsResponse in
+            let payload = try payloadBuilder(sourceAddressHint ?? "192.0.2.20")
+            requests.append(payload)
+            let response: Data
+            if payload.first == 2 {
+                response = pcpMappingResponse(for: payload)
+            } else if payload == Data([0, 0]) {
+                response = natPMPExternalAddressResponse(epoch: 500)
+            } else {
+                response = natPMPMappingResponse(
+                    for: payload,
+                    epoch: 500
+                )
+            }
+            let accepted = try acceptsResponse(response)
+            try expect(accepted, "Deletion response must match")
+            return response
+        },
+        nowProvider: { baseline },
+        monotonicUptimeProvider: { uptime },
+        bootIdentifierProvider: { boot }
+    )
+
+    let report = mapper.removeMappings([pcp, natPMP])
+    try expect(report.allSucceeded, "Both non-mirror deletion requests must succeed")
+    try expect(
+        requests.count == 3 && requests[1] == Data([0, 0]),
+        "NAT-PMP delete must be preceded by one harmless identity probe"
+    )
+
+    let pcpRequest = requests[0]
+    try expect(testReadUInt32(pcpRequest, at: 4) == 0, "PCP delete lifetime must be zero")
+    try expect(
+        testReadUInt16(pcpRequest, at: 40) == pcp.internalPort,
+        "PCP delete must retain the internal port identity"
+    )
+    try expect(
+        testReadUInt16(pcpRequest, at: 42) == 0,
+        "PCP delete suggested external port must be zero"
+    )
+    try expect(
+        pcpRequest[44..<60].allSatisfy { $0 == 0 },
+        "PCP delete suggested external address must be all zero"
+    )
+
+    let natPMPRequest = requests[2]
+    try expect(
+        testReadUInt16(natPMPRequest, at: 4) == natPMP.internalPort,
+        "NAT-PMP delete must retain the internal port identity"
+    )
+    try expect(
+        testReadUInt16(natPMPRequest, at: 6) == 0,
+        "NAT-PMP delete requested external port must be zero"
+    )
+    try expect(
+        testReadUInt32(natPMPRequest, at: 8) == 0,
+        "NAT-PMP delete lifetime must be zero"
+    )
+}
+
+func testDeletionRejectsNonzeroSuccessState() throws {
+    let baseline = Date(timeIntervalSince1970: 91_000)
+    let uptime: TimeInterval = 100
+    let boot = "delete-response-validation"
+    let pcp = mappingFixture(transport: .pcp, family: .ipv4, suffix: 33)
+    let natPMP = trackedNATPMPFixture(
+        suffix: 34,
+        epoch: 90,
+        now: baseline,
+        uptime: uptime,
+        boot: boot
+    )
+
+    let pcpMapper = RouterMappingService(
+        udpTransactionHandler: {
+            _, _, _, sourceAddressHint, payloadBuilder, _ in
+            let payload = try payloadBuilder(
+                sourceAddressHint ?? "192.0.2.33"
+            )
+            var response = pcpMappingResponse(for: payload, epoch: 90)
+            response[7] = 1
+            return response
+        }
+    )
+    let pcpReport = pcpMapper.removeMappings([pcp])
+    try expect(
+        pcpReport.remainingMappings == [pcp],
+        "A PCP success delete with nonzero lifetime must retain tracked state"
+    )
+
+    for corruption in ["external-port", "lifetime"] {
+        let natPMPMapper = RouterMappingService(
+            udpTransactionHandler: {
+                _, _, _, sourceAddressHint, payloadBuilder, _ in
+                let payload = try payloadBuilder(
+                    sourceAddressHint ?? "192.0.2.34"
+                )
+                if payload == Data([0, 0]) {
+                    return natPMPExternalAddressResponse(epoch: 90)
+                }
+                var response = natPMPMappingResponse(
+                    for: payload,
+                    epoch: 90
+                )
+                if corruption == "external-port" {
+                    response[11] = 1
+                } else {
+                    response[15] = 1
+                }
+                return response
+            },
+            nowProvider: { baseline },
+            monotonicUptimeProvider: { uptime },
+            bootIdentifierProvider: { boot }
+        )
+        let report = natPMPMapper.removeMappings([natPMP])
+        try expect(
+            report.remainingMappings == [natPMP],
+            "A NAT-PMP delete with nonzero \(corruption) must retain tracked state"
+        )
+    }
+}
+
+func testPCPResponseValidationAndRetrySchedules() throws {
+    func expectInvalid(_ operation: () throws -> Void, _ message: String) throws {
+        do {
+            try operation()
+            throw TestFailure(message)
+        } catch RouterMappingError.invalidResponse {
+            return
+        }
+    }
+
+    var nonzeroAnnounceLifetime = pcpAnnounceResponse()
+    nonzeroAnnounceLifetime[7] = 1
+    try expectInvalid(
+        {
+            _ = try PCPMessageCodec.parseAnnounceResponse(
+                nonzeroAnnounceLifetime
+            )
+        },
+        "ANNOUNCE with a nonzero lifetime must be rejected"
+    )
+    try expectInvalid(
+        {
+            _ = try PCPMessageCodec.parseAnnounceResponse(
+                Data(repeating: 0, count: 26)
+            )
+        },
+        "Misaligned ANNOUNCE must be rejected"
+    )
+    var oversizedAnnounce = Data(repeating: 0, count: 1_104)
+    oversizedAnnounce[0] = 2
+    oversizedAnnounce[1] = 0x80
+    try expectInvalid(
+        {
+            _ = try PCPMessageCodec.parseAnnounceResponse(oversizedAnnounce)
+        },
+        "Oversized ANNOUNCE must be rejected"
+    )
+
+    let nonce = Data(repeating: 7, count: 12)
+    let mapRequest = try PCPMessageCodec.makeMapRequest(
+        lifetime: 3_600,
+        clientAddress: "192.0.2.20",
+        nonce: nonce,
+        internalPort: 5_900,
+        suggestedExternalPort: 45_900
+    )
+    let validMap = pcpMappingResponse(for: mapRequest)
+    try expectInvalid(
+        {
+            _ = try PCPMessageCodec.parseMapResponse(
+                Data(validMap.prefix(58)),
+                nonce: nonce,
+                internalPort: 5_900,
+                requestedLifetime: 3_600
+            )
+        },
+        "Misaligned short MAP response must be rejected"
+    )
+    try expectInvalid(
+        {
+            _ = try PCPMessageCodec.parseMapResponse(
+                validMap + Data(repeating: 0, count: 1_044),
+                nonce: nonce,
+                internalPort: 5_900,
+                requestedLifetime: 3_600
+            )
+        },
+        "Oversized MAP response must be rejected"
+    )
+
+    let noJitter = RouterMappingService.pcpRetryIntervals(
+        maximumAttempts: 12,
+        randomizationProvider: { 0 }
+    )
+    try expect(
+        noJitter == [3, 6, 12, 24, 48, 96, 192, 384, 768, 1_024, 1_024, 1_024],
+        "PCP retry schedule must double from 3 seconds and cap at 1024"
+    )
+    let positiveJitter = RouterMappingService.pcpRetryIntervals(
+        maximumAttempts: 16,
+        randomizationProvider: { 0.1 }
+    )
+    try expect(
+        abs((positiveJitter.first ?? 0) - 3.3) < 0.000_001
+            && positiveJitter.allSatisfy { $0 <= 1_024 },
+        "PCP jitter must stay within +10% while preserving the 1024-second cap"
+    )
+
+    var defaultPCPIntervals: [TimeInterval] = []
+    var pcpConfig = automaticMappingConfig()
+    pcpConfig.mappingProtocolPreference = .pcp
+    let defaultPCP = RouterMappingService(
+        udpTransactionHandler: {
+            _, _, intervals, _, payloadBuilder, acceptsResponse in
+            defaultPCPIntervals = intervals
+            let payload = try payloadBuilder("192.0.2.20")
+            let response = pcpMappingResponse(for: payload)
+            let accepted = try acceptsResponse(response)
+            try expect(accepted, "Default PCP MAP response must match")
+            return response
+        },
+        retryRandomizationProvider: { 0 }
+    )
+    _ = try defaultPCP.ensureMapping(
+        config: pcpConfig,
+        localAddress: "192.0.2.20",
+        gatewayAddress: "192.0.2.1"
+    )
+    try expect(
+        defaultPCPIntervals == [3, 6, 12, 24, 48, 96, 192, 384, 768],
+        "Default PCP product policy must use nine RFC-shaped attempts"
+    )
+
+    var natPMPIntervals: [TimeInterval] = []
+    let natPMP = RouterMappingService(
+        udpTransactionHandler: {
+            _, _, intervals, _, payloadBuilder, acceptsResponse in
+            natPMPIntervals = intervals
+            let payload = try payloadBuilder("192.0.2.20")
+            try expect(payload == Data([0, 0]), "External Address request must be harmless")
+            let response = natPMPExternalAddressResponse(
+                address: [192, 0, 2, 53]
+            )
+            let accepted = try acceptsResponse(response)
+            try expect(accepted, "NAT-PMP response must match")
+            return response
+        }
+    )
+    let externalAddress = try natPMP.externalIPv4Address(
+        gatewayAddress: "192.0.2.1"
+    )
+    try expect(
+        externalAddress == "192.0.2.53",
+        "Default NAT-PMP capability request must succeed"
+    )
+    try expect(
+        natPMPIntervals == [0.25, 0.5, 1, 2, 4, 8, 16, 32, 64],
+        "Default NAT-PMP policy must use all nine RFC 6886 attempts"
+    )
+}
+
+func testEpochTrackingDetectsStateLossAndIsolatesKeys() throws {
+    let baseline = Date(timeIntervalSince1970: 10_000)
+    let baselineUptime: TimeInterval = 1_000
+    let bootIdentifier = "boot-epoch-tests"
+    var now = baseline.addingTimeInterval(10)
+    var uptime = baselineUptime + 10
+
+    func epochMapping(
+        transport: RouterMappingTransport,
+        gateway: String,
+        localAddress: String,
+        epoch: UInt32,
+        family: RouterMappingAddressFamily = .ipv4,
+        suffix: UInt16? = nil
+    ) -> ActiveRouterMapping {
+        var mapping = mappingFixture(
+            transport: transport,
+            family: family,
+            suffix: suffix
+                ?? UInt16(localAddress.split(separator: ".").last ?? "20")
+                ?? 20
+        )
+        mapping.gatewayAddress = gateway
+        mapping.localAddress = localAddress
+        mapping.routerEpoch = epoch
+        mapping.routerEpochObservedAt = baseline
+        mapping.routerEpochObservedUptime = baselineUptime
+        mapping.routerEpochBootIdentifier = bootIdentifier
+        mapping.routerEpochHealthCheckAfter =
+            baseline.addingTimeInterval(60)
+        return mapping
+    }
+
+    let resetPCP = epochMapping(
+        transport: .pcp,
+        gateway: "192.0.2.1",
+        localAddress: "192.0.2.20",
+        epoch: 100
+    )
+    let healthyPCP = epochMapping(
+        transport: .pcp,
+        gateway: "192.0.2.2",
+        localAddress: "192.0.2.21",
+        epoch: 200
+    )
+    let healthyNATPMP = epochMapping(
+        transport: .natpmp,
+        gateway: "192.0.2.1",
+        localAddress: "192.0.2.22",
+        epoch: 300
+    )
+
+    let mapper = RouterMappingService(
+        udpTransactionHandler: {
+            host, _, intervals, sourceAddressHint, payloadBuilder, acceptsResponse in
+            try expect(
+                intervals == [0.25, 0.5],
+                "Epoch health checks must use their independent 0.75-second budget"
+            )
+            let payload = try payloadBuilder(
+                sourceAddressHint ?? "192.0.2.22"
+            )
+            let response: Data
+            if payload.first == 2 {
+                response = pcpAnnounceResponse(
+                    epoch: host == "192.0.2.1" ? 5 : 210
+                )
+            } else {
+                response = natPMPExternalAddressResponse(epoch: 309)
+            }
+            let accepted = try acceptsResponse(response)
+            try expect(accepted, "Epoch probe response must match its protocol")
+            return response
+        },
+        nowProvider: { now },
+        monotonicUptimeProvider: { uptime },
+        bootIdentifierProvider: { bootIdentifier },
+        natPMPRebuildRandomizationProvider: { 0 },
+        rebuildDelayScheduler: { _, _ in }
+    )
+    let report = try mapper.refreshMappingEpochs([
+        resetPCP,
+        healthyPCP,
+        healthyNATPMP
+    ])
+    try expect(
+        report.invalidatedMappings == [resetPCP],
+        "PCP Epoch rollback must invalidate only its gateway/client/protocol key"
+    )
+    try expect(
+        Set(report.refreshedMappings.map(\.identifier))
+            == Set([healthyPCP.identifier, healthyNATPMP.identifier]),
+        "Healthy PCP and NAT-PMP keys must remain isolated from another reset"
+    )
+    try expect(
+        report.refreshedMappings.first {
+            $0.identifier == healthyPCP.identifier
+        }?.routerEpoch == 210,
+        "A healthy PCP observation must update its persisted Epoch baseline"
+    )
+    try expect(
+        report.refreshedMappings.first {
+            $0.identifier == healthyNATPMP.identifier
+        }?.routerEpoch == 309,
+        "A healthy NAT-PMP observation must update its persisted Epoch baseline"
+    )
+
+    let slowPCP = epochMapping(
+        transport: .pcp,
+        gateway: "192.0.2.3",
+        localAddress: "192.0.2.23",
+        epoch: 100
+    )
+    now = baseline.addingTimeInterval(100)
+    uptime = baselineUptime + 100
+    let driftMapper = RouterMappingService(
+        udpTransactionHandler: {
+            _, _, _, sourceAddressHint, payloadBuilder, _ in
+            _ = try payloadBuilder(sourceAddressHint ?? "192.0.2.23")
+            return pcpAnnounceResponse(epoch: 101)
+        },
+        nowProvider: { now },
+        monotonicUptimeProvider: { uptime },
+        bootIdentifierProvider: { bootIdentifier }
+    )
+    let driftReport = try driftMapper.refreshMappingEpochs([slowPCP])
+    try expect(
+        driftReport.invalidatedMappings == [slowPCP],
+        "RFC 6887 client/server time drift must trigger immediate recreation"
+    )
+
+    let resetNATPMP = epochMapping(
+        transport: .natpmp,
+        gateway: "192.0.2.4",
+        localAddress: "192.0.2.24",
+        epoch: 100
+    )
+    now = baseline.addingTimeInterval(16)
+    uptime = baselineUptime + 16
+    let natDriftMapper = RouterMappingService(
+        udpTransactionHandler: {
+            _, _, _, sourceAddressHint, payloadBuilder, _ in
+            _ = try payloadBuilder(sourceAddressHint ?? "192.0.2.24")
+            return natPMPExternalAddressResponse(epoch: 110)
+        },
+        nowProvider: { now },
+        monotonicUptimeProvider: { uptime },
+        bootIdentifierProvider: { bootIdentifier },
+        natPMPRebuildRandomizationProvider: { 0 },
+        rebuildDelayScheduler: { _, _ in }
+    )
+    let natDriftReport = try natDriftMapper.refreshMappingEpochs([
+        resetNATPMP
+    ])
+    try expect(
+        natDriftReport.invalidatedMappings == [resetNATPMP],
+        "RFC 6886 conservative Epoch estimate must detect NAT-PMP state loss"
+    )
+
+    now = baseline.addingTimeInterval(16)
+    var pendingResponseEpochs: [UInt32] = [1, 2]
+    let pendingMapper = RouterMappingService(
+        udpTransactionHandler: {
+            _, _, _, sourceAddressHint, payloadBuilder, _ in
+            _ = try payloadBuilder(sourceAddressHint ?? "192.0.2.24")
+            guard !pendingResponseEpochs.isEmpty else {
+                throw TestFailure("No pending Epoch response left")
+            }
+            return natPMPExternalAddressResponse(
+                epoch: pendingResponseEpochs.removeFirst()
+            )
+        },
+        nowProvider: { now },
+        monotonicUptimeProvider: { uptime },
+        bootIdentifierProvider: { bootIdentifier },
+        natPMPRebuildRandomizationProvider: { 0 },
+        rebuildDelayScheduler: { _, _ in }
+    )
+    _ = try pendingMapper.externalIPv4Address(
+        gatewayAddress: resetNATPMP.gatewayAddress
+    )
+    let pendingReport = try pendingMapper.refreshMappingEpochs([
+        resetNATPMP
+    ])
+    try expect(
+        pendingReport.invalidatedMappings == [resetNATPMP],
+        "WAN discovery before persisted-state seeding must still detect the Epoch reset"
+    )
+
+    let scopedPCP0 = epochMapping(
+        transport: .pcp,
+        gateway: "fe80::1%en0",
+        localAddress: "fe80::20",
+        epoch: 100,
+        family: .ipv6,
+        suffix: 26
+    )
+    let scopedPCP1 = epochMapping(
+        transport: .pcp,
+        gateway: "fe80::1%en1",
+        localAddress: "fe80::20",
+        epoch: 100,
+        family: .ipv6,
+        suffix: 27
+    )
+    now = baseline.addingTimeInterval(10)
+    uptime = baselineUptime + 10
+    let scopedMapper = RouterMappingService(
+        udpTransactionHandler: {
+            host, _, _, sourceAddressHint, payloadBuilder, _ in
+            _ = try payloadBuilder(sourceAddressHint ?? "fe80::20")
+            return pcpAnnounceResponse(
+                epoch: host.hasSuffix("%en0") ? 5 : 110
+            )
+        },
+        nowProvider: { now },
+        monotonicUptimeProvider: { uptime },
+        bootIdentifierProvider: { bootIdentifier }
+    )
+    let scopedReport = try scopedMapper.refreshMappingEpochs([
+        scopedPCP0,
+        scopedPCP1
+    ])
+    try expect(
+        scopedReport.invalidatedMappings == [scopedPCP0],
+        "IPv6 link-local gateway scopes must remain isolated Epoch keys"
+    )
+    try expect(
+        scopedReport.refreshedMappings.map(\.identifier)
+            == [scopedPCP1.identifier],
+        "A reset on one scoped IPv6 gateway must not invalidate another"
+    )
+
+    let concurrentMapping = epochMapping(
+        transport: .pcp,
+        gateway: "192.0.2.5",
+        localAddress: "192.0.2.25",
+        epoch: 500
+    )
+    now = baseline
+    uptime = baselineUptime
+    let concurrentMapper = RouterMappingService(
+        udpTransactionHandler: {
+            _, _, _, sourceAddressHint, payloadBuilder, _ in
+            _ = try payloadBuilder(sourceAddressHint ?? "192.0.2.25")
+            return pcpAnnounceResponse(epoch: 500)
+        },
+        nowProvider: { now },
+        monotonicUptimeProvider: { uptime },
+        bootIdentifierProvider: { bootIdentifier }
+    )
+    let group = DispatchGroup()
+    let errorLock = NSLock()
+    var concurrentErrors: [String] = []
+    for _ in 0..<32 {
+        group.enter()
+        DispatchQueue.global().async {
+            defer { group.leave() }
+            do {
+                _ = try concurrentMapper.refreshMappingEpochs([
+                    concurrentMapping
+                ])
+            } catch {
+                errorLock.lock()
+                concurrentErrors.append(error.localizedDescription)
+                errorLock.unlock()
+            }
+        }
+    }
+    try expect(
+        group.wait(timeout: .now() + 3) == .success,
+        "Concurrent Epoch observations must not deadlock"
+    )
+    try expect(
+        concurrentErrors.isEmpty,
+        "Concurrent Epoch observations must remain thread-safe"
+    )
+}
+
+func testEpochUsesMonotonicTimeAndFailsClosedAcrossPersistence() throws {
+    let baselineWall = Date(timeIntervalSince1970: 30_000)
+    let baselineUptime: TimeInterval = 1_000
+    let bootA = "boot-monotonic-a"
+    var mapping = mappingFixture(
+        transport: .pcp,
+        family: .ipv4,
+        suffix: 28
+    )
+    mapping.gatewayAddress = "192.0.2.28"
+    mapping.localAddress = "192.0.2.28"
+    mapping.routerEpoch = 100
+    mapping.routerEpochObservedAt = baselineWall
+    mapping.routerEpochObservedUptime = baselineUptime
+    mapping.routerEpochBootIdentifier = bootA
+    mapping.routerEpochHealthCheckAfter =
+        baselineWall.addingTimeInterval(60)
+
+    var wall = baselineWall.addingTimeInterval(10)
+    var uptime = baselineUptime + 10
+    var responseEpoch: UInt32 = 110
+    let mapper = RouterMappingService(
+        udpTransactionHandler: {
+            _, _, _, sourceAddressHint, payloadBuilder, _ in
+            _ = try payloadBuilder(sourceAddressHint ?? mapping.localAddress)
+            return pcpAnnounceResponse(epoch: responseEpoch)
+        },
+        nowProvider: { wall },
+        monotonicUptimeProvider: { uptime },
+        bootIdentifierProvider: { bootA }
+    )
+
+    var current = try mapper.refreshMappingEpochs([mapping])
+        .refreshedMappings[0]
+    wall = wall.addingTimeInterval(3_600)
+    uptime += 10
+    responseEpoch += 10
+    var report = try mapper.refreshMappingEpochs([current])
+    try expect(
+        report.invalidatedMappings.isEmpty,
+        "An in-process NTP forward jump must not replace monotonic elapsed time"
+    )
+    current = report.refreshedMappings[0]
+
+    wall = wall.addingTimeInterval(-7_200)
+    uptime += 10
+    responseEpoch += 10
+    report = try mapper.refreshMappingEpochs([current])
+    try expect(
+        report.invalidatedMappings.isEmpty,
+        "An in-process NTP backward jump must not become negative elapsed time"
+    )
+    current = report.refreshedMappings[0]
+
+    uptime -= 1
+    responseEpoch += 1
+    report = try mapper.refreshMappingEpochs([current])
+    try expect(
+        report.invalidatedMappings == [current],
+        "A monotonic clock rollback must fail closed"
+    )
+
+    func persistedReport(
+        wall: Date,
+        uptime: TimeInterval,
+        boot: String
+    ) throws -> RouterMappingEpochReport {
+        let fresh = RouterMappingService(
+            udpTransactionHandler: {
+                _, _, _, sourceAddressHint, payloadBuilder, _ in
+                _ = try payloadBuilder(
+                    sourceAddressHint ?? mapping.localAddress
+                )
+                return pcpAnnounceResponse(epoch: 110)
+            },
+            nowProvider: { wall },
+            monotonicUptimeProvider: { uptime },
+            bootIdentifierProvider: { boot }
+        )
+        return try fresh.refreshMappingEpochs([mapping])
+    }
+
+    let forward = try persistedReport(
+        wall: baselineWall.addingTimeInterval(3_600),
+        uptime: baselineUptime + 10,
+        boot: bootA
+    )
+    try expect(
+        forward.invalidatedMappings == [mapping],
+        "A persisted wall-clock forward jump must fail closed"
+    )
+    let backward = try persistedReport(
+        wall: baselineWall.addingTimeInterval(-10),
+        uptime: baselineUptime + 10,
+        boot: bootA
+    )
+    try expect(
+        backward.invalidatedMappings == [mapping],
+        "A persisted wall-clock backward jump must fail closed"
+    )
+    let rebooted = try persistedReport(
+        wall: baselineWall.addingTimeInterval(10),
+        uptime: 10,
+        boot: "boot-monotonic-b"
+    )
+    try expect(
+        rebooted.invalidatedMappings == [mapping],
+        "A system boot identity change must invalidate persisted router state"
+    )
+}
+
+func testNATPMPResetDelayBoundariesCancellationAndSerialization() throws {
+    let baseline = Date(timeIntervalSince1970: 40_000)
+    let bootIdentifier = "boot-natpmp-delay"
+
+    func mapping(_ suffix: UInt16) -> ActiveRouterMapping {
+        var result = mappingFixture(
+            transport: .natpmp,
+            family: .ipv4,
+            suffix: suffix
+        )
+        result.gatewayAddress = "192.0.2.40"
+        result.routerEpoch = 100
+        result.routerEpochObservedAt = baseline
+        result.routerEpochObservedUptime = 100
+        result.routerEpochBootIdentifier = bootIdentifier
+        result.routerEpochHealthCheckAfter =
+            baseline.addingTimeInterval(60)
+        return result
+    }
+
+    func runBoundary(_ randomSample: Double) throws -> [TimeInterval] {
+        var delays: [TimeInterval] = []
+        var transactionCount = 0
+        let mapper = RouterMappingService(
+            udpTransactionHandler: {
+                _, _, _, sourceAddressHint, payloadBuilder, _ in
+                transactionCount += 1
+                _ = try payloadBuilder(sourceAddressHint ?? "192.0.2.40")
+                return natPMPExternalAddressResponse(epoch: 1)
+            },
+            nowProvider: { baseline.addingTimeInterval(10) },
+            monotonicUptimeProvider: { 110 },
+            bootIdentifierProvider: { bootIdentifier },
+            natPMPRebuildRandomizationProvider: { randomSample },
+            rebuildDelayScheduler: { delay, cancelled in
+                try expect(!cancelled(), "Boundary delay must not be cancelled")
+                delays.append(delay)
+            }
+        )
+        let mappings = [mapping(40), mapping(41)]
+        let report = try mapper.refreshMappingEpochs(mappings)
+        try expect(
+            report.invalidatedMappings == mappings,
+            "Every mapping on the restarted NAT-PMP gateway must be invalidated"
+        )
+        try expect(
+            transactionCount == 2 && delays.count == 1,
+            "One gateway must be probed serially and delayed exactly once before rebuild"
+        )
+        return delays
+    }
+
+    let zeroBoundary = try runBoundary(0)
+    try expect(
+        zeroBoundary == [0],
+        "The RFC 6886 rebuild delay must support the zero-second boundary"
+    )
+    let fiveBoundary = try runBoundary(1)
+    try expect(
+        fiveBoundary == [5],
+        "The RFC 6886 rebuild delay must support the five-second boundary"
+    )
+
+    let cancelledMapper = RouterMappingService(
+        udpTransactionHandler: {
+            _, _, _, sourceAddressHint, payloadBuilder, _ in
+            _ = try payloadBuilder(sourceAddressHint ?? "192.0.2.40")
+            return natPMPExternalAddressResponse(epoch: 1)
+        },
+        nowProvider: { baseline.addingTimeInterval(10) },
+        monotonicUptimeProvider: { 110 },
+        bootIdentifierProvider: { bootIdentifier },
+        cancellationHandler: { true },
+        natPMPRebuildRandomizationProvider: { 1 },
+        rebuildDelayScheduler: { _, cancelled in
+            if cancelled() {
+                throw RouterMappingError.cancelled
+            }
+        }
+    )
+    do {
+        _ = try cancelledMapper.refreshMappingEpochs([mapping(42)])
+        throw TestFailure("Cancelled NAT-PMP rebuild delay must abort")
+    } catch RouterMappingError.cancelled {
+        // Expected.
+    }
+
+    var pcpDelayCount = 0
+    var pcp = mappingFixture(
+        transport: .pcp,
+        family: .ipv4,
+        suffix: 43
+    )
+    pcp.gatewayAddress = "192.0.2.43"
+    pcp.localAddress = "192.0.2.43"
+    pcp.routerEpoch = 100
+    pcp.routerEpochObservedAt = baseline
+    pcp.routerEpochObservedUptime = 100
+    pcp.routerEpochBootIdentifier = bootIdentifier
+    let pcpMapper = RouterMappingService(
+        udpTransactionHandler: {
+            _, _, _, sourceAddressHint, payloadBuilder, _ in
+            _ = try payloadBuilder(sourceAddressHint ?? pcp.localAddress)
+            return pcpAnnounceResponse(epoch: 1)
+        },
+        nowProvider: { baseline.addingTimeInterval(10) },
+        monotonicUptimeProvider: { 110 },
+        bootIdentifierProvider: { bootIdentifier },
+        rebuildDelayScheduler: { _, _ in pcpDelayCount += 1 }
+    )
+    _ = try pcpMapper.refreshMappingEpochs([pcp])
+    try expect(
+        pcpDelayCount == 0,
+        "NAT-PMP rebuild delay must not be applied to a solicited PCP health probe"
+    )
+}
+
+func testTransactionInjectionIgnoresBadDatagramsAndAcceptsLateResponse() throws {
+    let config = automaticMappingConfig()
+    var transactionCalls = 0
+    var mapPayloadBuilds = 0
+    let mapper = RouterMappingService(
+        udpTransactionHandler: {
+            _, _, intervals, sourceAddressHint, payloadBuilder, acceptsResponse in
+            transactionCalls += 1
+            let payload = try payloadBuilder(sourceAddressHint ?? "192.0.2.20")
+            if payload.count == 24 {
+                let response = pcpAnnounceResponse()
+                let accepted = try acceptsResponse(response)
+                try expect(accepted, "ANNOUNCE must match")
+                return response
+            }
+
+            mapPayloadBuilds += 1
+            try expect(intervals.count == 2, "MAP must expose the complete retry budget once")
+            let acceptedDamaged = try acceptsResponse(Data([2, 0]))
+            try expect(
+                !acceptedDamaged,
+                "A damaged datagram must be ignored"
+            )
+            var mismatched = pcpMappingResponse(for: payload)
+            mismatched[24] ^= 0xff
+            let acceptedMismatched = try acceptsResponse(mismatched)
+            try expect(
+                !acceptedMismatched,
+                "A response for another Mapping Nonce must be ignored"
+            )
+            let lateResponse = pcpMappingResponse(for: payload)
+            let acceptedLate = try acceptsResponse(lateResponse)
+            try expect(
+                acceptedLate,
+                "A late matching response must be accepted within the transaction"
+            )
+            return lateResponse
+        },
+        retryRandomizationProvider: { 0 },
+        retryPolicy: automaticTestRetryPolicy()
+    )
+
+    let result = try mapper.ensureMapping(
+        config: config,
+        localAddress: "192.0.2.20",
+        gatewayAddress: "192.0.2.1"
+    )
+    try expect(result.activeMapping.transport == .pcp, "Late PCP response must succeed")
+    try expect(
+        transactionCalls == 2 && mapPayloadBuilds == 1,
+        "ANNOUNCE and MAP must each use one transaction/socket-level injection"
+    )
+}
+
+func testRealUDPTransactionReusesSourcePortAndAcceptsLateResponse() throws {
+    let serverFD = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
+    guard serverFD >= 0 else {
+        throw TestFailure("Could not create loopback UDP server")
+    }
+    defer { close(serverFD) }
+
+    var receiveTimeout = timeval(tv_sec: 2, tv_usec: 0)
+    guard setsockopt(
+        serverFD,
+        SOL_SOCKET,
+        SO_RCVTIMEO,
+        &receiveTimeout,
+        socklen_t(MemoryLayout<timeval>.size)
+    ) == 0 else {
+        throw TestFailure("Could not set loopback UDP receive timeout")
+    }
+
+    var serverAddress = sockaddr_in()
+    serverAddress.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+    serverAddress.sin_family = sa_family_t(AF_INET)
+    serverAddress.sin_port = 0
+    guard "127.0.0.1".withCString({
+        inet_pton(AF_INET, $0, &serverAddress.sin_addr)
+    }) == 1 else {
+        throw TestFailure("Could not encode loopback server address")
+    }
+    let bindStatus = withUnsafePointer(to: &serverAddress) { pointer in
+        pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+            bind(
+                serverFD,
+                $0,
+                socklen_t(MemoryLayout<sockaddr_in>.size)
+            )
+        }
+    }
+    guard bindStatus == 0 else {
+        throw TestFailure(
+            "Could not bind loopback UDP server: \(String(cString: strerror(errno)))"
+        )
+    }
+
+    var boundAddress = sockaddr_in()
+    var boundLength = socklen_t(MemoryLayout<sockaddr_in>.size)
+    let nameStatus = withUnsafeMutablePointer(to: &boundAddress) { pointer in
+        pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+            getsockname(serverFD, $0, &boundLength)
+        }
+    }
+    guard nameStatus == 0 else {
+        throw TestFailure("Could not read loopback UDP server port")
+    }
+    let serverPort = UInt16(bigEndian: boundAddress.sin_port)
+
+    func receiveDatagram() throws -> (Data, sockaddr_in) {
+        var buffer = [UInt8](repeating: 0, count: 2_048)
+        var source = sockaddr_in()
+        var sourceLength = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let count = buffer.withUnsafeMutableBytes { bytes in
+            withUnsafeMutablePointer(to: &source) { pointer in
+                pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    recvfrom(
+                        serverFD,
+                        bytes.baseAddress,
+                        bytes.count,
+                        0,
+                        $0,
+                        &sourceLength
+                    )
+                }
+            }
+        }
+        guard count > 0 else {
+            throw TestFailure("Loopback UDP server timed out waiting for a datagram")
+        }
+        return (Data(buffer.prefix(count)), source)
+    }
+
+    func sendDatagram(_ data: Data, to destination: sockaddr_in) throws {
+        var destination = destination
+        let count = data.withUnsafeBytes { bytes in
+            withUnsafePointer(to: &destination) { pointer in
+                pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    sendto(
+                        serverFD,
+                        bytes.baseAddress,
+                        bytes.count,
+                        0,
+                        $0,
+                        socklen_t(MemoryLayout<sockaddr_in>.size)
+                    )
+                }
+            }
+        }
+        guard count == data.count else {
+            throw TestFailure("Loopback UDP server could not send a complete datagram")
+        }
+    }
+
+    let serverFinished = DispatchSemaphore(value: 0)
+    var serverError: Error?
+    var selectedSourceAddress: String?
+    var firstMAPSourcePort: in_port_t?
+    var secondMAPSourcePort: in_port_t?
+    DispatchQueue(label: "GatebeamTests.PCPLoopback").async {
+        defer { serverFinished.signal() }
+        do {
+            let (announce, announceSource) = try receiveDatagram()
+            guard announce.count == 24 else {
+                throw TestFailure("First PCP datagram must be ANNOUNCE")
+            }
+            selectedSourceAddress = PCPMessageCodec.addressString(
+                Data(announce[8..<24])
+            )
+            try sendDatagram(pcpAnnounceResponse(), to: announceSource)
+
+            let (firstMAP, firstMAPSource) = try receiveDatagram()
+            guard firstMAP.count == 60 else {
+                throw TestFailure("Second PCP datagram must be MAP")
+            }
+            firstMAPSourcePort = firstMAPSource.sin_port
+            try sendDatagram(Data([2, 0]), to: firstMAPSource)
+            var mismatched = pcpMappingResponse(for: firstMAP)
+            mismatched[24] ^= 0xff
+            try sendDatagram(mismatched, to: firstMAPSource)
+
+            let (secondMAP, secondMAPSource) = try receiveDatagram()
+            secondMAPSourcePort = secondMAPSource.sin_port
+            guard secondMAP == firstMAP else {
+                throw TestFailure("PCP retransmission must preserve the exact MAP payload")
+            }
+            try sendDatagram(
+                pcpMappingResponse(for: secondMAP),
+                to: secondMAPSource
+            )
+        } catch {
+            serverError = error
+        }
+    }
+
+    var config = automaticMappingConfig()
+    config.mappingProtocolPreference = .automatic
+    let mapper = RouterMappingService(
+        retryRandomizationProvider: { 0 },
+        retryPolicy: RouterMappingRetryPolicy(
+            pcpMaximumAttempts: 2,
+            natPMPMaximumAttempts: 1,
+            pcpInitialRetryInterval: 0.05
+        ),
+        routerControlPort: serverPort
+    )
+    let result = try mapper.ensureMapping(
+        config: config,
+        localAddress: "192.0.2.20",
+        gatewayAddress: "127.0.0.1"
+    )
+    guard serverFinished.wait(timeout: .now() + 3) == .success else {
+        throw TestFailure("Loopback PCP server did not finish")
+    }
+    if let serverError {
+        throw serverError
+    }
+    try expect(
+        result.activeMapping.transport == .pcp,
+        "A late matching PCP response must complete the real transaction"
+    )
+    try expect(
+        selectedSourceAddress == "127.0.0.1",
+        "PCP payload must use the source address selected by connect/getsockname"
+    )
+    try expect(
+        result.activeMapping.localAddress == "127.0.0.1"
+            && result.activeMapping.routerEpochObservedUptime != nil
+            && result.activeMapping.routerEpochBootIdentifier?.isEmpty == false
+            && result.activeMapping.routerEpochHealthCheckAfter != nil,
+        "The real transport must persist effective identity and complete Epoch clock metadata"
+    )
+    try expect(
+        firstMAPSourcePort != nil && firstMAPSourcePort == secondMAPSourcePort,
+        "PCP retransmissions must reuse the same UDP socket and source port"
+    )
+
+    let sendStarted = DispatchSemaphore(value: 0)
+    let cancelledFinished = DispatchSemaphore(value: 0)
+    var cancellationOperations = RouterMappingUDPSocketOperations.system
+    cancellationOperations.sendDatagram = { socketFD, bytes, count in
+        let result = Darwin.send(socketFD, bytes, count, 0)
+        if result == count {
+            sendStarted.signal()
+        }
+        return result
+    }
+    let cancellationMapper = RouterMappingService(
+        retryRandomizationProvider: { 0 },
+        retryPolicy: RouterMappingRetryPolicy(
+            pcpMaximumAttempts: 9,
+            natPMPMaximumAttempts: 9,
+            pcpInitialRetryInterval: 3
+        ),
+        routerControlPort: serverPort,
+        socketOperations: cancellationOperations
+    )
+    config.mappingProtocolPreference = .pcp
+    DispatchQueue(label: "GatebeamTests.PCPCancellation").async {
+        defer { cancelledFinished.signal() }
+        _ = try? cancellationMapper.ensureMapping(
+            config: config,
+            localAddress: "192.0.2.20",
+            gatewayAddress: "127.0.0.1"
+        )
+    }
+    guard sendStarted.wait(timeout: .now() + 2) == .success else {
+        throw TestFailure("Cancellation test did not enter real send/poll")
+    }
+    let cancellationStartedAt = ProcessInfo.processInfo.systemUptime
+    cancellationMapper.cancelCurrentOperations()
+    try expect(
+        cancelledFinished.wait(timeout: .now() + 0.75) == .success,
+        "Cancellation must interrupt recv/backoff without waiting for PCP RTO"
+    )
+    try expect(
+        ProcessInfo.processInfo.systemUptime - cancellationStartedAt < 0.75,
+        "Cancellation must return within the short cooperative bound"
+    )
+}
+
+func testRealIPv6PCPPayloadUsesConnectedSourceAddress() throws {
+    let serverFD = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP)
+    guard serverFD >= 0 else {
+        throw TestFailure("Could not create IPv6 loopback UDP server")
+    }
+    defer { close(serverFD) }
+
+    var receiveTimeout = timeval(tv_sec: 2, tv_usec: 0)
+    guard setsockopt(
+        serverFD,
+        SOL_SOCKET,
+        SO_RCVTIMEO,
+        &receiveTimeout,
+        socklen_t(MemoryLayout<timeval>.size)
+    ) == 0 else {
+        throw TestFailure("Could not set IPv6 loopback receive timeout")
+    }
+
+    var serverAddress = sockaddr_in6()
+    serverAddress.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
+    serverAddress.sin6_family = sa_family_t(AF_INET6)
+    serverAddress.sin6_port = 0
+    guard "::1".withCString({
+        inet_pton(AF_INET6, $0, &serverAddress.sin6_addr)
+    }) == 1 else {
+        throw TestFailure("Could not encode IPv6 loopback address")
+    }
+    let bindStatus = withUnsafePointer(to: &serverAddress) { pointer in
+        pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+            bind(
+                serverFD,
+                $0,
+                socklen_t(MemoryLayout<sockaddr_in6>.size)
+            )
+        }
+    }
+    guard bindStatus == 0 else {
+        throw TestFailure(
+            "Could not bind IPv6 loopback UDP server: "
+                + String(cString: strerror(errno))
+        )
+    }
+
+    var boundAddress = sockaddr_in6()
+    var boundLength = socklen_t(MemoryLayout<sockaddr_in6>.size)
+    let nameStatus = withUnsafeMutablePointer(to: &boundAddress) { pointer in
+        pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+            getsockname(serverFD, $0, &boundLength)
+        }
+    }
+    guard nameStatus == 0 else {
+        throw TestFailure("Could not read IPv6 loopback UDP server port")
+    }
+    let serverPort = UInt16(bigEndian: boundAddress.sin6_port)
+
+    let serverFinished = DispatchSemaphore(value: 0)
+    var serverError: Error?
+    var payloadSourceAddress: String?
+    var sourceFamily: sa_family_t?
+    var usedIPv4MappedEncoding = false
+    DispatchQueue(label: "GatebeamTests.PCPIPv6Loopback").async {
+        defer { serverFinished.signal() }
+        do {
+            var buffer = [UInt8](repeating: 0, count: 2_048)
+            var source = sockaddr_in6()
+            var sourceLength = socklen_t(MemoryLayout<sockaddr_in6>.size)
+            let count = buffer.withUnsafeMutableBytes { bytes in
+                withUnsafeMutablePointer(to: &source) { pointer in
+                    pointer.withMemoryRebound(
+                        to: sockaddr.self,
+                        capacity: 1
+                    ) {
+                        recvfrom(
+                            serverFD,
+                            bytes.baseAddress,
+                            bytes.count,
+                            0,
+                            $0,
+                            &sourceLength
+                        )
+                    }
+                }
+            }
+            guard count == 60 else {
+                throw TestFailure("IPv6 PCP server expected one MAP datagram")
+            }
+            let request = Data(buffer.prefix(count))
+            let addressBytes = Data(request[8..<24])
+            payloadSourceAddress = PCPMessageCodec.addressString(addressBytes)
+            sourceFamily = source.sin6_family
+            usedIPv4MappedEncoding =
+                addressBytes[0..<10].allSatisfy { $0 == 0 }
+                && addressBytes[10] == 0xff
+                && addressBytes[11] == 0xff
+
+            let response = pcpMappingResponse(for: request, epoch: 50)
+            let sent = response.withUnsafeBytes { bytes in
+                withUnsafePointer(to: &source) { pointer in
+                    pointer.withMemoryRebound(
+                        to: sockaddr.self,
+                        capacity: 1
+                    ) {
+                        sendto(
+                            serverFD,
+                            bytes.baseAddress,
+                            bytes.count,
+                            0,
+                            $0,
+                            sourceLength
+                        )
+                    }
+                }
+            }
+            guard sent == response.count else {
+                throw TestFailure("IPv6 PCP server could not send response")
+            }
+        } catch {
+            serverError = error
+        }
+    }
+
+    var config = automaticMappingConfig()
+    config.mappingProtocolPreference = .pcp
+    config.preferredAddressFamily = .ipv6
+    let mapper = RouterMappingService(
+        retryRandomizationProvider: { 0 },
+        retryPolicy: RouterMappingRetryPolicy(
+            pcpMaximumAttempts: 2,
+            natPMPMaximumAttempts: 1,
+            pcpInitialRetryInterval: 0.05
+        ),
+        routerControlPort: serverPort
+    )
+    let result = try mapper.ensureIPv6Pinhole(
+        config: config,
+        localAddress: "2001:db8::20",
+        gatewayAddress: "::1"
+    )
+    guard serverFinished.wait(timeout: .now() + 3) == .success else {
+        throw TestFailure("IPv6 loopback PCP server did not finish")
+    }
+    if let serverError {
+        throw serverError
+    }
+    try expect(
+        result.activeMapping.transport == .pcp,
+        "Real IPv6 PCP MAP must succeed"
+    )
+    try expect(
+        sourceFamily == sa_family_t(AF_INET6),
+        "Real PCP datagram must originate from an IPv6 socket"
+    )
+    try expect(
+        payloadSourceAddress == "::1" && !usedIPv4MappedEncoding,
+        "PCP payload must contain the native IPv6 source selected by getsockname"
+    )
+    try expect(
+        result.activeMapping.localAddress == "::1",
+        "The real IPv6 mapping identity must use the getsockname source"
+    )
 }
 
 func testIPv6PinholeRenewalPreservesOldIDUnlessExplicitlyMissing() throws {
@@ -852,7 +4539,9 @@ func testIPv6PinholeRenewalPreservesOldIDUnlessExplicitlyMissing() throws {
         controlURL: controlURL,
         gatewayIdentity: gateway,
         descriptionURL: URL(string: "http://192.0.2.1:5000/rootDesc.xml")!,
-        deviceIdentity: "uuid:gatebeam-renew-router"
+        deviceIdentity: "uuid:gatebeam-renew-router",
+        ssdpBootID: "301",
+        ssdpConfigID: "13"
     )
     var config = AppConfig.default
     config.mappingProtocolPreference = .upnp
@@ -965,10 +4654,7 @@ func testTemporaryAccessCapsEveryRouterLease() throws {
     let pcp = RouterMappingService(
         udpRequestHandler: { payload, _, _, _ in
             pcpLease = uint32(payload, at: 4)
-            var reply = payload
-            reply[1] = 0x81
-            reply[3] = 0
-            return reply
+            return pcpMappingResponse(for: payload)
         },
         nowProvider: { now }
     )
@@ -1070,7 +4756,9 @@ func testTemporaryAccessCapsEveryRouterLease() throws {
         controlURL: URL(string: "http://192.0.2.1:5000/upnp/control/IPv6Firewall1")!,
         gatewayIdentity: "192.0.2.1",
         descriptionURL: URL(string: "http://192.0.2.1:5000/rootDesc.xml")!,
-        deviceIdentity: "uuid:lease-router"
+        deviceIdentity: "uuid:lease-router",
+        ssdpBootID: "401",
+        ssdpConfigID: "17"
     )
     var upnpIPv6Lease: UInt32?
     var upnp6Config = base
@@ -1192,6 +4880,11 @@ func testTemporaryAccessRejectsMappingsCompletedPastAbsoluteDeadline() throws {
     var natCleanup: [ActiveRouterMapping] = []
     let natpmp = RouterMappingService(
         udpRequestHandler: { request, _, _, _ in
+            if request == Data([0, 0]) {
+                return natPMPExternalAddressResponse(
+                    address: [192, 0, 2, 53]
+                )
+            }
             natNow = deadline.addingTimeInterval(1)
             var reply = natPMPDeletionResponse(for: request)
             reply[12] = request[8]
@@ -1283,7 +4976,9 @@ func testTemporaryAccessRejectsMappingsCompletedPastAbsoluteDeadline() throws {
         controlURL: URL(string: "http://192.0.2.1:5000/upnp/control/IPv6Firewall1")!,
         gatewayIdentity: gateway,
         descriptionURL: URL(string: "http://192.0.2.1:5000/rootDesc.xml")!,
-        deviceIdentity: "uuid:absolute-deadline-router"
+        deviceIdentity: "uuid:absolute-deadline-router",
+        ssdpBootID: "501",
+        ssdpConfigID: "19"
     )
     var upnp6Now = start
     var upnp6Cleanup: [ActiveRouterMapping] = []
@@ -1624,14 +5319,19 @@ func testLegacyAutomaticRemovalUsesStrictProtocolOrder() throws {
         }
     )
     let pcpOnlyReport = remove(using: pcpOnly)
-    try expect(pcpOnlyReport.allSucceeded, "Confirmed UDP deletions and a missing UPnP rule must close legacy Automatic")
     try expect(
-        pcpOnlyReport.succeededMappings.map(\.transport) == [.pcp, .natpmp],
-        "Automatic cleanup must retain every exact successful protocol"
+        !pcpOnlyReport.allSucceeded,
+        "Legacy NAT-PMP without persisted Epoch identity must remain"
     )
     try expect(
-        pcpOnlyActions == ["PCP", "NAT-PMP"],
-        "A PCP delete response has no ownership proof, so NAT-PMP must still be attempted"
+        pcpOnlyReport.succeededMappings.map(\.transport) == [.pcp]
+            && pcpOnlyReport.remainingMappings.map(\.transport)
+                == [.natpmp],
+        "Automatic cleanup must retain only the unproven NAT-PMP identity"
+    )
+    try expect(
+        pcpOnlyActions == ["PCP"],
+        "Legacy NAT-PMP must not send a delete without Epoch proof"
     )
     try expect(
         pcpOnlyDiscoveryCount == 1,
@@ -1659,14 +5359,19 @@ func testLegacyAutomaticRemovalUsesStrictProtocolOrder() throws {
         }
     )
     let natPMPReport = remove(using: natPMPOnly)
-    try expect(natPMPReport.allSucceeded, "A confirmed NAT-PMP deletion plus a missing UPnP rule must close legacy Automatic")
     try expect(
-        natPMPReport.succeededMappings.map(\.transport) == [.natpmp],
-        "NAT-PMP-only cleanup must retain the exact successful protocol"
+        !natPMPReport.allSucceeded,
+        "A legacy NAT-PMP rule without Epoch proof must fail closed"
     )
     try expect(
-        natPMPActions == ["PCP unsupported", "NAT-PMP"],
-        "Automatic must try NAT-PMP after conclusive PCP unsupported"
+        natPMPReport.succeededMappings.isEmpty
+            && natPMPReport.remainingMappings.map(\.transport)
+                == [.natpmp],
+        "NAT-PMP-only cleanup must retain the unknown legacy identity"
+    )
+    try expect(
+        natPMPActions == ["PCP unsupported"],
+        "Conclusive PCP unsupported must not authorize a NAT-PMP delete"
     )
     try expect(
         natPMPDiscoveryCount == 1,
@@ -1715,14 +5420,19 @@ func testLegacyAutomaticRemovalUsesStrictProtocolOrder() throws {
         }
     )
     let upnpReport = remove(using: upnpOnly)
-    try expect(upnpReport.allSucceeded, "An exactly matched legacy UPnP rule must be deleted")
     try expect(
-        upnpReport.succeededMappings.map(\.transport) == [.upnp],
-        "UPnP-only cleanup must retain the exact successful protocol"
+        !upnpReport.allSucceeded,
+        "Matched UPnP cleanup must not erase unknown NAT-PMP recovery"
     )
     try expect(
-        upnpUDPActions == ["PCP unsupported", "NAT-PMP unsupported"],
-        "UPnP must run only after both UDP protocols are conclusively unsupported"
+        upnpReport.succeededMappings.map(\.transport) == [.upnp]
+            && upnpReport.remainingMappings.map(\.transport)
+                == [.natpmp],
+        "UPnP cleanup must retain only the unproven NAT-PMP identity"
+    )
+    try expect(
+        upnpUDPActions == ["PCP unsupported"],
+        "UPnP cleanup must not issue an unproven NAT-PMP delete first"
     )
     try expect(
         upnpSOAPActions == [
@@ -1756,8 +5466,9 @@ func testLegacyAutomaticRemovalUsesStrictProtocolOrder() throws {
     let foreignReport = remove(using: foreignRule)
     try expect(!foreignReport.allSucceeded, "A foreign UPnP rule must make cleanup fail closed")
     try expect(
-        foreignReport.remainingMappings.map(\.transport) == [.upnp],
-        "A foreign UPnP rule must retain only the bound UPnP recovery identity"
+        foreignReport.remainingMappings.map(\.transport)
+            == [.natpmp, .upnp],
+        "A foreign UPnP rule must retain both unknown NAT-PMP and bound UPnP recovery identities"
     )
     try expect(
         foreignActions == ["GetSpecificPortMappingEntry"],
@@ -1779,8 +5490,10 @@ func testLegacyAutomaticRemovalUsesStrictProtocolOrder() throws {
     )
     let unsupportedReport = remove(using: unsupported)
     try expect(
-        unsupportedReport.allSucceeded && unsupportedReport.attempts.isEmpty,
-        "Unsupported UDP protocols followed by no UPnP entry must close idempotently"
+        !unsupportedReport.allSucceeded
+            && unsupportedReport.remainingMappings.map(\.transport)
+                == [.natpmp],
+        "Legacy NAT-PMP without Epoch proof must remain even when PCP is unsupported and UPnP is absent"
     )
     try expect(
         unsupportedActions == ["GetSpecificPortMappingEntry"],
@@ -1810,16 +5523,17 @@ func testLegacyAutomaticRemovalUsesStrictProtocolOrder() throws {
     let uncertainPCPReport = remove(using: uncertainPCP)
     try expect(!uncertainPCPReport.allSucceeded, "Uncertain PCP deletion must fail closed")
     try expect(
-        uncertainPCPReport.remainingMappings.map(\.transport) == [.pcp],
-        "Uncertain PCP deletion must retain only the PCP recovery identity"
+        uncertainPCPReport.remainingMappings.map(\.transport)
+            == [.pcp, .natpmp],
+        "Uncertain PCP deletion must also retain unknown legacy NAT-PMP"
     )
     try expect(
-        uncertainPCPReport.succeededMappings.map(\.transport) == [.natpmp],
-        "A later confirmed cleanup must remain recorded beside the exact PCP uncertainty"
+        uncertainPCPReport.succeededMappings.isEmpty,
+        "Unknown legacy NAT-PMP must not be reported as deleted"
     )
     try expect(
-        uncertainPCPActions == ["PCP uncertain", "NAT-PMP"],
-        "Uncertain PCP cleanup must not suppress independent NAT-PMP cleanup"
+        uncertainPCPActions == ["PCP uncertain"],
+        "Uncertain PCP cleanup must not authorize legacy NAT-PMP deletion"
     )
     try expect(uncertainPCPDiscoveryCount == 1, "Uncertain PCP cleanup must not suppress the UPnP ownership check")
 
@@ -1850,8 +5564,8 @@ func testLegacyAutomaticRemovalUsesStrictProtocolOrder() throws {
         "Uncertain NAT-PMP deletion must retain only the NAT-PMP recovery identity"
     )
     try expect(
-        uncertainNATPMPActions == ["PCP unsupported", "NAT-PMP uncertain"],
-        "NAT-PMP uncertainty must remain exact after conclusive PCP unsupported"
+        uncertainNATPMPActions == ["PCP unsupported"],
+        "Legacy NAT-PMP must fail before any state-changing request"
     )
     try expect(
         uncertainNATPMPDiscoveryCount == 1,
@@ -1891,8 +5605,9 @@ func testLegacyAutomaticRemovalUsesStrictProtocolOrder() throws {
     let discoveryFailureReport = remove(using: discoveryFailure)
     try expect(!discoveryFailureReport.allSucceeded, "UPnP discovery timeout must remain unknown")
     try expect(
-        discoveryFailureReport.remainingMappings.map(\.transport) == [.upnp],
-        "UPnP discovery timeout must retain a manual-recovery identity"
+        discoveryFailureReport.remainingMappings.map(\.transport)
+            == [.natpmp, .upnp],
+        "UPnP discovery timeout must retain both NAT-PMP and UPnP recovery identities"
     )
     try expect(discoveryFailureCalls == 1, "UPnP discovery must be attempted exactly once")
 
@@ -1933,12 +5648,13 @@ func testLegacyAutomaticRemovalUsesStrictProtocolOrder() throws {
         "Partial cleanup must retain the confirmed IPv4 deletion"
     )
     try expect(
-        partialReport.remainingMappings.map(\.addressFamily) == [.ipv6],
-        "Partial cleanup must preserve only the uncertain IPv6 identity"
+        partialReport.remainingMappings.map(\.addressFamily)
+            == [.ipv4, .ipv6],
+        "Partial cleanup must preserve unknown IPv4 NAT-PMP and uncertain IPv6 identities"
     )
     try expect(
-        dualStackActions == ["IPv4 PCP", "IPv4 NAT-PMP unsupported", "IPv6 PCP uncertain"],
-        "Dual-stack cleanup must finish every independent IPv4 candidate before retaining the IPv6 uncertainty"
+        dualStackActions == ["IPv4 PCP", "IPv6 PCP uncertain"],
+        "Dual-stack cleanup must skip unproven legacy NAT-PMP deletion"
     )
 
     var ipv6AutomaticConfig = config
@@ -2106,6 +5822,8 @@ func testUPnPUncertainAddRecoveryQueriesBeforeDelete() throws {
 
 func testUPnPAddResponseLossPreservesFiniteRecoveryState() throws {
     var now = Date(timeIntervalSince1970: 2_000_100_000)
+    var uptime: TimeInterval = 100
+    let bootIdentifier = "upnp-response-loss-boot"
     let gateway = "192.0.2.1"
     let ipv4Service = UPnPService(
         serviceType: "urn:schemas-upnp-org:service:WANIPConnection:1",
@@ -2127,7 +5845,9 @@ func testUPnPAddResponseLossPreservesFiniteRecoveryState() throws {
             try expect(action == "AddPortMapping", "Response-loss fixture must stop after AddPortMapping")
             throw RouterMappingError.timeout("Injected AddPortMapping response loss")
         },
-        nowProvider: { now }
+        nowProvider: { now },
+        monotonicUptimeProvider: { uptime },
+        bootIdentifierProvider: { bootIdentifier }
     )
     do {
         _ = try ipv4Mapper.ensureMapping(
@@ -2154,7 +5874,9 @@ func testUPnPAddResponseLossPreservesFiniteRecoveryState() throws {
         controlURL: URL(string: "http://192.0.2.1:5000/upnp/control/IPv6Firewall1")!,
         gatewayIdentity: gateway,
         descriptionURL: URL(string: "http://192.0.2.1:5000/rootDesc.xml")!,
-        deviceIdentity: "uuid:response-loss-router"
+        deviceIdentity: "uuid:response-loss-router",
+        ssdpBootID: "601",
+        ssdpConfigID: "23"
     )
     var ipv6Config = config
     ipv6Config.preferredAddressFamily = .ipv6
@@ -2175,7 +5897,9 @@ func testUPnPAddResponseLossPreservesFiniteRecoveryState() throws {
                 throw TestFailure("Unexpected IPv6 response-loss action \(action)")
             }
         },
-        nowProvider: { now }
+        nowProvider: { now },
+        monotonicUptimeProvider: { uptime },
+        bootIdentifierProvider: { bootIdentifier }
     )
     let unknownExposure: ActiveRouterMapping
     do {
@@ -2198,6 +5922,7 @@ func testUPnPAddResponseLossPreservesFiniteRecoveryState() throws {
         "Unknown IPv6 exposure must block cleanup completion before its lease expires"
     )
     now = unknownExposure.leaseExpiresAt.addingTimeInterval(1)
+    uptime = (unknownExposure.leaseExpiresUptime ?? uptime) + 1
     try expect(
         ipv6Mapper.removeMappings([unknownExposure]).allSucceeded,
         "Unknown IPv6 exposure must clear idempotently after its finite lease expires"
@@ -2210,6 +5935,12 @@ func testIPv6ScopedSSDPAllowsSameUDNDualStackControlURL() throws {
     let controlURL = URL(string: "http://192.0.2.1:5000/upnp/control/IPv6Firewall1")!
     let deviceIdentity = "uuid:dual-stack-igd"
     let serviceType = "urn:schemas-upnp-org:service:WANIPv6FirewallControl:1"
+    let bootIDHeader = ["BOOTID", "UPNP", "ORG"].joined(
+        separator: "."
+    )
+    let configIDHeader = ["CONFIGID", "UPNP", "ORG"].joined(
+        separator: "."
+    )
     let description = Data("""
     <root>
       <device>
@@ -2243,6 +5974,8 @@ func testIPv6ScopedSSDPAllowsSameUDNDualStackControlURL() throws {
                 """)
             case "AddPinhole":
                 return response("<response><UniqueID>77</UniqueID></response>")
+            case "UpdatePinhole":
+                return response("")
             case "DeletePinhole":
                 return response("")
             default:
@@ -2255,6 +5988,8 @@ func testIPv6ScopedSSDPAllowsSameUDNDualStackControlURL() throws {
             HTTP/1.1 200 OK\r
             LOCATION: \(descriptionURL.absoluteString)\r
             USN: \(deviceIdentity)::urn:schemas-upnp-org:device:InternetGatewayDevice:2\r
+            \(bootIDHeader): 701\r
+            \(configIDHeader): 29\r
             ST: \(serviceType)\r
             \r
             """.utf8)]
@@ -2269,6 +6004,7 @@ func testIPv6ScopedSSDPAllowsSameUDNDualStackControlURL() throws {
         localAddress: "2606:4700:4700::20",
         gatewayAddress: gateway
     )
+    config.ipv6PinholeID = result.pinholeID
     try expect(searches.count == 1, "IPv6 pinhole creation must perform one scoped SSDP search")
     try expect(searches[0].addressFamily == .ipv6, "IPv6 firewall discovery must use an IPv6 socket")
     try expect(searches[0].host.lowercased() == "ff02::c", "IPv6 SSDP must target FF02::C")
@@ -2279,12 +6015,269 @@ func testIPv6ScopedSSDPAllowsSameUDNDualStackControlURL() throws {
         },
         "Every IPv6 SSDP request must carry the scoped multicast Host header"
     )
+    let renewed = try mapper.renewMapping(
+        config: config,
+        mapping: result.activeMapping
+    )
+    try expect(
+        renewed.pinholeID == result.pinholeID,
+        "Matching SSDP BOOTID/CONFIGID must permit an ID-only UpdatePinhole"
+    )
     try expect(
         mapper.removeMappings([result.activeMapping]).allSucceeded,
         "A same-UDN dual-stack control URL must remain bound for exact deletion"
     )
-    try expect(searches.count == 1, "Deletion must use persisted IGD identity without rediscovery")
-    try expect(actions == ["GetFirewallStatus", "AddPinhole", "DeletePinhole"], "IPv6 lifecycle actions must stay ordered")
+    try expect(
+        searches.count == 3,
+        "IPv6 ID-only renewal and deletion must each rediscover the persisted SSDP identity"
+    )
+    try expect(
+        actions == [
+            "GetFirewallStatus",
+            "AddPinhole",
+            "GetFirewallStatus",
+            "UpdatePinhole",
+            "DeletePinhole"
+        ],
+        "IPv6 lifecycle actions must stay ordered"
+    )
+
+    func ssdpResponse(
+        bootID: String?,
+        configID: String?
+    ) -> Data {
+        let bootHeader = bootID.map {
+            "\(bootIDHeader): \($0)\r\n"
+        } ?? ""
+        let configHeader = configID.map {
+            "\(configIDHeader): \($0)\r\n"
+        } ?? ""
+        return Data("""
+        HTTP/1.1 200 OK\r
+        LOCATION: \(descriptionURL.absoluteString)\r
+        USN: \(deviceIdentity)::urn:schemas-upnp-org:device:InternetGatewayDevice:2\r
+        \(bootHeader)\(configHeader)ST: \(serviceType)\r
+        \r
+        """.utf8)
+    }
+
+    let changedIdentities: [
+        (name: String, bootID: String?, configID: String?)
+    ] = [
+        ("changed BOOTID", "702", "29"),
+        ("changed CONFIGID", "701", "30"),
+        ("missing BOOTID", nil, "29"),
+        ("missing CONFIGID", "701", nil)
+    ]
+    for identity in changedIdentities {
+        var unsafeSOAPCalls = 0
+        let changed = RouterMappingService(
+            upnpDescriptionHandler: { _ in description },
+            soapRequestHandler: { _, _, _, _ in
+                unsafeSOAPCalls += 1
+                return response("")
+            },
+            ssdpSearchHandler: { _ in
+                [
+                    ssdpResponse(
+                        bootID: identity.bootID,
+                        configID: identity.configID
+                    )
+                ]
+            }
+        )
+        do {
+            _ = try changed.renewMapping(
+                config: config,
+                mapping: result.activeMapping
+            )
+            throw TestFailure(
+                "\(identity.name) must block ID-only UpdatePinhole"
+            )
+        } catch is RouterMappingRecoveryRequiredError {
+            // Expected: preserve the original finite recovery identity.
+        }
+        let report = changed.removeMappings(
+            [result.activeMapping]
+        )
+        try expect(
+            !report.allSucceeded
+                && report.remainingMappings == [result.activeMapping],
+            "\(identity.name) must retain IPv6 pinhole recovery until finite lease expiry"
+        )
+        try expect(
+            unsafeSOAPCalls == 0,
+            "\(identity.name) must block ID-only DeletePinhole"
+        )
+    }
+
+    func ssdpPacket(
+        location: URL = descriptionURL,
+        identity: String = deviceIdentity,
+        bootIDs: [String] = ["701"],
+        configIDs: [String] = ["29"]
+    ) -> Data {
+        var lines = [
+            "HTTP/1.1 200 OK",
+            "LOCATION: \(location.absoluteString)",
+            "USN: \(identity)::urn:schemas-upnp-org:device:InternetGatewayDevice:2"
+        ]
+        lines.append(contentsOf: bootIDs.map {
+            "\(bootIDHeader): \($0)"
+        })
+        lines.append(contentsOf: configIDs.map {
+            "\(configIDHeader): \($0)"
+        })
+        lines.append("ST: \(serviceType)")
+        lines.append("")
+        lines.append("")
+        return Data(lines.joined(separator: "\r\n").utf8)
+    }
+
+    func expectIdentityConflict(
+        _ name: String,
+        responses: [Data],
+        descriptionData: Data = description
+    ) throws {
+        var unsafeSOAPCalls = 0
+        let conflicting = RouterMappingService(
+            upnpDescriptionHandler: { _ in
+                descriptionData
+            },
+            soapRequestHandler: { _, _, _, _ in
+                unsafeSOAPCalls += 1
+                return response("")
+            },
+            ssdpSearchHandler: { _ in responses }
+        )
+        do {
+            _ = try conflicting.renewMapping(
+                config: config,
+                mapping: result.activeMapping
+            )
+            throw TestFailure(
+                "\(name) must block ID-only UpdatePinhole"
+            )
+        } catch is RouterMappingRecoveryRequiredError {
+            // Expected.
+        }
+        let removal = conflicting.removeMappings(
+            [result.activeMapping]
+        )
+        try expect(
+            !removal.allSucceeded
+                && removal.remainingMappings
+                    == [result.activeMapping],
+            "\(name) must retain finite IPv6 recovery state"
+        )
+        try expect(
+            unsafeSOAPCalls == 0,
+            "\(name) must block both UpdatePinhole and DeletePinhole"
+        )
+    }
+
+    let alternateDescriptionURL = URL(
+        string: "http://192.0.2.2:5000/rootDesc.xml"
+    )!
+    try expectIdentityConflict(
+        "Same normalized UDN with multiple LOCATION values",
+        responses: [
+            ssdpPacket(),
+            ssdpPacket(
+                location: alternateDescriptionURL,
+                identity: "UUID:DUAL-STACK-IGD"
+            )
+        ]
+    )
+    try expectIdentityConflict(
+        "Same normalized UDN with multiple BOOTID values",
+        responses: [
+            ssdpPacket(),
+            ssdpPacket(
+                identity: "UUID:DUAL-STACK-IGD",
+                bootIDs: ["702"]
+            )
+        ]
+    )
+    try expectIdentityConflict(
+        "Same normalized UDN with multiple CONFIGID values",
+        responses: [
+            ssdpPacket(),
+            ssdpPacket(
+                identity: "UUID:DUAL-STACK-IGD",
+                configIDs: ["30"]
+            )
+        ]
+    )
+    try expectIdentityConflict(
+        "Conflicting duplicate SSDP identity header",
+        responses: [
+            ssdpPacket(bootIDs: ["701", "702"])
+        ]
+    )
+    let conflictingStaticDescription = Data("""
+    <root>
+      <device>
+        <UDN>\(deviceIdentity)</UDN>
+        <serviceList>
+          <service>
+            <serviceType>\(serviceType)</serviceType>
+            <controlURL>\(controlURL.absoluteString)</controlURL>
+          </service>
+          <service>
+            <serviceType>\(serviceType)</serviceType>
+            <controlURL>http://192.0.2.1:5000/upnp/control/replacement</controlURL>
+          </service>
+        </serviceList>
+      </device>
+    </root>
+    """.utf8)
+    try expectIdentityConflict(
+        "Same normalized UDN with conflicting static control endpoints",
+        responses: [ssdpPacket()],
+        descriptionData: conflictingStaticDescription
+    )
+
+    var legacy = result.activeMapping
+    legacy.pcpNonce = try encodedUPnPBindingFixture(
+        service: UPnPService(
+            serviceType: serviceType,
+            controlURL: controlURL,
+            gatewayIdentity: gateway,
+            descriptionURL: descriptionURL,
+            deviceIdentity: deviceIdentity,
+            allowsCrossFamilyControl: true
+        ),
+        gateway: gateway
+    )
+    var legacyDiscoveryCalls = 0
+    var legacySOAPCalls = 0
+    let legacyRemover = RouterMappingService(
+        upnpDescriptionHandler: { _ in description },
+        soapRequestHandler: { _, _, _, _ in
+            legacySOAPCalls += 1
+            return response("")
+        },
+        ssdpSearchHandler: { _ in
+            legacyDiscoveryCalls += 1
+            return [
+                ssdpResponse(
+                    bootID: "701",
+                    configID: "29"
+                )
+            ]
+        }
+    )
+    let legacyReport = legacyRemover.removeMappings([legacy])
+    try expect(
+        !legacyReport.allSucceeded
+            && legacyReport.remainingMappings == [legacy],
+        "A legacy IPv6 binding without SSDP IDs must migrate conservatively"
+    )
+    try expect(
+        legacyDiscoveryCalls == 0 && legacySOAPCalls == 0,
+        "Legacy missing metadata must fail before SSDP or ID-only SOAP"
+    )
 }
 
 func testPCPMapCodec() throws {
@@ -2511,9 +6504,12 @@ func testOlderConfigDecodesWithoutIPv6State() throws {
     try expect(decoded.activeRouterMappings.isEmpty, "Older configs should default tracked router mappings to an empty list")
 }
 
-func testReportsCloudflareAPIError() throws {
+func testReportsCloudflareDNSPermissionGuidanceWithoutResponseSecrets() throws {
     let mock = MockHTTPClient(responses: [
-        response(#"{"success":false,"errors":[{"code":9109,"message":"Invalid access token"}],"result":null}"#, status: 403)
+        response(
+            #"{"success":false,"errors":[{"code":9109,"message":"secret-marker"}],"result":null}"#,
+            status: 403
+        )
     ])
     let provider = CloudflareDNSProvider(http: mock)
 
@@ -2524,9 +6520,309 @@ func testReportsCloudflareAPIError() throws {
             ipAddress: "192.0.0.9",
             token: "bad-token"
         )
-        throw TestFailure("Invalid token response should fail")
+        throw TestFailure("A denied DNS-record request should fail")
     } catch let error as CloudflareError {
-        try expect(error.localizedDescription.contains("9109"), "Cloudflare error code should be preserved")
+        try expect(
+            error.localizedDescription == CloudflarePermissionGuidance.dnsWriteDenied,
+            "A DNS-record 403 must explain the exact target-zone permissions"
+        )
+        try expect(
+            !error.localizedDescription.contains("secret-marker"),
+            "A DNS-record 403 must not expose response-body details"
+        )
+    }
+}
+
+func testReportsCloudflareCreatePermissionGuidance() throws {
+    let mock = MockHTTPClient(responses: [
+        response(#"{"success":true,"errors":[],"result":[]}"#),
+        response(
+            #"{"success":false,"errors":[{"code":10000,"message":"secret-create-marker"}],"result":null}"#,
+            status: 403
+        )
+    ])
+    let provider = CloudflareDNSProvider(http: mock)
+
+    do {
+        _ = try provider.upsertARecord(
+            zoneID: "0123456789abcdef0123456789abcdef",
+            recordName: "mac.example.com",
+            ipAddress: "192.0.0.9",
+            token: "under-scoped-token"
+        )
+        throw TestFailure("A denied first DNS write should fail")
+    } catch let error as CloudflareError {
+        try expect(
+            error.localizedDescription == CloudflarePermissionGuidance.dnsWriteDenied,
+            "The first denied DNS write must request Zone/DNS/Edit and Zone/Zone/Read"
+        )
+        try expect(
+            !error.localizedDescription.contains("secret-create-marker"),
+            "The first denied DNS write must not expose the Cloudflare response body"
+        )
+    }
+}
+
+private let cloudflareTokenPrefix = "cf" + "ut_"
+private let cloudflareResponseToken = cloudflareTokenPrefix + "RESPONSE_SECRET_123"
+private let cloudflareTransportToken = cloudflareTokenPrefix + "TRANSPORT_SECRET"
+
+private let cloudflareSecretFragments = [
+    cloudflareResponseToken,
+    "Authorization: Bearer response-secret",
+    "proxy-user:proxy-password",
+    "<html>private gateway response</html>",
+    "9109: server-controlled-message"
+]
+
+private func cloudflareErrorFixture(
+    operation: CloudflareOperation,
+    body: String,
+    status: Int
+) throws -> CloudflareError {
+    let secretHeaders: [AnyHashable: Any] = [
+        "Authorization": "Bearer cfut_HEADER_SECRET",
+        "Proxy-Authorization": "Basic proxy-password",
+        "X-Debug-Secret": "header-secret"
+    ]
+    let failing = response(body, status: status, headers: secretHeaders)
+    let verifySuccess = response(
+        #"{"success":true,"errors":[],"result":{"id":"token-1","status":"active"}}"#
+    )
+    let emptyRecords = response(#"{"success":true,"errors":[],"result":[]}"#)
+    let existingRecord = response(
+        #"{"success":true,"errors":[],"result":[{"id":"record-1","type":"A","name":"mac.example.com","content":"192.0.0.10","ttl":120,"proxied":false}]}"#
+    )
+    let provider: CloudflareDNSProvider
+
+    do {
+        switch operation {
+        case .verifyToken:
+            provider = CloudflareDNSProvider(http: MockHTTPClient(responses: [failing]))
+            _ = try provider.listZones(token: "request-token")
+        case .listZones:
+            provider = CloudflareDNSProvider(
+                http: MockHTTPClient(responses: [verifySuccess, failing])
+            )
+            _ = try provider.listZones(token: "request-token")
+        case .readZone:
+            provider = CloudflareDNSProvider(
+                http: MockHTTPClient(responses: [verifySuccess, failing])
+            )
+            _ = try provider.validateConfiguration(
+                zoneID: "0123456789abcdef0123456789abcdef",
+                recordName: "mac.example.com",
+                token: "request-token"
+            )
+        case .listDNSRecords:
+            provider = CloudflareDNSProvider(http: MockHTTPClient(responses: [failing]))
+            _ = try provider.upsertARecord(
+                zoneID: "0123456789abcdef0123456789abcdef",
+                recordName: "mac.example.com",
+                ipAddress: "192.0.0.9",
+                token: "request-token"
+            )
+        case .createDNSRecord:
+            provider = CloudflareDNSProvider(
+                http: MockHTTPClient(responses: [emptyRecords, failing])
+            )
+            _ = try provider.upsertARecord(
+                zoneID: "0123456789abcdef0123456789abcdef",
+                recordName: "mac.example.com",
+                ipAddress: "192.0.0.9",
+                token: "request-token"
+            )
+        case .updateDNSRecord:
+            provider = CloudflareDNSProvider(
+                http: MockHTTPClient(responses: [existingRecord, failing])
+            )
+            _ = try provider.upsertARecord(
+                zoneID: "0123456789abcdef0123456789abcdef",
+                recordName: "mac.example.com",
+                ipAddress: "192.0.0.9",
+                token: "request-token"
+            )
+        }
+        throw TestFailure("\(operation.rawValue) fixture should fail")
+    } catch let error as CloudflareError {
+        return error
+    }
+}
+
+private func assertCloudflareErrorIsSanitized(
+    _ error: CloudflareError,
+    operation: CloudflareOperation,
+    expectedFailure: CloudflareServiceFailure
+) throws {
+    try expect(
+        error == .service(operation: operation, failure: expectedFailure),
+        "\(operation.rawValue) must preserve only its controlled operation/failure model"
+    )
+    let uiStatus = ComponentStatus.failed(
+        "Cloudflare request failed",
+        detail: error.localizedDescription
+    )
+    let surfaces = [
+        error.localizedDescription,
+        String(describing: error),
+        String(reflecting: error),
+        (error as NSError).localizedDescription,
+        uiStatus.message,
+        uiStatus.detail
+    ]
+    let forbidden = cloudflareSecretFragments + [
+        "cfut_HEADER_SECRET",
+        "proxy-password",
+        "header-secret",
+        "response-secret",
+        "server-controlled-message"
+    ]
+    for surface in surfaces {
+        for secret in forbidden {
+            try expect(
+                !surface.localizedCaseInsensitiveContains(secret),
+                "\(operation.rawValue) leaked a response/header/credential fragment through an error or UI surface"
+            )
+        }
+    }
+}
+
+func testCloudflareErrorsSanitizeJSONAndNonJSONAcrossEveryOperation() throws {
+    let operations: [CloudflareOperation] = [
+        .verifyToken,
+        .listZones,
+        .readZone,
+        .listDNSRecords,
+        .createDNSRecord,
+        .updateDNSRecord
+    ]
+    let joinedSecrets = cloudflareSecretFragments.joined(separator: " | ")
+    let jsonBody = """
+    {"success":false,"errors":[{"code":9109,"message":"\(joinedSecrets)"}],"result":null}
+    """
+    let nonJSONBody = joinedSecrets
+
+    for operation in operations {
+        let structured = try cloudflareErrorFixture(
+            operation: operation,
+            body: jsonBody,
+            status: 500
+        )
+        try assertCloudflareErrorIsSanitized(
+            structured,
+            operation: operation,
+            expectedFailure: .rejected(httpStatus: 500, safeCodes: [])
+        )
+
+        let invalid = try cloudflareErrorFixture(
+            operation: operation,
+            body: nonJSONBody,
+            status: 502
+        )
+        try assertCloudflareErrorIsSanitized(
+            invalid,
+            operation: operation,
+            expectedFailure: .invalidResponse(httpStatus: 502)
+        )
+    }
+}
+
+func testCloudflare403UsesFixedPermissionGuidanceAcrossEveryOperation() throws {
+    let body = cloudflareSecretFragments.joined(separator: "\n")
+    for operation in [
+        CloudflareOperation.verifyToken,
+        .listZones,
+        .readZone,
+        .listDNSRecords,
+        .createDNSRecord,
+        .updateDNSRecord
+    ] {
+        let error = try cloudflareErrorFixture(
+            operation: operation,
+            body: body,
+            status: 403
+        )
+        try assertCloudflareErrorIsSanitized(
+            error,
+            operation: operation,
+            expectedFailure: .permissionDenied
+        )
+        try expect(
+            error.localizedDescription == CloudflarePermissionGuidance.dnsWriteDenied,
+            "Every Cloudflare 403 must use the same fixed local permission guidance"
+        )
+    }
+}
+
+func testCloudflareTransportErrorDoesNotExposeUnderlyingRequestDetails() throws {
+    let underlying = TestFailure(
+        "\(cloudflareTransportToken) Authorization Bearer proxy-user:proxy-password https://private.example"
+    )
+    let provider = CloudflareDNSProvider(http: ThrowingHTTPClient(error: underlying))
+    do {
+        _ = try provider.listZones(token: "request-token")
+        throw TestFailure("A transport failure should be mapped")
+    } catch let error as CloudflareError {
+        try assertCloudflareErrorIsSanitized(
+            error,
+            operation: .verifyToken,
+            expectedFailure: .transport
+        )
+        try expect(
+            !error.localizedDescription.contains("private.example"),
+            "Transport errors must not expose request or proxy locations"
+        )
+    }
+}
+
+func testCloudflareValidationErrorsDoNotEchoResponseValues() throws {
+    let inactiveProvider = CloudflareDNSProvider(
+        http: MockHTTPClient(responses: [
+            response(
+                #"{"success":true,"errors":[],"result":{"id":"token-1","status":"cfut_STATUS_SECRET proxy-password"}}"#
+            )
+        ])
+    )
+    do {
+        _ = try inactiveProvider.listZones(token: "request-token")
+        throw TestFailure("A non-active token status should fail")
+    } catch let error as CloudflareError {
+        try expect(
+            error == .configuration(.inactiveToken),
+            "A non-active token status must map to a fixed configuration issue"
+        )
+        try expect(
+            !error.localizedDescription.contains("cfut_")
+                && !error.localizedDescription.contains("proxy-password"),
+            "A server-controlled token status must not enter an error"
+        )
+    }
+
+    let zoneProvider = CloudflareDNSProvider(
+        http: MockHTTPClient(responses: [
+            response(#"{"success":true,"errors":[],"result":{"id":"token-1","status":"active"}}"#),
+            response(
+                #"{"success":true,"errors":[],"result":{"id":"zone-1","name":"cfut_ZONE_SECRET.proxy-password","status":"active"}}"#
+            )
+        ])
+    )
+    do {
+        _ = try zoneProvider.validateConfiguration(
+            zoneID: "0123456789abcdef0123456789abcdef",
+            recordName: "mac.example.com",
+            token: "request-token"
+        )
+        throw TestFailure("A record outside the selected zone should fail")
+    } catch let error as CloudflareError {
+        try expect(
+            error == .configuration(.recordOutsideZone),
+            "A server-controlled zone name must map to a fixed configuration issue"
+        )
+        try expect(
+            !error.localizedDescription.contains("cfut_")
+                && !error.localizedDescription.contains("proxy-password"),
+            "A server-controlled zone name must not enter an error"
+        )
     }
 }
 
@@ -2566,12 +6862,39 @@ let tests: [(String, () throws -> Void)] = [
     ("classifies global IPv6 CIDRs", testClassifiesGlobalIPv6WithFixedCIDRFixtures),
     ("supports dual-stack preference", testDualStackPreference),
     ("reports every mapping removal result", testRemovalReportPreservesEveryProtocolAndFamilyResult),
+    ("binds current-check proof for every mapping protocol", testProtocolMappingsProduceBoundCurrentCheckProofs),
     ("keeps UPnP leases renewable", testUPnPLeaseIsAlwaysRenewable),
     ("binds UPnP removal to the original router", testUPnPRemovalStaysBoundToOriginalRouter),
     ("preserves UPnP recovery identity after verification failure", testUPnPVerificationFailurePreservesRecoveryIdentity),
     ("repeats IPv6 UPnP deletion idempotently", testUPnPIPv6RepeatedDeleteIsIdempotentOnlyForFirewallService),
     ("preserves recovery identity in automatic mode", testAutomaticMappingPreservesRecoveryIdentity),
-    ("stops automatic fallback after uncertain UDP creation", testAutomaticStopsAfterUncertainPCPOrNATPMPRequest),
+    ("falls back to UPnP after harmless UDP probes", testAutomaticFallsBackToUPnPWhenUDPProtocolsDoNotRespond),
+    ("probes NAT-PMP before automatic mapping", testAutomaticUsesNATPMPOnlyAfterExternalAddressProbe),
+    ("recognizes NAT-PMP version negotiation immediately", testAutomaticRecognizesNATPMPVersionNegotiationImmediately),
+    ("probes PCP before automatic mapping", testAutomaticUsesPCPOnlyAfterAnnounceProbe),
+    ("retransmits a lost automatic probe", testAutomaticRetransmitsAfterSingleProbePacketLoss),
+    ("reports every automatic protocol unsupported", testAutomaticReportsAllProtocolsUnsupportedWithoutSendingMAP),
+    ("stops fallback only after uncertain confirmed MAP", testAutomaticStopsFallbackOnlyAfterConfirmedProtocolMAPIsUncertain),
+    ("cancels automatic UDP retries and fallback", testAutomaticCancellationStopsRetriesAndFallback),
+    ("falls back when UDP transport never sends MAP", testAutomaticFallsBackWhenTransportNeverSentMAP),
+    ("preserves unsent evidence in production socket stages", testProductionSocketStagesPreserveUnsentEvidence),
+    ("builds PCP payload from connected source", testPCPBuilderUsesConnectedSourceAddress),
+    ("keeps effective PCP identity through lifecycle", testPCPEffectiveIdentityPersistsThroughLifecycle),
+    ("separates address drift and bounds renewal", testAddressChangeReasonAutoWANBudgetAndRenewalDeadline),
+    ("cancels one operation token across protocol chains", testOperationTokenCancellationGapAndAbsoluteDeadline),
+    ("binds UPnP renewal to persisted IGD identity", testUPnPRenewalRequiresPersistedIGDIdentity),
+    ("cancels real UPnP URLSession description requests", testRealUPnPDescriptionRequestCancelsURLSession),
+    ("keeps effective NAT-PMP identity through lifecycle", testNATPMPEffectiveIdentityPersistsAndDriftBlocksMAP),
+    ("requires NAT-PMP Epoch continuity before delete", testNATPMPDeletionRequiresProvenEpochContinuity),
+    ("zeros suggested external fields on deletion", testDeletionRequestsZeroSuggestedExternalFields),
+    ("rejects nonzero successful deletion state", testDeletionRejectsNonzeroSuccessState),
+    ("validates PCP responses and retry schedules", testPCPResponseValidationAndRetrySchedules),
+    ("detects isolated router Epoch state loss", testEpochTrackingDetectsStateLossAndIsolatesKeys),
+    ("uses monotonic Epoch time and fail-closed persistence", testEpochUsesMonotonicTimeAndFailsClosedAcrossPersistence),
+    ("delays serialized NAT-PMP reset rebuilds", testNATPMPResetDelayBoundariesCancellationAndSerialization),
+    ("ignores bad UDP datagrams and accepts late response", testTransactionInjectionIgnoresBadDatagramsAndAcceptsLateResponse),
+    ("reuses the real UDP source port for PCP retries", testRealUDPTransactionReusesSourcePortAndAcceptsLateResponse),
+    ("uses native IPv6 source in real PCP payload", testRealIPv6PCPPayloadUsesConnectedSourceAddress),
     ("preserves IPv6 pinhole ID on uncertain renewal", testIPv6PinholeRenewalPreservesOldIDUnlessExplicitlyMissing),
     ("caps every router lease to temporary access", testTemporaryAccessCapsEveryRouterLease),
     ("enforces temporary access absolute router deadlines", testTemporaryAccessRejectsMappingsCompletedPastAbsoluteDeadline),
@@ -2590,7 +6913,12 @@ let tests: [(String, () throws -> Void)] = [
     ("rejects temporary IPv6", testLocalIPv6SelectionRejectsTemporaryAddress),
     ("rejects tunnel-only fixed ifconfig IPv6", testLocalIPv6SelectionRejectsTunnelOnlyIfconfigFixture),
     ("decodes older config", testOlderConfigDecodesWithoutIPv6State),
-    ("reports API error", testReportsCloudflareAPIError),
+    ("reports DNS permission guidance", testReportsCloudflareDNSPermissionGuidanceWithoutResponseSecrets),
+    ("reports first DNS write permission guidance", testReportsCloudflareCreatePermissionGuidance),
+    ("sanitizes every Cloudflare JSON and non-JSON error path", testCloudflareErrorsSanitizeJSONAndNonJSONAcrossEveryOperation),
+    ("uses fixed permission guidance for every Cloudflare 403", testCloudflare403UsesFixedPermissionGuidanceAcrossEveryOperation),
+    ("sanitizes Cloudflare transport errors", testCloudflareTransportErrorDoesNotExposeUnderlyingRequestDetails),
+    ("sanitizes Cloudflare validation response values", testCloudflareValidationErrorsDoNotEchoResponseValues),
     ("lists paginated zones", testListsZonesAcrossPages),
     ("supports account-owned token", testListsZonesWithAccountOwnedToken)
 ]

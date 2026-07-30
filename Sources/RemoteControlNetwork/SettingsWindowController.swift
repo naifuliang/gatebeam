@@ -51,17 +51,168 @@ enum SettingsProxyValidation {
 }
 
 struct SettingsPersistenceCoordinator {
-    let persistSettings: (AppConfig, String) throws -> AppConfig
+    let persistSettings: (AppConfig, CloudflareTokenMutation) throws -> AppConfig
 
     @discardableResult
-    func persist(config: AppConfig, token: String) throws -> AppConfig {
+    func persist(
+        config: AppConfig,
+        tokenMutation: CloudflareTokenMutation = .keepExisting
+    ) throws -> AppConfig {
         let normalized = try SettingsProxyValidation.normalizedForPersistence(config)
-        return try persistSettings(normalized, token)
+        return try persistSettings(normalized, tokenMutation.validated())
+    }
+}
+
+enum SettingsTokenMutationPolicy {
+    static func saveMutation(
+        enteredToken: String,
+        fieldWasEdited: Bool,
+        readState: CloudflareTokenReadState
+    ) -> CloudflareTokenMutation {
+        guard fieldWasEdited else { return .keepExisting }
+        let normalized = enteredToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { return .keepExisting }
+        if case .available(let savedToken) = readState,
+           savedToken == normalized {
+            return .keepExisting
+        }
+        return .replace(normalized)
+    }
+
+    static func verificationToken(
+        enteredToken: String,
+        readState: CloudflareTokenReadState
+    ) -> String? {
+        let normalized = enteredToken.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !normalized.isEmpty {
+            return normalized
+        }
+        if case .available(let savedToken) = readState {
+            return savedToken
+        }
+        return nil
+    }
+
+    static func removalMutation(confirmed: Bool) -> CloudflareTokenMutation? {
+        confirmed ? .explicitRemove : nil
+    }
+}
+
+struct CloudflareVerificationRequest: Equatable {
+    let generation: UInt64
+    let token: String?
+    let pendingTokenMutation: CloudflareTokenMutation
+    let proxyMode: NetworkProxyMode
+    let customProxyURL: String
+}
+
+struct SettingsCloudflareVerificationCoordinator {
+    private var nextGeneration: UInt64 = 0
+    private(set) var activeGeneration: UInt64?
+
+    mutating func begin(
+        token: String?,
+        pendingTokenMutation: CloudflareTokenMutation,
+        formConfig: AppConfig
+    ) throws -> CloudflareVerificationRequest {
+        nextGeneration &+= 1
+        activeGeneration = nil
+        let route = try Self.cloudflareRoute(from: formConfig)
+        activeGeneration = nextGeneration
+        return CloudflareVerificationRequest(
+            generation: nextGeneration,
+            token: token,
+            pendingTokenMutation: pendingTokenMutation,
+            proxyMode: route.mode,
+            customProxyURL: route.customProxyURL
+        )
+    }
+
+    mutating func complete(_ request: CloudflareVerificationRequest) -> Bool {
+        guard activeGeneration == request.generation else { return false }
+        activeGeneration = nil
+        return true
+    }
+
+    @discardableResult
+    mutating func cancelActive() -> Bool {
+        guard activeGeneration != nil else { return false }
+        activeGeneration = nil
+        return true
+    }
+
+    private static func cloudflareRoute(
+        from config: AppConfig
+    ) throws -> (mode: NetworkProxyMode, customProxyURL: String) {
+        guard config.ddnsProxyMode == .custom else {
+            return (config.ddnsProxyMode, "")
+        }
+        return (
+            .custom,
+            try HTTPClient.validatedProxyURL(config.customProxyURL).absoluteString
+        )
+    }
+}
+
+enum SettingsCloudflareTokenRemovalPrompt {
+    static func makeAlert() -> NSAlert {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Remove Cloudflare Token?"
+        alert.informativeText = "Gatebeam will delete only the saved Cloudflare API token. Your other settings will not be changed."
+        let removeButton = alert.addButton(withTitle: "Remove Token")
+        removeButton.hasDestructiveAction = true
+        alert.addButton(withTitle: "Cancel")
+        return alert
+    }
+
+    static func mutation(
+        for response: NSApplication.ModalResponse
+    ) -> CloudflareTokenMutation? {
+        SettingsTokenMutationPolicy.removalMutation(
+            confirmed: response == .alertFirstButtonReturn
+        )
+    }
+}
+
+enum SettingsCloudflareZoneReadPresentation {
+    static func message(zoneCount: Int, pendingStorage: Bool) -> String {
+        guard zoneCount > 0 else {
+            return "Token is active, but no readable zones were returned. Grant Zone/Zone/Read for the target zone."
+        }
+        let noun = zoneCount == 1 ? "zone" : "zones"
+        if pendingStorage {
+            return "Token is active and can read \(zoneCount) \(noun). Save Changes stores it; DNS Edit is confirmed on the first record update."
+        }
+        return "Token is active and can read \(zoneCount) \(noun). DNS Edit is confirmed when Gatebeam updates the selected record."
+    }
+}
+
+enum SettingsCloudflareErrorPresentation {
+    static let genericMessage = "Cloudflare request failed. Check the connection route and try again."
+
+    static func message(for error: Error) -> String {
+        if let cloudflareError = error as? CloudflareError {
+            return cloudflareError.localizedDescription
+        }
+        if let keychainError = error as? KeychainError {
+            return keychainError.localizedDescription
+        }
+        if case NetworkError.invalidProxyURL = error {
+            return "Invalid proxy URL: \(SettingsProxyValidation.formatMessage)"
+        }
+        return genericMessage
     }
 }
 
 final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
+    private struct PreparedPersistence {
+        let config: AppConfig
+        let tokenMutation: CloudflareTokenMutation
+    }
+
     private let agent: NetworkAgent
+    private let tokenRemovalResponseProvider: (NSAlert) -> NSApplication.ModalResponse
 
     private let remoteEnabledButton = NSButton(checkboxWithTitle: "Remote access", target: nil, action: nil)
     private let startAtLoginButton = NSButton(checkboxWithTitle: "Start at login", target: nil, action: nil)
@@ -97,21 +248,42 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
     private let reachabilityStatusView = StatusMetricView(title: "Local TCP", width: SettingsLayout.metricWidth)
     private var cloudflareZones: [CloudflareZoneSummary] = []
     private var configuredRecordName = ""
+    private var tokenReadState: CloudflareTokenReadState = .unknown
+    private var tokenFieldWasEdited = false
+    private var isSynchronizingTokenField = false
+    private var cloudflareVerification = SettingsCloudflareVerificationCoordinator()
     private var isPersisting = false
     private var isAuthorizingToken = false
     private weak var saveButton: NSButton?
     private weak var checkButton: NSButton?
     private weak var connectButton: NSButton?
     private weak var authorizeTokenButton: NSButton?
+    private weak var removeTokenButton: NSButton?
+    private weak var temporaryAccessButton: NSButton?
+    private weak var copyURLButton: NSButton?
+    private weak var footerView: NSView?
 
-    init(agent: NetworkAgent, autoLoadCloudflare: Bool = true) {
+    init(
+        agent: NetworkAgent,
+        autoLoadCloudflare: Bool = true,
+        tokenRemovalResponseProvider: ((NSAlert) -> NSApplication.ModalResponse)? = nil
+    ) {
         self.agent = agent
+        self.tokenRemovalResponseProvider = tokenRemovalResponseProvider ?? { alert in
+            alert.runModal()
+        }
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 880, height: 880),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
+        let appearanceView = SettingsAppearanceTrackingView(
+            frame: window.contentView?.bounds ?? NSRect(x: 0, y: 0, width: 880, height: 880)
+        )
+        appearanceView.autoresizingMask = [.width, .height]
+        appearanceView.identifier = NSUserInterfaceItemIdentifier("settings-root")
+        window.contentView = appearanceView
         window.title = "Gatebeam"
         window.titlebarAppearsTransparent = true
         window.isMovableByWindowBackground = true
@@ -121,15 +293,18 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         )
         window.center()
         super.init(window: window)
+        appearanceView.onEffectiveAppearanceChanged = { [weak self] in
+            self?.refreshAppearance()
+        }
         setupContent()
-        let savedToken = autoLoadCloudflare ? agent.cloudflareToken() : ""
-        update(config: agent.config, token: savedToken)
+        let tokenState = agent.cloudflareTokenState
+        update(config: agent.config, tokenState: tokenState)
         update(status: agent.status)
         if agent.savedTokenNeedsAuthorization {
             cloudflareFeedbackLabel.stringValue = "A saved token needs approval. Click Authorize Token."
             cloudflareFeedbackLabel.textColor = .systemOrange
         }
-        if autoLoadCloudflare, !savedToken.isEmpty {
+        if autoLoadCloudflare, case .available = tokenState {
             loadCloudflareZones(showErrors: false)
         }
     }
@@ -138,7 +313,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         nil
     }
 
-    func update(config: AppConfig, token: String) {
+    func update(config: AppConfig, tokenState: CloudflareTokenReadState) {
         remoteEnabledButton.state = config.remoteAccessEnabled ? .on : .off
         startAtLoginButton.state = config.startAtLogin ? .on : .off
         configuredRecordName = config.dnsRecordName
@@ -149,7 +324,10 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
             recordNameField.stringValue = config.dnsRecordName
         }
         updateRecordPreview()
-        tokenField.stringValue = token
+        tokenReadState = tokenState
+        if !tokenFieldWasEdited {
+            synchronizeTokenField(with: tokenState)
+        }
         internalPortField.stringValue = String(config.internalPort)
         externalPortField.stringValue = String(config.externalPort)
         leaseField.stringValue = String(config.mappingLeaseSeconds)
@@ -162,11 +340,12 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         publicIPProxyControl.selectedSegment = proxySegment(for: config.publicIPProxyMode)
         customProxyField.stringValue = config.customProxyURL
         updateProxyControls(validationMessage: proxyValidationMessage(for: config))
+        refreshConnectionPresentation(status: agent.status)
     }
 
     func update(status: AppStatus) {
         renderSummary(status)
-        connectionLabel.stringValue = status.connectionURL ?? "No connection URL yet"
+        refreshConnectionPresentation(status: status)
         if let checked = status.lastCheckedAt {
             lastCheckedLabel.stringValue = "Last checked \(DateFormatter.settingsShortTime.string(from: checked))"
         } else {
@@ -180,14 +359,16 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
 
     func setCloudflareZonesForPreview(_ zones: [CloudflareZoneSummary]) {
         applyCloudflareZones(zones)
-        cloudflareFeedbackLabel.stringValue = "Connected. \(zones.count) domain\(zones.count == 1 ? "" : "s") available."
-        cloudflareFeedbackLabel.textColor = .systemGreen
+        cloudflareFeedbackLabel.stringValue = SettingsCloudflareZoneReadPresentation.message(
+            zoneCount: zones.count,
+            pendingStorage: false
+        )
+        cloudflareFeedbackLabel.textColor = zones.isEmpty ? .systemOrange : .systemBlue
     }
 
     private func setupContent() {
         guard let contentView = window?.contentView else { return }
         contentView.wantsLayer = true
-        contentView.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
 
         let header = makeHeader()
         header.translatesAutoresizingMaskIntoConstraints = false
@@ -244,9 +425,10 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         actionBar.setContentCompressionResistancePriority(.required, for: .vertical)
 
         let footer = NSView()
+        footer.identifier = NSUserInterfaceItemIdentifier("settings-footer")
         footer.translatesAutoresizingMaskIntoConstraints = false
         footer.wantsLayer = true
-        footer.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+        footerView = footer
         contentView.addSubview(footer)
         footer.addSubview(actionBar)
 
@@ -282,6 +464,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
             actionBar.centerXAnchor.constraint(equalTo: footer.centerXAnchor),
             actionBar.centerYAnchor.constraint(equalTo: footer.centerYAnchor, constant: 1)
         ])
+        refreshAppearance()
     }
 
     private func makeHeader() -> NSView {
@@ -303,6 +486,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         subheadlineLabel.widthAnchor.constraint(equalToConstant: SettingsLayout.gridWidth).isActive = true
 
         connectionLabel.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        connectionLabel.identifier = NSUserInterfaceItemIdentifier("settings-connection-url")
         connectionLabel.alignment = .left
         connectionLabel.textColor = .secondaryLabelColor
         connectionLabel.lineBreakMode = .byTruncatingMiddle
@@ -319,13 +503,18 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         let panel = makePanel(title: "Access & Health", subtitle: "Control public access and review connection health.")
 
         remoteEnabledButton.font = NSFont.systemFont(ofSize: 14, weight: .semibold)
+        remoteEnabledButton.identifier = NSUserInterfaceItemIdentifier("settings-remote-access")
+        remoteEnabledButton.target = self
+        remoteEnabledButton.action = #selector(remoteAccessFormChanged)
         startAtLoginButton.font = NSFont.systemFont(ofSize: 13)
 
         let hint = caption("When off, DNS updates and router mappings pause.")
 
         let openButton = iconButton(title: "30 min", symbol: "timer", action: #selector(openForThirtyMinutes))
+        openButton.identifier = NSUserInterfaceItemIdentifier("settings-open-30-minutes")
         openButton.bezelStyle = .rounded
         openButton.toolTip = "Open remote access for 30 minutes"
+        temporaryAccessButton = openButton
 
         let accessControls = NSStackView()
         accessControls.orientation = .horizontal
@@ -371,6 +560,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         panel.addArrangedSubview(labeledField("API token", tokenField))
 
         let connectButton = iconButton(title: "Verify", symbol: "arrow.triangle.2.circlepath", action: #selector(connectCloudflare))
+        connectButton.identifier = NSUserInterfaceItemIdentifier("settings-verify-token")
         connectButton.toolTip = "Verify the entered token and load its available Cloudflare domains"
         self.connectButton = connectButton
         let authorizeButton = iconButton(
@@ -378,8 +568,15 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
             symbol: "key",
             action: #selector(authorizeSavedToken)
         )
+        authorizeButton.identifier = NSUserInterfaceItemIdentifier("settings-authorize-token")
         authorizeButton.toolTip = "Allow this Gatebeam build to use and securely migrate a previously saved token"
         self.authorizeTokenButton = authorizeButton
+        let removeButton = symbolButton(
+            symbol: "trash",
+            toolTip: "Remove the saved Cloudflare token",
+            action: #selector(confirmRemoveCloudflareToken)
+        )
+        self.removeTokenButton = removeButton
         let helpButton = symbolButton(symbol: "questionmark.circle", toolTip: "Cloudflare token permissions", action: #selector(showCloudflareHelp))
         let buttonStack = NSStackView()
         buttonStack.orientation = .horizontal
@@ -387,6 +584,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         buttonStack.spacing = 8
         buttonStack.addArrangedSubview(connectButton)
         buttonStack.addArrangedSubview(authorizeButton)
+        buttonStack.addArrangedSubview(removeButton)
         let buttonSpacer = NSView()
         buttonSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
         buttonStack.addArrangedSubview(buttonSpacer)
@@ -396,8 +594,12 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
 
         cloudflareFeedbackLabel.font = NSFont.systemFont(ofSize: 11)
         cloudflareFeedbackLabel.textColor = .secondaryLabelColor
-        cloudflareFeedbackLabel.maximumNumberOfLines = 2
+        cloudflareFeedbackLabel.maximumNumberOfLines = 3
         cloudflareFeedbackLabel.lineBreakMode = .byWordWrapping
+        cloudflareFeedbackLabel.preferredMaxLayoutWidth = SettingsLayout.cardContentWidth
+        cloudflareFeedbackLabel.widthAnchor.constraint(
+            equalToConstant: SettingsLayout.cardContentWidth
+        ).isActive = true
         panel.addArrangedSubview(cloudflareFeedbackLabel)
 
         zonePopup.removeAllItems()
@@ -408,6 +610,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         zonePopup.controlSize = .regular
         zonePopup.heightAnchor.constraint(equalToConstant: 28).isActive = true
         recordNameField.delegate = self
+        tokenField.delegate = self
         panel.addArrangedSubview(twoColumnRow(
             labeledControl("Domain", zonePopup, minWidth: 160),
             labeledField("Subdomain", recordNameField, placeholder: "remote or @", minWidth: 160)
@@ -455,6 +658,12 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
 
         configureSegment(ddnsProxyControl)
         configureSegment(publicIPProxyControl)
+        ddnsProxyControl.identifier = NSUserInterfaceItemIdentifier(
+            "settings-ddns-proxy-mode"
+        )
+        publicIPProxyControl.identifier = NSUserInterfaceItemIdentifier(
+            "settings-public-ip-proxy-mode"
+        )
         ddnsProxyControl.target = self
         ddnsProxyControl.action = #selector(proxyModeChanged)
         publicIPProxyControl.target = self
@@ -466,6 +675,9 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         panel.addArrangedSubview(caption("Direct is recommended when the probe must report the ISP-facing address."))
 
         customProxyField.delegate = self
+        customProxyField.identifier = NSUserInterfaceItemIdentifier(
+            "settings-custom-proxy-url"
+        )
         customProxyField.toolTip = "Use http://host:port or socks5://host:port. Credentials are not stored here."
         panel.addArrangedSubview(labeledField(
             "Custom proxy URL",
@@ -487,6 +699,9 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         proxyValidationLabel.lineBreakMode = .byTruncatingTail
         proxyValidationLabel.preferredMaxLayoutWidth = SettingsLayout.cardContentWidth
         proxyValidationLabel.widthAnchor.constraint(equalToConstant: SettingsLayout.cardContentWidth).isActive = true
+        proxyValidationLabel.identifier = NSUserInterfaceItemIdentifier(
+            "settings-proxy-validation"
+        )
         panel.addArrangedSubview(proxyValidationLabel)
         panel.addArrangedSubview(verticalSpacer())
         return panel
@@ -502,8 +717,12 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
 
         let copyButton = iconButton(title: "Copy URL", symbol: "doc.on.doc", action: #selector(copyURL))
+        copyButton.identifier = NSUserInterfaceItemIdentifier("settings-copy-url")
         let checkButton = iconButton(title: "Check Now", symbol: "arrow.clockwise", action: #selector(checkNow))
+        checkButton.identifier = NSUserInterfaceItemIdentifier("settings-check-now")
         let saveButton = iconButton(title: "Save Changes", symbol: "checkmark", action: #selector(save))
+        saveButton.identifier = NSUserInterfaceItemIdentifier("settings-save")
+        self.copyURLButton = copyButton
         self.checkButton = checkButton
         self.saveButton = saveButton
         saveButton.keyEquivalent = "\r"
@@ -522,18 +741,21 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         subtitle: String? = nil,
         alignment: NSLayoutConstraint.Attribute = .leading
     ) -> NSStackView {
-        let stack = NSStackView()
+        let stack = SettingsPanelView()
+        let identifierTitle = title ?? "untitled"
+        stack.identifier = NSUserInterfaceItemIdentifier(
+            "settings-panel-\(identifierTitle.lowercased().replacingOccurrences(of: " ", with: "-"))"
+        )
         stack.orientation = .vertical
         stack.alignment = alignment
         stack.distribution = .fill
         stack.spacing = 8
-        stack.edgeInsets = NSEdgeInsets(top: 16, left: 16, bottom: 16, right: 16)
+        stack.edgeInsets = NSEdgeInsets(top: 14, left: 16, bottom: 14, right: 16)
         stack.wantsLayer = true
         stack.layer?.cornerRadius = 8
         stack.layer?.cornerCurve = .continuous
-        stack.layer?.backgroundColor = NSColor.controlBackgroundColor.cgColor
-        stack.layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.25).cgColor
         stack.layer?.borderWidth = 1
+        stack.refreshAppearanceLayers()
 
         if let title {
             let titleLabel = NSTextField(labelWithString: title)
@@ -715,6 +937,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
     private func formConfig() -> AppConfig {
         var config = agent.config
         config.remoteAccessEnabled = remoteEnabledButton.state == .on
+        config.clearTemporaryAccessExpiration()
         config.startAtLogin = startAtLoginButton.state == .on
         config.dnsProvider = providerControl.selectedSegment == 0 ? .disabled : .cloudflare
         config.preferredAddressFamily = addressPreference(for: addressControl.selectedSegment)
@@ -740,52 +963,104 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
 
     private func persist(
         _ config: AppConfig,
+        tokenMutation: CloudflareTokenMutation? = nil,
         completion: ((Bool) -> Void)? = nil
     ) {
-        guard !isPersisting, !isAuthorizingToken else { return }
-        let normalized: AppConfig
+        guard !isBusy else { return }
+        let prepared: PreparedPersistence
         do {
-            normalized = try SettingsProxyValidation.normalizedForPersistence(config)
+            prepared = try preparePersistence(
+                config,
+                tokenMutation: tokenMutation
+            )
         } catch {
             presentPersistenceError(error)
             completion?(false)
             return
         }
+        performPersistence(prepared, completion: completion)
+    }
 
+    private func preparePersistence(
+        _ config: AppConfig,
+        tokenMutation: CloudflareTokenMutation? = nil
+    ) throws -> PreparedPersistence {
+        let normalized = try SettingsProxyValidation.normalizedForPersistence(
+            config
+        )
+        let mutation = try (
+            tokenMutation ?? SettingsTokenMutationPolicy.saveMutation(
+                enteredToken: tokenField.stringValue,
+                fieldWasEdited: tokenFieldWasEdited,
+                readState: tokenReadState
+            )
+        ).validated()
+        return PreparedPersistence(
+            config: normalized,
+            tokenMutation: mutation
+        )
+    }
+
+    private func performPersistence(
+        _ prepared: PreparedPersistence,
+        temporaryAccessMinutes: Int? = nil,
+        uiMutation: (() -> Void)? = nil,
+        completion: ((Bool) -> Void)? = nil
+    ) {
+        guard !isBusy else { return }
+        uiMutation?()
+        cancelCloudflareVerification()
         setPersistenceBusy(true)
-        agent.persistSettingsAsync(config: normalized, token: tokenField.stringValue) { [weak self] result in
+        let handleResult: (Result<AppConfig, Error>) -> Void = { [weak self] result in
             guard let self else { return }
             self.setPersistenceBusy(false)
             switch result {
             case .success(let persistedConfig):
+                self.applyPersistedTokenMutation(prepared.tokenMutation)
                 self.synchronizePersistedProxyField(from: persistedConfig)
                 self.intervalField.stringValue = String(Int(persistedConfig.checkIntervalSeconds))
                 completion?(true)
             case .failure(let error):
-                self.update(config: self.agent.config, token: self.agent.cloudflareToken())
+                self.tokenFieldWasEdited = false
+                self.update(config: self.agent.config, tokenState: self.agent.cloudflareTokenState)
                 self.update(status: self.agent.status)
                 self.presentPersistenceError(error)
                 completion?(false)
             }
         }
+        if let temporaryAccessMinutes {
+            agent.setTemporaryAccess(
+                minutes: temporaryAccessMinutes,
+                applying: prepared.config,
+                tokenMutation: prepared.tokenMutation,
+                completion: handleResult
+            )
+        } else {
+            agent.persistSettingsAsync(
+                config: prepared.config,
+                tokenMutation: prepared.tokenMutation,
+                completion: handleResult
+            )
+        }
     }
 
     @objc private func connectCloudflare() {
-        let token = tokenField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !token.isEmpty else {
-            cloudflareFeedbackLabel.stringValue = "Paste a token, or authorize a token saved by an earlier Gatebeam build."
+        guard !isBusy else { return }
+        let token = SettingsTokenMutationPolicy.verificationToken(
+            enteredToken: tokenField.stringValue,
+            readState: tokenReadState
+        )
+        if token == nil, tokenReadState == .missing {
+            cloudflareFeedbackLabel.stringValue = "No saved token exists. Paste a scoped token to verify."
             cloudflareFeedbackLabel.textColor = .systemRed
             return
         }
-
-        persist(formConfig()) { [weak self] succeeded in
-            guard succeeded else { return }
-            self?.loadCloudflareZones(showErrors: true)
-        }
+        loadCloudflareZones(showErrors: true, token: token)
     }
 
     @objc private func authorizeSavedToken() {
-        guard !isPersisting, !isAuthorizingToken else { return }
+        guard !isBusy else { return }
+        cancelCloudflareVerification()
         setAuthorizationBusy(true)
         cloudflareFeedbackLabel.stringValue = "Waiting for macOS Keychain authorization..."
         cloudflareFeedbackLabel.textColor = .secondaryLabelColor
@@ -795,19 +1070,27 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
             self.setAuthorizationBusy(false)
             switch result {
             case .success(.noSavedToken):
+                self.tokenReadState = .missing
+                self.tokenFieldWasEdited = false
+                self.synchronizeTokenField(with: .missing)
                 self.cloudflareFeedbackLabel.stringValue = "No saved token was found. Paste a new scoped token."
                 self.cloudflareFeedbackLabel.textColor = .secondaryLabelColor
             case .success(.authorized(let token)):
-                self.tokenField.stringValue = token
+                self.tokenReadState = .available(token)
+                self.tokenFieldWasEdited = false
+                self.synchronizeTokenField(with: .available(token))
                 self.cloudflareFeedbackLabel.stringValue = "Saved token authorized for this Gatebeam build."
                 self.cloudflareFeedbackLabel.textColor = .systemGreen
                 self.loadCloudflareZones(showErrors: false)
             case .success(.migratedLegacyToken(let token)):
-                self.tokenField.stringValue = token
+                self.tokenReadState = .available(token)
+                self.tokenFieldWasEdited = false
+                self.synchronizeTokenField(with: .available(token))
                 self.cloudflareFeedbackLabel.stringValue = "Legacy token secured and removed from the old Keychain item."
                 self.cloudflareFeedbackLabel.textColor = .systemGreen
                 self.loadCloudflareZones(showErrors: false)
             case .failure(let error):
+                self.tokenReadState = .unavailable
                 self.cloudflareFeedbackLabel.stringValue = error.localizedDescription
                 self.cloudflareFeedbackLabel.textColor = .systemRed
                 self.showAlert(
@@ -815,6 +1098,68 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
                     message: error.localizedDescription
                 )
             }
+        }
+    }
+
+    @objc func confirmRemoveCloudflareToken() {
+        guard !isBusy else { return }
+        let alert = SettingsCloudflareTokenRemovalPrompt.makeAlert()
+        guard let mutation = SettingsCloudflareTokenRemovalPrompt.mutation(
+            for: tokenRemovalResponseProvider(alert)
+        ) else {
+            return
+        }
+
+        cancelCloudflareVerification()
+        setPersistenceBusy(true)
+        agent.applyCloudflareTokenMutationAsync(mutation) { [weak self] result in
+            guard let self else { return }
+            self.setPersistenceBusy(false)
+            switch result {
+            case .success:
+                self.tokenReadState = .missing
+                self.tokenFieldWasEdited = false
+                self.synchronizeTokenField(with: .missing)
+                self.cloudflareZones = []
+                self.zonePopup.removeAllItems()
+                self.zonePopup.addItem(withTitle: "No domains loaded")
+                self.zonePopup.isEnabled = false
+                self.cloudflareFeedbackLabel.stringValue = "Saved Cloudflare token removed."
+                self.cloudflareFeedbackLabel.textColor = .secondaryLabelColor
+            case .failure(let error):
+                self.tokenReadState = self.agent.cloudflareTokenState
+                self.showAlert(
+                    title: "Could not remove Cloudflare token",
+                    message: error.localizedDescription
+                )
+            }
+        }
+    }
+
+    private func synchronizeTokenField(with state: CloudflareTokenReadState) {
+        isSynchronizingTokenField = true
+        switch state {
+        case .available(let token):
+            tokenField.stringValue = token
+        case .unknown, .missing, .unavailable:
+            tokenField.stringValue = ""
+        }
+        isSynchronizingTokenField = false
+    }
+
+    private func applyPersistedTokenMutation(_ mutation: CloudflareTokenMutation) {
+        switch mutation {
+        case .keepExisting:
+            tokenFieldWasEdited = false
+            synchronizeTokenField(with: tokenReadState)
+        case .replace(let token):
+            tokenReadState = .available(token)
+            tokenFieldWasEdited = false
+            synchronizeTokenField(with: tokenReadState)
+        case .explicitRemove:
+            tokenReadState = .missing
+            tokenFieldWasEdited = false
+            synchronizeTokenField(with: tokenReadState)
         }
     }
 
@@ -836,11 +1181,16 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
     }
 
     private func updateBusyControls() {
-        let isBusy = isPersisting || isAuthorizingToken
         saveButton?.isEnabled = !isBusy
         checkButton?.isEnabled = !isBusy
         connectButton?.isEnabled = !isBusy
         authorizeTokenButton?.isEnabled = !isBusy
+        removeTokenButton?.isEnabled = !isBusy
+        temporaryAccessButton?.isEnabled = !isBusy
+    }
+
+    private var isBusy: Bool {
+        isPersisting || isAuthorizingToken
     }
 
     private func presentPersistenceError(_ error: Error) {
@@ -864,6 +1214,9 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
     }
 
     @objc private func proxyModeChanged() {
+        cancelCloudflareVerification(
+            feedback: "Cloudflare connection settings changed. Verify again."
+        )
         updateProxyControls(validationMessage: proxyValidationMessage(for: formConfig()))
     }
 
@@ -883,30 +1236,74 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         proxyValidationLabel.isHidden = validationMessage == nil
     }
 
-    private func loadCloudflareZones(showErrors: Bool) {
+    private func loadCloudflareZones(showErrors: Bool, token: String? = nil) {
+        let candidate = token ?? SettingsTokenMutationPolicy.verificationToken(
+            enteredToken: tokenField.stringValue,
+            readState: tokenReadState
+        )
+        let pendingMutation = SettingsTokenMutationPolicy.saveMutation(
+            enteredToken: tokenField.stringValue,
+            fieldWasEdited: tokenFieldWasEdited,
+            readState: tokenReadState
+        )
+        let request: CloudflareVerificationRequest
+        do {
+            request = try cloudflareVerification.begin(
+                token: candidate,
+                pendingTokenMutation: pendingMutation,
+                formConfig: formConfig()
+            )
+        } catch {
+            presentProxyValidationError(error)
+            cloudflareFeedbackLabel.stringValue = error.localizedDescription
+            cloudflareFeedbackLabel.textColor = .systemRed
+            return
+        }
+
         cloudflareFeedbackLabel.stringValue = "Verifying token and loading domains..."
         cloudflareFeedbackLabel.textColor = .secondaryLabelColor
         zonePopup.isEnabled = false
 
-        agent.loadCloudflareZones(token: tokenField.stringValue) { [weak self] result in
+        agent.loadCloudflareZones(
+            token: request.token,
+            proxyMode: request.proxyMode,
+            customProxyURL: request.customProxyURL
+        ) { [weak self] result in
             guard let self else { return }
+            guard self.cloudflareVerification.complete(request) else { return }
             switch result {
             case .success(let zones):
                 self.applyCloudflareZones(zones)
-                self.cloudflareFeedbackLabel.stringValue = zones.isEmpty
-                    ? "Token is active, but it cannot access any domains."
-                    : "Connected. \(zones.count) domain\(zones.count == 1 ? "" : "s") available."
-                self.cloudflareFeedbackLabel.textColor = zones.isEmpty ? .systemOrange : .systemGreen
+                let pendingStorage: Bool
+                if case .replace = request.pendingTokenMutation {
+                    pendingStorage = true
+                } else {
+                    pendingStorage = false
+                }
+                self.cloudflareFeedbackLabel.stringValue = SettingsCloudflareZoneReadPresentation.message(
+                    zoneCount: zones.count,
+                    pendingStorage: pendingStorage
+                )
+                self.cloudflareFeedbackLabel.textColor = zones.isEmpty ? .systemOrange : .systemBlue
             case .failure(let error):
                 self.cloudflareZones = []
                 self.zonePopup.removeAllItems()
                 self.zonePopup.addItem(withTitle: "No domains loaded")
-                self.cloudflareFeedbackLabel.stringValue = error.localizedDescription
+                let message = SettingsCloudflareErrorPresentation.message(for: error)
+                self.cloudflareFeedbackLabel.stringValue = message
                 self.cloudflareFeedbackLabel.textColor = .systemRed
                 if showErrors {
-                    self.showAlert(title: "Cloudflare connection failed", message: error.localizedDescription)
+                    self.showAlert(title: "Cloudflare connection failed", message: message)
                 }
             }
+        }
+    }
+
+    private func cancelCloudflareVerification(feedback: String? = nil) {
+        guard cloudflareVerification.cancelActive() else { return }
+        if let feedback {
+            cloudflareFeedbackLabel.stringValue = feedback
+            cloudflareFeedbackLabel.textColor = .secondaryLabelColor
         }
     }
 
@@ -944,7 +1341,20 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         guard let field = notification.object as? NSTextField else { return }
         if field === recordNameField {
             updateRecordPreview()
+        } else if field === tokenField, !isSynchronizingTokenField {
+            cancelCloudflareVerification(
+                feedback: "The token changed. Verify it again before trusting the result."
+            )
+            tokenFieldWasEdited = true
+            let normalized = tokenField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            if normalized.isEmpty {
+                cloudflareFeedbackLabel.stringValue = "The saved token will be kept. Use the trash button to remove it."
+                cloudflareFeedbackLabel.textColor = .secondaryLabelColor
+            }
         } else if field === customProxyField {
+            cancelCloudflareVerification(
+                feedback: "Cloudflare connection settings changed. Verify again."
+            )
             updateProxyControls(validationMessage: proxyValidationMessage(for: formConfig()))
         }
     }
@@ -955,8 +1365,8 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         alert.informativeText = """
         1. Open Cloudflare > My Profile > API Tokens > Create Token.
         2. Start with Edit zone DNS, then make sure both permissions are present:
-           - Zone / DNS / Edit
-           - Zone / Zone / Read
+           - Zone/DNS/Edit
+           - Zone/Zone/Read
         3. Under Zone Resources, choose Specific Zone for least privilege, or All Zones to list every domain.
         4. Leave Client IP filtering empty because a DDNS connection can change IP.
         5. Create the token, paste it here once, then click Verify.
@@ -1018,21 +1428,82 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
     }
 
     @objc private func checkNow() {
-        save()
+        agent.runCheck()
     }
 
     @objc private func openForThirtyMinutes() {
+        guard !isBusy else { return }
         var config = formConfig()
         config.remoteAccessEnabled = true
-        config.accessExpiresAt = Date().addingTimeInterval(30 * 60)
-        remoteEnabledButton.state = .on
-        persist(config)
+        let prepared: PreparedPersistence
+        do {
+            prepared = try preparePersistence(config)
+        } catch {
+            presentPersistenceError(error)
+            return
+        }
+        performPersistence(
+            prepared,
+            temporaryAccessMinutes: 30,
+            uiMutation: { [weak self] in
+                self?.remoteEnabledButton.state = .on
+            }
+        )
+    }
+
+    @objc private func remoteAccessFormChanged() {
+        refreshConnectionPresentation(status: agent.status)
     }
 
     @objc private func copyURL() {
-        guard let url = agent.status.connectionURL else { return }
+        guard let url = RemoteConnectionURLPolicy.primaryCopyURL(
+            remoteAccessEnabled: effectiveRemoteAccessEnabled,
+            status: agent.status
+        ) else {
+            return
+        }
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(url, forType: .string)
+    }
+
+    private func refreshConnectionPresentation(status: AppStatus) {
+        let remoteAccessEnabled = effectiveRemoteAccessEnabled
+        connectionLabel.stringValue = RemoteConnectionURLPolicy.displayURL(
+            remoteAccessEnabled: remoteAccessEnabled,
+            status: status
+        )
+        connectionLabel.toolTip = remoteAccessEnabled ? status.connectionURL : nil
+        copyURLButton?.isEnabled = RemoteConnectionURLPolicy.primaryCopyURL(
+            remoteAccessEnabled: remoteAccessEnabled,
+            status: status
+        ) != nil
+    }
+
+    private var effectiveRemoteAccessEnabled: Bool {
+        remoteEnabledButton.state == .on && agent.config.remoteAccessEnabled
+    }
+
+    func refreshAppearance() {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard let contentView = window?.contentView else { return }
+        contentView.layer?.backgroundColor = NSColor.resolvedCGColor(
+            .windowBackgroundColor,
+            for: contentView
+        )
+        if let footerView {
+            footerView.layer?.backgroundColor = NSColor.resolvedCGColor(
+                .windowBackgroundColor,
+                for: footerView
+            )
+        }
+        for view in settingsDescendants(of: contentView) {
+            (view as? SettingsAppearanceRefreshing)?.refreshAppearanceLayers()
+        }
+        ddnsStatusView.refreshAppearanceLayers()
+        routerStatusView.refreshAppearanceLayers()
+        desktopStatusView.refreshAppearanceLayers()
+        reachabilityStatusView.refreshAppearanceLayers()
+        contentView.needsDisplay = true
     }
 
     private func showAlert(title: String, message: String) {
@@ -1109,6 +1580,7 @@ private final class StatusMetricView: NSView {
     private let dot = NSView()
     private let titleLabel = NSTextField(labelWithString: "")
     private let messageLabel = NSTextField(labelWithString: "")
+    private var currentState: CheckState = .unknown
 
     init(title: String, width: CGFloat = SettingsLayout.cardContentWidth) {
         super.init(frame: .zero)
@@ -1122,6 +1594,9 @@ private final class StatusMetricView: NSView {
         addSubview(row)
 
         dot.wantsLayer = true
+        dot.identifier = NSUserInterfaceItemIdentifier(
+            "settings-status-dot-\(title.lowercased().replacingOccurrences(of: " ", with: "-"))"
+        )
         dot.layer?.cornerRadius = 5
         dot.widthAnchor.constraint(equalToConstant: 10).isActive = true
         dot.heightAnchor.constraint(equalToConstant: 10).isActive = true
@@ -1162,7 +1637,21 @@ private final class StatusMetricView: NSView {
     func update(_ status: ComponentStatus) {
         messageLabel.stringValue = status.message
         messageLabel.toolTip = status.message
-        dot.layer?.backgroundColor = color(for: status.state).cgColor
+        currentState = status.state
+        refreshAppearanceLayers()
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        dispatchPrecondition(condition: .onQueue(.main))
+        refreshAppearanceLayers()
+    }
+
+    func refreshAppearanceLayers() {
+        dot.layer?.backgroundColor = NSColor.resolvedCGColor(
+            color(for: currentState),
+            for: dot
+        )
     }
 
     private func color(for state: CheckState) -> NSColor {
@@ -1174,5 +1663,52 @@ private final class StatusMetricView: NSView {
         case .disabled: return .tertiaryLabelColor
         case .unknown: return .separatorColor
         }
+    }
+}
+
+private protocol SettingsAppearanceRefreshing: AnyObject {
+    func refreshAppearanceLayers()
+}
+
+private final class SettingsAppearanceTrackingView: NSView {
+    var onEffectiveAppearanceChanged: (() -> Void)?
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        dispatchPrecondition(condition: .onQueue(.main))
+        onEffectiveAppearanceChanged?()
+    }
+}
+
+private final class SettingsPanelView: NSStackView, SettingsAppearanceRefreshing {
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        dispatchPrecondition(condition: .onQueue(.main))
+        refreshAppearanceLayers()
+    }
+
+    func refreshAppearanceLayers() {
+        layer?.backgroundColor = NSColor.resolvedCGColor(
+            .controlBackgroundColor,
+            for: self
+        )
+        layer?.borderColor = NSColor.resolvedCGColor(
+            .separatorColor.withAlphaComponent(0.25),
+            for: self
+        )
+    }
+}
+
+private func settingsDescendants(of root: NSView) -> [NSView] {
+    root.subviews.flatMap { [$0] + settingsDescendants(of: $0) }
+}
+
+private extension NSColor {
+    static func resolvedCGColor(_ color: NSColor, for view: NSView) -> CGColor {
+        var resolved = color.cgColor
+        view.effectiveAppearance.performAsCurrentDrawingAppearance {
+            resolved = color.cgColor
+        }
+        return resolved
     }
 }
