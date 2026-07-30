@@ -206,6 +206,11 @@ enum SettingsCloudflareErrorPresentation {
 }
 
 final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
+    private struct PreparedPersistence {
+        let config: AppConfig
+        let tokenMutation: CloudflareTokenMutation
+    }
+
     private let agent: NetworkAgent
     private let tokenRemovalResponseProvider: (NSAlert) -> NSApplication.ModalResponse
 
@@ -254,6 +259,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
     private weak var connectButton: NSButton?
     private weak var authorizeTokenButton: NSButton?
     private weak var removeTokenButton: NSButton?
+    private weak var temporaryAccessButton: NSButton?
     private weak var copyURLButton: NSButton?
     private weak var footerView: NSView?
 
@@ -497,6 +503,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         let panel = makePanel(title: "Access & Health", subtitle: "Control public access and review connection health.")
 
         remoteEnabledButton.font = NSFont.systemFont(ofSize: 14, weight: .semibold)
+        remoteEnabledButton.identifier = NSUserInterfaceItemIdentifier("settings-remote-access")
         remoteEnabledButton.target = self
         remoteEnabledButton.action = #selector(remoteAccessFormChanged)
         startAtLoginButton.font = NSFont.systemFont(ofSize: 13)
@@ -504,8 +511,10 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         let hint = caption("When off, DNS updates and router mappings pause.")
 
         let openButton = iconButton(title: "30 min", symbol: "timer", action: #selector(openForThirtyMinutes))
+        openButton.identifier = NSUserInterfaceItemIdentifier("settings-open-30-minutes")
         openButton.bezelStyle = .rounded
         openButton.toolTip = "Open remote access for 30 minutes"
+        temporaryAccessButton = openButton
 
         let accessControls = NSStackView()
         accessControls.orientation = .horizontal
@@ -551,6 +560,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         panel.addArrangedSubview(labeledField("API token", tokenField))
 
         let connectButton = iconButton(title: "Verify", symbol: "arrow.triangle.2.circlepath", action: #selector(connectCloudflare))
+        connectButton.identifier = NSUserInterfaceItemIdentifier("settings-verify-token")
         connectButton.toolTip = "Verify the entered token and load its available Cloudflare domains"
         self.connectButton = connectButton
         let authorizeButton = iconButton(
@@ -558,6 +568,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
             symbol: "key",
             action: #selector(authorizeSavedToken)
         )
+        authorizeButton.identifier = NSUserInterfaceItemIdentifier("settings-authorize-token")
         authorizeButton.toolTip = "Allow this Gatebeam build to use and securely migrate a previously saved token"
         self.authorizeTokenButton = authorizeButton
         let removeButton = symbolButton(
@@ -647,6 +658,12 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
 
         configureSegment(ddnsProxyControl)
         configureSegment(publicIPProxyControl)
+        ddnsProxyControl.identifier = NSUserInterfaceItemIdentifier(
+            "settings-ddns-proxy-mode"
+        )
+        publicIPProxyControl.identifier = NSUserInterfaceItemIdentifier(
+            "settings-public-ip-proxy-mode"
+        )
         ddnsProxyControl.target = self
         ddnsProxyControl.action = #selector(proxyModeChanged)
         publicIPProxyControl.target = self
@@ -658,6 +675,9 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         panel.addArrangedSubview(caption("Direct is recommended when the probe must report the ISP-facing address."))
 
         customProxyField.delegate = self
+        customProxyField.identifier = NSUserInterfaceItemIdentifier(
+            "settings-custom-proxy-url"
+        )
         customProxyField.toolTip = "Use http://host:port or socks5://host:port. Credentials are not stored here."
         panel.addArrangedSubview(labeledField(
             "Custom proxy URL",
@@ -679,6 +699,9 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         proxyValidationLabel.lineBreakMode = .byTruncatingTail
         proxyValidationLabel.preferredMaxLayoutWidth = SettingsLayout.cardContentWidth
         proxyValidationLabel.widthAnchor.constraint(equalToConstant: SettingsLayout.cardContentWidth).isActive = true
+        proxyValidationLabel.identifier = NSUserInterfaceItemIdentifier(
+            "settings-proxy-validation"
+        )
         panel.addArrangedSubview(proxyValidationLabel)
         panel.addArrangedSubview(verticalSpacer())
         return panel
@@ -696,7 +719,9 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         let copyButton = iconButton(title: "Copy URL", symbol: "doc.on.doc", action: #selector(copyURL))
         copyButton.identifier = NSUserInterfaceItemIdentifier("settings-copy-url")
         let checkButton = iconButton(title: "Check Now", symbol: "arrow.clockwise", action: #selector(checkNow))
+        checkButton.identifier = NSUserInterfaceItemIdentifier("settings-check-now")
         let saveButton = iconButton(title: "Save Changes", symbol: "checkmark", action: #selector(save))
+        saveButton.identifier = NSUserInterfaceItemIdentifier("settings-save")
         self.copyURLButton = copyButton
         self.checkButton = checkButton
         self.saveButton = saveButton
@@ -912,6 +937,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
     private func formConfig() -> AppConfig {
         var config = agent.config
         config.remoteAccessEnabled = remoteEnabledButton.state == .on
+        config.clearTemporaryAccessExpiration()
         config.startAtLogin = startAtLoginButton.state == .on
         config.dnsProvider = providerControl.selectedSegment == 0 ? .disabled : .cloudflare
         config.preferredAddressFamily = addressPreference(for: addressControl.selectedSegment)
@@ -940,29 +966,57 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
         tokenMutation: CloudflareTokenMutation? = nil,
         completion: ((Bool) -> Void)? = nil
     ) {
-        guard !isPersisting, !isAuthorizingToken else { return }
-        cancelCloudflareVerification()
-        let normalized: AppConfig
+        guard !isBusy else { return }
+        let prepared: PreparedPersistence
         do {
-            normalized = try SettingsProxyValidation.normalizedForPersistence(config)
+            prepared = try preparePersistence(
+                config,
+                tokenMutation: tokenMutation
+            )
         } catch {
             presentPersistenceError(error)
             completion?(false)
             return
         }
+        performPersistence(prepared, completion: completion)
+    }
 
-        setPersistenceBusy(true)
-        let mutation = tokenMutation ?? SettingsTokenMutationPolicy.saveMutation(
-            enteredToken: tokenField.stringValue,
-            fieldWasEdited: tokenFieldWasEdited,
-            readState: tokenReadState
+    private func preparePersistence(
+        _ config: AppConfig,
+        tokenMutation: CloudflareTokenMutation? = nil
+    ) throws -> PreparedPersistence {
+        let normalized = try SettingsProxyValidation.normalizedForPersistence(
+            config
         )
-        agent.persistSettingsAsync(config: normalized, tokenMutation: mutation) { [weak self] result in
+        let mutation = try (
+            tokenMutation ?? SettingsTokenMutationPolicy.saveMutation(
+                enteredToken: tokenField.stringValue,
+                fieldWasEdited: tokenFieldWasEdited,
+                readState: tokenReadState
+            )
+        ).validated()
+        return PreparedPersistence(
+            config: normalized,
+            tokenMutation: mutation
+        )
+    }
+
+    private func performPersistence(
+        _ prepared: PreparedPersistence,
+        temporaryAccessMinutes: Int? = nil,
+        uiMutation: (() -> Void)? = nil,
+        completion: ((Bool) -> Void)? = nil
+    ) {
+        guard !isBusy else { return }
+        uiMutation?()
+        cancelCloudflareVerification()
+        setPersistenceBusy(true)
+        let handleResult: (Result<AppConfig, Error>) -> Void = { [weak self] result in
             guard let self else { return }
             self.setPersistenceBusy(false)
             switch result {
             case .success(let persistedConfig):
-                self.applyPersistedTokenMutation(mutation)
+                self.applyPersistedTokenMutation(prepared.tokenMutation)
                 self.synchronizePersistedProxyField(from: persistedConfig)
                 self.intervalField.stringValue = String(Int(persistedConfig.checkIntervalSeconds))
                 completion?(true)
@@ -974,10 +1028,24 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
                 completion?(false)
             }
         }
+        if let temporaryAccessMinutes {
+            agent.setTemporaryAccess(
+                minutes: temporaryAccessMinutes,
+                applying: prepared.config,
+                tokenMutation: prepared.tokenMutation,
+                completion: handleResult
+            )
+        } else {
+            agent.persistSettingsAsync(
+                config: prepared.config,
+                tokenMutation: prepared.tokenMutation,
+                completion: handleResult
+            )
+        }
     }
 
     @objc private func connectCloudflare() {
-        guard !isPersisting, !isAuthorizingToken else { return }
+        guard !isBusy else { return }
         let token = SettingsTokenMutationPolicy.verificationToken(
             enteredToken: tokenField.stringValue,
             readState: tokenReadState
@@ -991,7 +1059,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
     }
 
     @objc private func authorizeSavedToken() {
-        guard !isPersisting, !isAuthorizingToken else { return }
+        guard !isBusy else { return }
         cancelCloudflareVerification()
         setAuthorizationBusy(true)
         cloudflareFeedbackLabel.stringValue = "Waiting for macOS Keychain authorization..."
@@ -1034,7 +1102,7 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
     }
 
     @objc func confirmRemoveCloudflareToken() {
-        guard !isPersisting, !isAuthorizingToken else { return }
+        guard !isBusy else { return }
         let alert = SettingsCloudflareTokenRemovalPrompt.makeAlert()
         guard let mutation = SettingsCloudflareTokenRemovalPrompt.mutation(
             for: tokenRemovalResponseProvider(alert)
@@ -1113,12 +1181,16 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
     }
 
     private func updateBusyControls() {
-        let isBusy = isPersisting || isAuthorizingToken
         saveButton?.isEnabled = !isBusy
         checkButton?.isEnabled = !isBusy
         connectButton?.isEnabled = !isBusy
         authorizeTokenButton?.isEnabled = !isBusy
         removeTokenButton?.isEnabled = !isBusy
+        temporaryAccessButton?.isEnabled = !isBusy
+    }
+
+    private var isBusy: Bool {
+        isPersisting || isAuthorizingToken
     }
 
     private func presentPersistenceError(_ error: Error) {
@@ -1356,15 +1428,27 @@ final class SettingsWindowController: NSWindowController, NSTextFieldDelegate {
     }
 
     @objc private func checkNow() {
-        save()
+        agent.runCheck()
     }
 
     @objc private func openForThirtyMinutes() {
+        guard !isBusy else { return }
         var config = formConfig()
         config.remoteAccessEnabled = true
-        config.accessExpiresAt = Date().addingTimeInterval(30 * 60)
-        remoteEnabledButton.state = .on
-        persist(config)
+        let prepared: PreparedPersistence
+        do {
+            prepared = try preparePersistence(config)
+        } catch {
+            presentPersistenceError(error)
+            return
+        }
+        performPersistence(
+            prepared,
+            temporaryAccessMinutes: 30,
+            uiMutation: { [weak self] in
+                self?.remoteEnabledButton.state = .on
+            }
+        )
     }
 
     @objc private func remoteAccessFormChanged() {

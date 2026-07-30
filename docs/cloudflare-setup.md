@@ -20,7 +20,7 @@ Do not use a **Global API Key**. Do not give the token access to all zones unles
 
 ## Verify And Choose A Name
 
-In Gatebeam, use **Authorize Token** for an existing saved token when that control is available. For a new or replacement token, complete the token-save action offered by your build. Save the remaining settings, then click **Verify**. A success means Cloudflare accepted the token and the token can read at least one zone. It does **not** prove `Zone / DNS / Edit`; Cloudflare does not offer a harmless universal write test for this purpose. Older previews may access Keychain during Verify or Save, so do not assume Verify is side-effect-free unless the build includes the candidate explicit credential controls described in the [Keychain section](../README.md#keychain).
+For an existing saved token, choose **Authorize Token** first so this Gatebeam build may read it from Keychain. For a new or replacement token, paste it into **API token** and choose **Verify**; Gatebeam uses the entered value to load the readable domains without saving it. A success means Cloudflare accepted the token and it can read at least one zone. It does **not** prove `Zone / DNS / Edit`; Cloudflare does not offer a harmless universal write test for this purpose. After verification, choose **Save Changes** with the edited, non-empty token still in the field to write or replace the Keychain item. A normal save with an untouched token field performs no token read, write, or deletion.
 
 Choose the **Domain** as the Cloudflare zone, then enter the **Subdomain** in any of these forms:
 
@@ -60,9 +60,10 @@ Future Gatebeam versions may provide an explicit inactive-record cleanup flow. U
 Rotate a token when a device changes hands, a secret may have been exposed, or access should be narrowed.
 
 1. Create a new scoped token with the same minimum permissions and target-zone resource limit.
-2. In a build with the explicit credential controls, use **Replace Token** to store the non-empty new value.
-3. Verify and run a normal update to confirm the selected record can be written.
-4. In Cloudflare, revoke the old token from **My Profile** > **API Tokens**.
+2. Paste the new value into Gatebeam's **API token** field and choose **Verify** to confirm that it can read the intended domain. Verification does not save the token.
+3. Choose **Save Changes** while the edited, non-empty token remains in the field. Gatebeam then writes or replaces the Keychain item; macOS may request authorization for this explicit write.
+4. Run a normal update to confirm that the selected record can be written.
+5. In Cloudflare, revoke the old token from **My Profile** > **API Tokens**.
 
 To stop Gatebeam from using Cloudflare, turn the provider off and remove the saved token through its explicit **Remove Token** control when that control is present. Remove or rotate the token in Cloudflare as well; deleting a local Keychain item does not revoke a copied token elsewhere.
 
