@@ -513,6 +513,14 @@ struct AppConfig: Codable {
         normalized.checkIntervalSeconds = Self.normalizedCheckInterval(checkIntervalSeconds)
         return normalized
     }
+
+    mutating func clearTemporaryAccessExpiration() {
+        accessExpiresAt = nil
+        accessExpiresUptime = nil
+        accessBootIdentifier = nil
+        accessAnchorWallTime = nil
+        accessRemainingAtAnchor = nil
+    }
 }
 
 extension CheckState {

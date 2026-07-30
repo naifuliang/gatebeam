@@ -825,19 +825,33 @@ final class NetworkAgent {
     func setRemoteAccessEnabled(_ enabled: Bool) {
         var next = config
         next.remoteAccessEnabled = enabled
-        if !enabled {
-            next.accessExpiresAt = nil
-            next.accessExpiresUptime = nil
-            next.accessBootIdentifier = nil
-            next.accessAnchorWallTime = nil
-            next.accessRemainingAtAnchor = nil
-        }
+        next.clearTemporaryAccessExpiration()
         saveConfig(next)
     }
 
     func setTemporaryAccess(minutes: Int) {
-        var next = config
-        let duration = TimeInterval(minutes * 60)
+        saveConfig(temporaryAccessConfig(from: config, minutes: minutes))
+    }
+
+    func setTemporaryAccess(
+        minutes: Int,
+        applying newConfig: AppConfig,
+        tokenMutation: CloudflareTokenMutation = .keepExisting,
+        completion: @escaping (Result<AppConfig, Error>) -> Void
+    ) {
+        persistSettingsAsync(
+            config: temporaryAccessConfig(from: newConfig, minutes: minutes),
+            tokenMutation: tokenMutation,
+            completion: completion
+        )
+    }
+
+    private func temporaryAccessConfig(
+        from baseConfig: AppConfig,
+        minutes: Int
+    ) -> AppConfig {
+        var next = baseConfig
+        let duration = max(0, TimeInterval(minutes) * 60)
         let now = nowProvider()
         next.remoteAccessEnabled = true
         next.accessExpiresAt = now.addingTimeInterval(duration)
@@ -845,7 +859,7 @@ final class NetworkAgent {
         next.accessBootIdentifier = bootIdentifierProvider()
         next.accessAnchorWallTime = now
         next.accessRemainingAtAnchor = duration
-        saveConfig(next)
+        return next
     }
 
     func cloudflareToken() -> String {

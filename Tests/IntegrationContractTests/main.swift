@@ -1889,6 +1889,830 @@ func testCloudflareTokenRemovalControllerPath() throws {
     controller.close()
 }
 
+func settingsView<View: NSView>(
+    identifier: String,
+    in controller: SettingsWindowController,
+    as type: View.Type = View.self
+) throws -> View {
+    func find(in view: NSView) -> View? {
+        if let matched = view as? View,
+           matched.identifier?.rawValue == identifier {
+            return matched
+        }
+        for subview in view.subviews {
+            if let matched = find(in: subview) {
+                return matched
+            }
+        }
+        return nil
+    }
+
+    guard let contentView = controller.window?.contentView,
+          let matched = find(in: contentView) else {
+        throw IntegrationContractFailure(
+            "Settings view \(identifier) was not found in the real window hierarchy"
+        )
+    }
+    return matched
+}
+
+func settingsButton(
+    identifier: String,
+    in controller: SettingsWindowController
+) throws -> NSButton {
+    try settingsView(identifier: identifier, in: controller)
+}
+
+func settingsConfigSnapshot(_ config: AppConfig) throws -> Data {
+    let encoder = JSONEncoder()
+    encoder.dateEncodingStrategy = .iso8601
+    encoder.outputFormatting = [.sortedKeys]
+    return try encoder.encode(config)
+}
+
+func deliverSettingsAction(_ button: NSButton) throws {
+    guard let action = button.action else {
+        throw IntegrationContractFailure(
+            "Settings button \(button.identifier?.rawValue ?? "unknown") has no action"
+        )
+    }
+    _ = NSApplication.shared.sendAction(
+        action,
+        to: button.target,
+        from: button
+    )
+}
+
+func testSettingsUIAccessActionsPersistExplicitLifetimeModes() throws {
+    _ = NSApplication.shared
+    let baseline = Date(timeIntervalSince1970: 2_000_100_000)
+    let staleDeadline = baseline.addingTimeInterval(600)
+
+    func temporaryFixture(remoteAccessEnabled: Bool) -> AppConfig {
+        var config = AppConfig.default
+        config.remoteAccessEnabled = remoteAccessEnabled
+        config.dnsProvider = .disabled
+        config.mappingProtocolPreference = .disabled
+        config.accessExpiresAt = staleDeadline
+        config.accessExpiresUptime = 700
+        config.accessBootIdentifier = "settings-ui-boot"
+        config.accessAnchorWallTime = baseline.addingTimeInterval(-30)
+        config.accessRemainingAtAnchor = 630
+        return config
+    }
+
+    func hasNoTemporaryExpiration(_ config: AppConfig) -> Bool {
+        config.accessExpiresAt == nil
+            && config.accessExpiresUptime == nil
+            && config.accessBootIdentifier == nil
+            && config.accessAnchorWallTime == nil
+            && config.accessRemainingAtAnchor == nil
+    }
+
+    func runSavePath(
+        name: String,
+        enabled: Bool
+    ) throws {
+        let directory = try makeTemporaryDirectory(named: "settings-ui-\(name)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = AppConfigStore(baseDirectory: directory)
+        let agent = NetworkAgent(
+            configStore: store,
+            keychain: inMemoryKeychain(),
+            initialConfig: temporaryFixture(remoteAccessEnabled: true),
+            localNetworkService: MockLocalNetworkService(),
+            routerMappingService: MockRouterMappingService(),
+            nowProvider: { baseline },
+            monotonicUptimeProvider: { 100 },
+            bootIdentifierProvider: { "settings-ui-boot" },
+            performInitialCheckOnStart: false
+        )
+        let controller = SettingsWindowController(
+            agent: agent,
+            autoLoadCloudflare: false
+        )
+        defer {
+            controller.close()
+            stopAgentForCleanup(agent)
+        }
+
+        let remoteButton = try settingsButton(
+            identifier: "settings-remote-access",
+            in: controller
+        )
+        let saveButton = try settingsButton(
+            identifier: "settings-save",
+            in: controller
+        )
+        remoteButton.state = enabled ? .on : .off
+        saveButton.performClick(nil)
+
+        try expect(
+            waitUntil {
+                let current = agent.config
+                guard current.remoteAccessEnabled == enabled,
+                      hasNoTemporaryExpiration(current),
+                      let persisted = try? store.load() else {
+                    return false
+                }
+                return persisted.remoteAccessEnabled == enabled
+                    && hasNoTemporaryExpiration(persisted)
+            },
+            "The real Settings \(name) save must persist its explicit lifetime mode "
+                + "and clear every temporary-access field"
+        )
+    }
+
+    try runSavePath(name: "disabled", enabled: false)
+    try runSavePath(name: "permanent", enabled: true)
+
+    let temporaryDirectory = try makeTemporaryDirectory(
+        named: "settings-ui-temporary"
+    )
+    defer {
+        try? FileManager.default.removeItem(at: temporaryDirectory)
+    }
+    let temporaryStore = AppConfigStore(baseDirectory: temporaryDirectory)
+    var disabledConfig = temporaryFixture(remoteAccessEnabled: false)
+    disabledConfig.clearTemporaryAccessExpiration()
+    let temporaryTokenReads = LockedCounter()
+    let temporaryTokenWrites = LockedCounter()
+    let temporaryTokenDeletes = LockedCounter()
+    let temporaryKeychain = KeychainStore(
+        service: "io.github.naifuliang.gatebeam.settings-ui-temporary",
+        legacyServices: [],
+        operationHandlers: KeychainOperationHandlers(
+            scopedSet: { _, _, _, _, _ in
+                temporaryTokenWrites.increment()
+            },
+            scopedGet: { _, _, _ in
+                temporaryTokenReads.increment()
+                return nil
+            },
+            scopedDelete: { _, _, _ in
+                temporaryTokenDeletes.increment()
+            }
+        )
+    )
+    let temporaryAgent = NetworkAgent(
+        configStore: temporaryStore,
+        keychain: temporaryKeychain,
+        initialConfig: disabledConfig,
+        localNetworkService: MockLocalNetworkService(),
+        routerMappingService: MockRouterMappingService(),
+        nowProvider: { baseline },
+        monotonicUptimeProvider: { 100 },
+        bootIdentifierProvider: { "settings-ui-boot" },
+        performInitialCheckOnStart: false
+    )
+    let temporaryController = SettingsWindowController(
+        agent: temporaryAgent,
+        autoLoadCloudflare: false
+    )
+    defer {
+        temporaryController.close()
+        stopAgentForCleanup(temporaryAgent)
+    }
+
+    let temporaryButton = try settingsButton(
+        identifier: "settings-open-30-minutes",
+        in: temporaryController
+    )
+    let remoteButton = try settingsButton(
+        identifier: "settings-remote-access",
+        in: temporaryController
+    )
+    let checkButton = try settingsButton(
+        identifier: "settings-check-now",
+        in: temporaryController
+    )
+    try expect(
+        temporaryButton.isEnabled && remoteButton.state == .off,
+        "The idle Settings window must offer temporary access without "
+            + "preemptively changing the access checkbox"
+    )
+    temporaryButton.performClick(nil)
+    try expect(
+        waitUntil {
+            let current = temporaryAgent.config
+            guard current.remoteAccessEnabled,
+                  current.accessExpiresAt == baseline.addingTimeInterval(1_800),
+                  current.accessExpiresUptime == 1_900,
+                  current.accessBootIdentifier == "settings-ui-boot",
+                  current.accessAnchorWallTime == baseline,
+                  current.accessRemainingAtAnchor == 1_800,
+                  let persisted = try? temporaryStore.load() else {
+                return false
+            }
+            return persisted.remoteAccessEnabled
+                && persisted.accessExpiresAt
+                    == baseline.addingTimeInterval(1_800)
+                && persisted.accessExpiresUptime == 1_900
+                && persisted.accessBootIdentifier == "settings-ui-boot"
+                && persisted.accessAnchorWallTime == baseline
+                && persisted.accessRemainingAtAnchor == 1_800
+                && temporaryButton.isEnabled
+                && remoteButton.state == .on
+                && temporaryTokenReads.current == 0
+                && temporaryTokenWrites.current == 0
+                && temporaryTokenDeletes.current == 0
+        },
+        "The real 30-minute button must use the agent entry point and durably "
+            + "write the complete wall, monotonic, boot, and anchor deadline"
+    )
+    try expect(
+        temporaryButton.isEnabled
+            && remoteButton.state == .on
+            && temporaryTokenReads.current == 0
+            && temporaryTokenWrites.current == 0
+            && temporaryTokenDeletes.current == 0,
+        "A completed temporary-access click must restore the button, show the "
+            + "persisted enabled state, and leave an untouched token alone"
+    )
+    let temporarySnapshot = temporaryAgent.config
+    checkButton.performClick(nil)
+    RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+    try expect(
+        temporaryAgent.config.accessExpiresAt
+                == temporarySnapshot.accessExpiresAt
+            && temporaryAgent.config.accessExpiresUptime
+                == temporarySnapshot.accessExpiresUptime
+            && temporaryAgent.config.accessBootIdentifier
+                == temporarySnapshot.accessBootIdentifier
+            && temporaryAgent.config.accessAnchorWallTime
+                == temporarySnapshot.accessAnchorWallTime
+            && temporaryAgent.config.accessRemainingAtAnchor
+                == temporarySnapshot.accessRemainingAtAnchor,
+        "Check Now must inspect the saved configuration without converting "
+            + "temporary access into permanent access"
+    )
+}
+
+func testTemporaryAccessRejectsInvalidCustomProxyWithoutMutation() throws {
+    _ = NSApplication.shared
+    let directory = try makeTemporaryDirectory(
+        named: "temporary-access-invalid-custom-proxy"
+    )
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let configWrites = LockedCounter()
+    let tokenReads = LockedCounter()
+    let authorizationReads = LockedCounter()
+    let tokenWrites = LockedCounter()
+    let tokenDeletes = LockedCounter()
+    let configURL = URL(fileURLWithPath: agentConfigPath(directory))
+    let store = AppConfigStore(
+        configURL: configURL,
+        dataWriter: { data, url in
+            configWrites.increment()
+            try data.write(to: url, options: [.atomic])
+        }
+    )
+    var initialConfig = AppConfig.default
+    initialConfig.remoteAccessEnabled = false
+    initialConfig.dnsProvider = .disabled
+    initialConfig.mappingProtocolPreference = .disabled
+    initialConfig.ddnsProxyMode = .custom
+    initialConfig.publicIPProxyMode = .direct
+    initialConfig.customProxyURL = "https://proxy.example.net:443/unsupported"
+    try store.save(initialConfig)
+    let initialDiskData = try Data(contentsOf: configURL)
+    let initialDiskSnapshot = try settingsConfigSnapshot(store.load())
+
+    let keychain = KeychainStore(
+        service: "io.github.naifuliang.gatebeam.settings-invalid-proxy",
+        legacyServices: [],
+        operationHandlers: KeychainOperationHandlers(
+            scopedSet: { _, _, _, _, _ in tokenWrites.increment() },
+            scopedGet: { _, _, interaction in
+                tokenReads.increment()
+                if interaction == .userInitiated {
+                    authorizationReads.increment()
+                }
+                return nil
+            },
+            scopedDelete: { _, _, _ in tokenDeletes.increment() }
+        )
+    )
+    let localNetwork = MockLocalNetworkService()
+    let router = MockRouterMappingService()
+    let agent = NetworkAgent(
+        configStore: store,
+        keychain: keychain,
+        initialConfig: initialConfig,
+        localNetworkService: localNetwork,
+        routerMappingService: router,
+        performInitialCheckOnStart: false
+    )
+    let controller = SettingsWindowController(
+        agent: agent,
+        autoLoadCloudflare: false
+    )
+    defer {
+        controller.close()
+        stopAgentForCleanup(agent)
+    }
+
+    let temporaryButton = try settingsButton(
+        identifier: "settings-open-30-minutes",
+        in: controller
+    )
+    let remoteButton = try settingsButton(
+        identifier: "settings-remote-access",
+        in: controller
+    )
+    let ddnsProxyControl: NSSegmentedControl = try settingsView(
+        identifier: "settings-ddns-proxy-mode",
+        in: controller
+    )
+    let customProxyField: NSTextField = try settingsView(
+        identifier: "settings-custom-proxy-url",
+        in: controller
+    )
+    let validationLabel: NSTextField = try settingsView(
+        identifier: "settings-proxy-validation",
+        in: controller
+    )
+    let initialAgentSnapshot = try settingsConfigSnapshot(agent.config)
+    try expect(
+        temporaryButton.isEnabled
+            && remoteButton.state == .off
+            && ddnsProxyControl.selectedSegment == 2
+            && customProxyField.stringValue == initialConfig.customProxyURL,
+        "The real Settings window must begin off with the invalid Custom "
+            + "proxy form intact before temporary access is attempted"
+    )
+
+    temporaryButton.performClick(nil)
+    RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+
+    let finalAgentSnapshot = try settingsConfigSnapshot(agent.config)
+    let finalDiskData = try Data(contentsOf: configURL)
+    let finalDiskSnapshot = try settingsConfigSnapshot(store.load())
+    try expect(
+        remoteButton.state == .off
+            && temporaryButton.isEnabled
+            && finalAgentSnapshot == initialAgentSnapshot
+            && finalDiskData == initialDiskData
+            && finalDiskSnapshot == initialDiskSnapshot
+            && configWrites.current == 1,
+        "Invalid Custom proxy validation must run before any checkbox, Agent, "
+            + "or durable configuration mutation"
+    )
+    try expect(
+        tokenReads.current == 0
+            && authorizationReads.current == 0
+            && tokenWrites.current == 0
+            && tokenDeletes.current == 0
+            && localNetwork.callCount == 0
+            && router.operationCount == 0,
+        "Rejected temporary access must perform zero Keychain authorization, "
+            + "local-network discovery, or router operation"
+    )
+    try expect(
+        !validationLabel.isHidden
+            && validationLabel.stringValue.contains(
+                SettingsProxyValidation.formatMessage
+            )
+            && validationLabel.toolTip == validationLabel.stringValue,
+        "The rejected action must leave a visible, specific proxy format error"
+    )
+}
+
+func testTemporaryAccessRejectsBusySettingsSaveWithoutMutation() throws {
+    _ = NSApplication.shared
+    let directory = try makeTemporaryDirectory(
+        named: "temporary-access-save-busy"
+    )
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let persistenceStarted = DispatchSemaphore(value: 0)
+    let releasePersistence = DispatchSemaphore(value: 0)
+    let configWrites = LockedCounter()
+    let tokenReads = LockedCounter()
+    let tokenWrites = LockedCounter()
+    let tokenDeletes = LockedCounter()
+    let configURL = URL(fileURLWithPath: agentConfigPath(directory))
+    let store = AppConfigStore(
+        configURL: configURL,
+        dataWriter: { data, url in
+            configWrites.increment()
+            persistenceStarted.signal()
+            releasePersistence.wait()
+            try data.write(to: url, options: [.atomic])
+        }
+    )
+    let keychain = KeychainStore(
+        service: "io.github.naifuliang.gatebeam.settings-save-busy",
+        legacyServices: [],
+        operationHandlers: KeychainOperationHandlers(
+            scopedSet: { _, _, _, _, _ in tokenWrites.increment() },
+            scopedGet: { _, _, _ in
+                tokenReads.increment()
+                return nil
+            },
+            scopedDelete: { _, _, _ in tokenDeletes.increment() }
+        )
+    )
+    var initialConfig = AppConfig.default
+    initialConfig.dnsProvider = .disabled
+    initialConfig.mappingProtocolPreference = .disabled
+    let agent = NetworkAgent(
+        configStore: store,
+        keychain: keychain,
+        initialConfig: initialConfig,
+        localNetworkService: MockLocalNetworkService(),
+        routerMappingService: MockRouterMappingService(),
+        performInitialCheckOnStart: false
+    )
+    let controller = SettingsWindowController(
+        agent: agent,
+        autoLoadCloudflare: false
+    )
+    defer {
+        releasePersistence.signal()
+        controller.close()
+        stopAgentForCleanup(agent)
+    }
+    let temporaryButton = try settingsButton(
+        identifier: "settings-open-30-minutes",
+        in: controller
+    )
+    let remoteButton = try settingsButton(
+        identifier: "settings-remote-access",
+        in: controller
+    )
+    let saveButton = try settingsButton(
+        identifier: "settings-save",
+        in: controller
+    )
+    let verifyButton = try settingsButton(
+        identifier: "settings-verify-token",
+        in: controller
+    )
+    let checkButton = try settingsButton(
+        identifier: "settings-check-now",
+        in: controller
+    )
+    let initialSnapshot = try settingsConfigSnapshot(agent.config)
+
+    saveButton.performClick(nil)
+    try expect(
+        persistenceStarted.wait(timeout: .now() + 3) == .success,
+        "The real Save Changes action must enter the blocked persistence fixture"
+    )
+    try expect(
+        !temporaryButton.isEnabled
+            && !saveButton.isEnabled
+            && !verifyButton.isEnabled
+            && !checkButton.isEnabled,
+        "Temporary access must be disabled with the existing Save, Verify, "
+            + "and Check controls while settings persistence is active"
+    )
+
+    temporaryButton.performClick(nil)
+    try deliverSettingsAction(temporaryButton)
+    RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+    let busySaveSnapshot = try settingsConfigSnapshot(agent.config)
+    try expect(
+        remoteButton.state == .off
+            && busySaveSnapshot == initialSnapshot
+            && configWrites.current == 1
+            && tokenReads.current == 0
+            && tokenWrites.current == 0
+            && tokenDeletes.current == 0,
+        "A click or queued temporary-access action during Save must leave the "
+            + "checkbox, complete agent config, in-flight write count, and "
+            + "Keychain side effects unchanged"
+    )
+
+    releasePersistence.signal()
+    try expect(
+        waitUntil {
+            temporaryButton.isEnabled
+                && saveButton.isEnabled
+                && verifyButton.isEnabled
+                && checkButton.isEnabled
+        },
+        "All Settings actions must become available together after Save completes"
+    )
+    let completedSaveSnapshot = try settingsConfigSnapshot(agent.config)
+    try expect(
+        remoteButton.state == .off
+            && completedSaveSnapshot == initialSnapshot
+            && configWrites.current == 1
+            && tokenReads.current == 0
+            && tokenWrites.current == 0
+            && tokenDeletes.current == 0,
+        "Completing the original Save must not replay the rejected temporary action"
+    )
+}
+
+func testTemporaryAccessRejectsTokenAuthorizationBusyWithoutMutation() throws {
+    _ = NSApplication.shared
+    let directory = try makeTemporaryDirectory(
+        named: "temporary-access-authorization-busy"
+    )
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let authorizationStarted = DispatchSemaphore(value: 0)
+    let releaseAuthorization = DispatchSemaphore(value: 0)
+    let tokenReads = LockedCounter()
+    let tokenWrites = LockedCounter()
+    let tokenDeletes = LockedCounter()
+    let keychain = KeychainStore(
+        service: "io.github.naifuliang.gatebeam.settings-authorization-busy",
+        legacyServices: [],
+        operationHandlers: KeychainOperationHandlers(
+            scopedSet: { _, _, _, _, _ in tokenWrites.increment() },
+            scopedGet: { _, _, interaction in
+                tokenReads.increment()
+                if interaction == .userInitiated {
+                    authorizationStarted.signal()
+                    releaseAuthorization.wait()
+                }
+                return nil
+            },
+            scopedDelete: { _, _, _ in tokenDeletes.increment() }
+        )
+    )
+    var initialConfig = AppConfig.default
+    initialConfig.dnsProvider = .disabled
+    initialConfig.mappingProtocolPreference = .disabled
+    let agent = NetworkAgent(
+        configStore: AppConfigStore(baseDirectory: directory),
+        keychain: keychain,
+        initialConfig: initialConfig,
+        localNetworkService: MockLocalNetworkService(),
+        routerMappingService: MockRouterMappingService(),
+        performInitialCheckOnStart: false
+    )
+    let controller = SettingsWindowController(
+        agent: agent,
+        autoLoadCloudflare: false
+    )
+    defer {
+        releaseAuthorization.signal()
+        controller.close()
+        stopAgentForCleanup(agent)
+    }
+    let temporaryButton = try settingsButton(
+        identifier: "settings-open-30-minutes",
+        in: controller
+    )
+    let remoteButton = try settingsButton(
+        identifier: "settings-remote-access",
+        in: controller
+    )
+    let saveButton = try settingsButton(
+        identifier: "settings-save",
+        in: controller
+    )
+    let verifyButton = try settingsButton(
+        identifier: "settings-verify-token",
+        in: controller
+    )
+    let authorizeButton = try settingsButton(
+        identifier: "settings-authorize-token",
+        in: controller
+    )
+    let initialSnapshot = try settingsConfigSnapshot(agent.config)
+
+    authorizeButton.performClick(nil)
+    try expect(
+        authorizationStarted.wait(timeout: .now() + 3) == .success,
+        "The real Authorize Token action must enter the blocked Keychain fixture"
+    )
+    try expect(
+        !temporaryButton.isEnabled
+            && !saveButton.isEnabled
+            && !verifyButton.isEnabled
+            && !authorizeButton.isEnabled,
+        "Temporary access must be disabled with Save, Verify, and Authorize "
+            + "while Keychain authorization is active"
+    )
+
+    temporaryButton.performClick(nil)
+    try deliverSettingsAction(temporaryButton)
+    RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+    let busyAuthorizationSnapshot = try settingsConfigSnapshot(agent.config)
+    try expect(
+        remoteButton.state == .off
+            && busyAuthorizationSnapshot == initialSnapshot
+            && !FileManager.default.fileExists(atPath: agentConfigPath(directory))
+            && tokenReads.current == 1
+            && tokenWrites.current == 0
+            && tokenDeletes.current == 0,
+        "A click or queued temporary-access action during authorization must "
+            + "leave UI and config untouched and add no config or Keychain side effect"
+    )
+
+    releaseAuthorization.signal()
+    try expect(
+        waitUntil {
+            temporaryButton.isEnabled
+                && saveButton.isEnabled
+                && verifyButton.isEnabled
+                && authorizeButton.isEnabled
+        },
+        "All Settings actions must become available together after authorization"
+    )
+    let completedAuthorizationSnapshot = try settingsConfigSnapshot(
+        agent.config
+    )
+    try expect(
+        remoteButton.state == .off
+            && completedAuthorizationSnapshot == initialSnapshot
+            && !FileManager.default.fileExists(atPath: agentConfigPath(directory))
+            && tokenReads.current == 1
+            && tokenWrites.current == 0
+            && tokenDeletes.current == 0,
+        "Authorization completion must not replay the rejected temporary action"
+    )
+}
+
+func testTemporaryAccessEntrySurvivesClockAndRestartBoundaries() throws {
+    let directory = try makeTemporaryDirectory(
+        named: "temporary-entry-boundaries"
+    )
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let store = AppConfigStore(baseDirectory: directory)
+    let wall = LockedClock(Date(timeIntervalSince1970: 2_000_110_000))
+    let uptime = LockedMonotonicClock(100)
+    var base = AppConfig.default
+    base.dnsProvider = .disabled
+    base.mappingProtocolPreference = .disabled
+
+    let firstAgent = NetworkAgent(
+        configStore: store,
+        keychain: inMemoryKeychain(),
+        initialConfig: base,
+        localNetworkService: MockLocalNetworkService(),
+        routerMappingService: MockRouterMappingService(),
+        nowProvider: { wall.now() },
+        monotonicUptimeProvider: { uptime.now() },
+        bootIdentifierProvider: { "temporary-entry-boot-a" },
+        performInitialCheckOnStart: false
+    )
+    defer { stopAgentForCleanup(firstAgent) }
+
+    firstAgent.setTemporaryAccess(minutes: 30)
+    try expect(
+        waitUntil {
+            firstAgent.config.accessExpiresUptime == 1_900
+                && (try? store.load().accessExpiresUptime) == 1_900
+        },
+        "The first temporary-access request must persist its monotonic deadline"
+    )
+
+    let rolledBackWall = wall.now().addingTimeInterval(-3_600)
+    wall.set(rolledBackWall)
+    uptime.set(160)
+    firstAgent.setTemporaryAccess(minutes: 30)
+    try expect(
+        waitUntil {
+            let current = firstAgent.config
+            return current.accessExpiresAt
+                    == rolledBackWall.addingTimeInterval(1_800)
+                && current.accessExpiresUptime == 1_960
+                && current.accessBootIdentifier
+                    == "temporary-entry-boot-a"
+                && current.accessAnchorWallTime == rolledBackWall
+                && current.accessRemainingAtAnchor == 1_800
+                && (try? store.load().accessExpiresUptime) == 1_960
+        },
+        "A repeated request after wall-clock rollback must replace every anchor "
+            + "and grant exactly 30 new monotonic minutes"
+    )
+    try stopAgent(firstAgent)
+
+    let sameBootAgent = NetworkAgent(
+        configStore: store,
+        keychain: inMemoryKeychain(),
+        localNetworkService: MockLocalNetworkService(),
+        routerMappingService: MockRouterMappingService(),
+        nowProvider: { rolledBackWall.addingTimeInterval(120) },
+        monotonicUptimeProvider: { 280 },
+        bootIdentifierProvider: { "temporary-entry-boot-a" },
+        performInitialCheckOnStart: false
+    )
+    defer { stopAgentForCleanup(sameBootAgent) }
+    try expect(
+        sameBootAgent.config.remoteAccessEnabled
+            && sameBootAgent.config.accessExpiresUptime == 1_960
+            && sameBootAgent.config.accessBootIdentifier
+                == "temporary-entry-boot-a"
+            && sameBootAgent.config.accessAnchorWallTime == rolledBackWall
+            && sameBootAgent.config.accessRemainingAtAnchor == 1_800,
+        "A process restart in the same boot must preserve the monotonic deadline"
+    )
+    try stopAgent(sameBootAgent)
+
+    let crossBootAgent = NetworkAgent(
+        configStore: store,
+        keychain: inMemoryKeychain(),
+        localNetworkService: MockLocalNetworkService(),
+        routerMappingService: MockRouterMappingService(),
+        nowProvider: { rolledBackWall.addingTimeInterval(-7_200) },
+        monotonicUptimeProvider: { 10 },
+        bootIdentifierProvider: { "temporary-entry-boot-b" },
+        performInitialCheckOnStart: false
+    )
+    defer { stopAgentForCleanup(crossBootAgent) }
+    let crossBoot = crossBootAgent.config
+    try expect(
+        !crossBoot.remoteAccessEnabled
+            && hasNoTemporaryAccessExpiration(crossBoot),
+        "A temporary session restored in another boot must fail closed even "
+            + "when the wall clock moved backward"
+    )
+    try stopAgent(crossBootAgent)
+}
+
+func hasNoTemporaryAccessExpiration(_ config: AppConfig) -> Bool {
+    config.accessExpiresAt == nil
+        && config.accessExpiresUptime == nil
+        && config.accessBootIdentifier == nil
+        && config.accessAnchorWallTime == nil
+        && config.accessRemainingAtAnchor == nil
+}
+
+func testTemporaryAccessUsesMonotonicDeadlineAfterWallRollback() throws {
+    let directory = try makeTemporaryDirectory(
+        named: "temporary-monotonic-wall-rollback"
+    )
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let wall = LockedClock(Date(timeIntervalSince1970: 2_000_120_000))
+    let uptime = LockedMonotonicClock(100)
+    let scheduleLock = NSLock()
+    var scheduledHandlers: [() -> Void] = []
+    var config = AppConfig.default
+    config.dnsProvider = .disabled
+    config.mappingProtocolPreference = .disabled
+    let agent = NetworkAgent(
+        configStore: AppConfigStore(baseDirectory: directory),
+        keychain: inMemoryKeychain(),
+        initialConfig: config,
+        localNetworkService: MockLocalNetworkService(),
+        routerMappingService: MockRouterMappingService(),
+        nowProvider: { wall.now() },
+        monotonicUptimeProvider: { uptime.now() },
+        bootIdentifierProvider: { "temporary-wall-rollback-boot" },
+        performInitialCheckOnStart: false,
+        expirationTimerScheduler: { _, handler in
+            scheduleLock.lock()
+            scheduledHandlers.append(handler)
+            scheduleLock.unlock()
+            return NetworkAgentScheduledTimer {}
+        }
+    )
+    defer { stopAgentForCleanup(agent) }
+    agent.start()
+    agent.setTemporaryAccess(minutes: 30)
+    try expect(
+        waitUntil {
+            scheduleLock.lock()
+            let scheduled = !scheduledHandlers.isEmpty
+            scheduleLock.unlock()
+            return scheduled && agent.config.accessExpiresUptime == 1_900
+        },
+        "Temporary access must arm its monotonic expiration timer"
+    )
+
+    wall.set(wall.now().addingTimeInterval(-86_400))
+    uptime.set(1_899)
+    scheduleLock.lock()
+    let earlyHandler = scheduledHandlers.last
+    scheduleLock.unlock()
+    guard let earlyHandler else {
+        throw IntegrationContractFailure(
+            "The temporary-access expiration handler was not captured"
+        )
+    }
+    earlyHandler()
+    RunLoop.current.run(until: Date().addingTimeInterval(0.05))
+    try expect(
+        agent.config.remoteAccessEnabled,
+        "Wall-clock rollback must not expire access before its monotonic deadline"
+    )
+
+    uptime.set(1_900)
+    scheduleLock.lock()
+    let deadlineHandler = scheduledHandlers.last
+    scheduleLock.unlock()
+    guard let deadlineHandler else {
+        throw IntegrationContractFailure(
+            "The monotonic deadline handler was not rescheduled"
+        )
+    }
+    deadlineHandler()
+    try expect(
+        waitUntil {
+            !agent.config.remoteAccessEnabled
+                && hasNoTemporaryAccessExpiration(agent.config)
+        },
+        "Temporary access must close at 30 monotonic minutes despite a wall-clock rollback"
+    )
+    try stopAgent(agent)
+}
+
 func testCloudflareZoneReadPresentationDoesNotClaimDNSReady() throws {
     let singular = SettingsCloudflareZoneReadPresentation.message(
         zoneCount: 1,
@@ -7472,6 +8296,12 @@ let tests: [(String, () throws -> Void)] = [
     ("Settings Verify uses unsaved Cloudflare proxy", testSettingsVerifyUsesUnsavedCloudflareProxyWithoutPersistence),
     ("Cloudflare token removal prompt contract", testCloudflareTokenRemovalPromptCancelAndConfirmContract),
     ("Cloudflare token removal controller path", testCloudflareTokenRemovalControllerPath),
+    ("Settings UI access lifetime actions", testSettingsUIAccessActionsPersistExplicitLifetimeModes),
+    ("temporary access rejects invalid Custom proxy", testTemporaryAccessRejectsInvalidCustomProxyWithoutMutation),
+    ("temporary access rejects busy Settings save", testTemporaryAccessRejectsBusySettingsSaveWithoutMutation),
+    ("temporary access rejects busy token authorization", testTemporaryAccessRejectsTokenAuthorizationBusyWithoutMutation),
+    ("temporary access clock and restart boundaries", testTemporaryAccessEntrySurvivesClockAndRestartBoundaries),
+    ("temporary access monotonic wall rollback", testTemporaryAccessUsesMonotonicDeadlineAfterWallRollback),
     ("Cloudflare Zone Read presentation", testCloudflareZoneReadPresentationDoesNotClaimDNSReady),
     ("Settings Cloudflare error presentation", testSettingsCloudflareErrorPresentationFailsClosed),
     ("remote connection URL off-state policy", testRemoteConnectionURLPolicyFailsClosedWhenAccessIsOff),

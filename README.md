@@ -14,7 +14,7 @@ Gatebeam is a native macOS menu bar app for Cloudflare DDNS and optional local-r
 
 1. In macOS System Settings, enable **Screen Sharing** or **Remote Management** and confirm the intended account may sign in.
 2. Create a scoped Cloudflare API token following [Cloudflare setup](docs/cloudflare-setup.md). Do not use a Global API Key.
-3. Open Gatebeam from the menu bar, open **Settings**, and choose Cloudflare. For an existing saved token, use **Authorize Token** when available. For a new or replacement token, complete the token-save action offered by your build. Save the remaining settings, then click **Verify** to load the zones the token can read.
+3. Open Gatebeam from the menu bar, open **Settings**, and choose Cloudflare. For an existing saved token, use **Authorize Token**. For a new or replacement token, paste it into **API token** and choose **Verify** to load readable domains without saving it; then choose **Save Changes** to store the edited token and settings.
 4. Choose a **Domain** (the Cloudflare zone) and enter a **Subdomain**. For example, choose `example.com` and enter `remote`, `remote.example.com`, or `@`.
 5. Choose the address mode, network paths, router protocol, ports, and lease. See [Networking and remote access](docs/networking.md).
 6. Save the configuration, review the displayed status, then explicitly turn on remote access.
@@ -40,12 +40,13 @@ For the complete contract and diagnosis path, read [Proxy policy](docs/proxy-pol
 
 Gatebeam stores the Cloudflare token in the macOS Keychain, never in its normal configuration file. The candidate credential-safety release introduces explicit token controls:
 
-- **Save Changes** keeps an existing saved token and does not read, write, or delete it.
+- **Save Changes** does not read, write, or delete an existing token when the API token field was not edited.
+- Pasting or editing a non-empty token and then choosing **Save Changes** writes or replaces that token in Keychain.
+- **Verify** checks the entered token, or a token already authorized in this app session, and loads readable domains. Verification does not save the token.
 - **Authorize Token** is the intentional path to let the current build access an existing token, including after an app upgrade.
-- **Replace Token** intentionally writes a non-empty replacement.
 - **Remove Token** requires confirmation and deletes only the saved token.
 
-These controls may cause a one-time macOS Keychain authorization prompt. Background checks, launch, timers, diagnostics, and normal saves should not prompt. If macOS denies or cancels a prompt, do not keep retrying: open Settings and use the explicit authorization action when ready. This behavior applies only after the candidate credential-safety change is included. Older preview builds may access Keychain during Verify or Save; upgrade to the candidate release before relying on the explicit-control contract.
+macOS may request Keychain authorization when you explicitly authorize an existing token, save an edited token, or remove one. A normal save with an untouched token field, background checks, launch, timers, and diagnostics do not request interactive Keychain access. If macOS denies or cancels a prompt, Gatebeam does not keep retrying; open Settings and use the relevant explicit action when ready.
 
 ## Safety Checklist
 
